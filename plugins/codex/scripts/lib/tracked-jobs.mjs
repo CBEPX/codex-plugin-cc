@@ -202,3 +202,84 @@ export async function runTrackedJob(job, runner, options = {}) {
     throw error;
   }
 }
+
+function isPidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return null;
+  }
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    // ESRCH: no such process. EPERM: exists but not ours — treat as alive.
+    return error?.code === "ESRCH" ? false : true;
+  }
+}
+
+function markJobDead(workspaceRoot, jobSummary, errorMessage) {
+  const jobFile = resolveJobFile(workspaceRoot, jobSummary.id);
+  const stored = fs.existsSync(jobFile) ? readJobFile(jobFile) : null;
+  const base = stored ?? jobSummary;
+  if (base.status !== "running" && base.status !== "queued") {
+    // The job finished between the caller's read and now — keep the real result.
+    return base;
+  }
+  const completedAt = nowIso();
+  const record = {
+    ...base,
+    status: "failed",
+    phase: "failed",
+    errorMessage,
+    pid: null,
+    completedAt
+  };
+  writeJobFile(workspaceRoot, jobSummary.id, record);
+  upsertJob(workspaceRoot, {
+    id: jobSummary.id,
+    status: "failed",
+    phase: "failed",
+    pid: null,
+    errorMessage,
+    completedAt
+  });
+  appendLogLine(base.logFile ?? null, `Marked failed: ${errorMessage}`);
+  return record;
+}
+
+// A worker that dies without throwing (SIGKILL, OOM, native crash) never
+// reaches runTrackedJob's catch, so its job stays "running" forever. Rewrite
+// any active job whose recorded pid is no longer alive as failed.
+export function reapDeadJobs(workspaceRoot, jobs) {
+  return jobs.map((job) => {
+    if (job.status !== "running" && job.status !== "queued") {
+      return job;
+    }
+    if (isPidAlive(job.pid) === false) {
+      return markJobDead(
+        workspaceRoot,
+        job,
+        `worker process (pid ${job.pid}) died without recording a result — ` +
+          `likely a crash; resume with task --resume-last`
+      );
+    }
+    return job;
+  });
+}
+
+export function registerWorkerCrashGuard(workspaceRoot, jobId, logFile = null) {
+  const mark = (label) => (reason) => {
+    try {
+      const detail = reason instanceof Error ? reason.stack ?? reason.message : String(reason ?? "");
+      appendLogLine(logFile, `Worker ${label}: ${detail}`);
+      markJobDead(workspaceRoot, { id: jobId, status: "running", logFile }, `worker ${label}: ${detail.split("\n")[0]}`);
+    } catch {
+      // Never let the guard itself throw during teardown.
+    }
+    process.exit(1);
+  };
+  process.on("uncaughtException", mark("uncaughtException"));
+  process.on("unhandledRejection", mark("unhandledRejection"));
+  for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"]) {
+    process.on(sig, mark(`received ${sig}`));
+  }
+}
