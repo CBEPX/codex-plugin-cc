@@ -39,6 +39,18 @@ test("reapDeadJobs marks a running job with a dead pid as failed", () => {
   assert.equal(listJobs(workspace).find((job) => job.id === "job-dead").status, "failed");
 });
 
+test("reapDeadJobs refreshes updatedAt so the reaped job sorts newest-first", () => {
+  const workspace = makeTempDir();
+  const stale = "2000-01-01T00:00:00.000Z";
+  seedJob(workspace, { id: "job-stale", status: "running", phase: "delegating", pid: spawnDeadPid(), updatedAt: stale, logFile: null });
+
+  const reaped = reapDeadJobs(workspace, listJobs(workspace));
+
+  assert.notEqual(reaped[0].updatedAt, stale);
+  assert.equal(reaped[0].updatedAt, reaped[0].completedAt);
+  assert.equal(readJobFile(resolveJobFile(workspace, "job-stale")).updatedAt, reaped[0].updatedAt);
+});
+
 test("reapDeadJobs leaves a running job with a live pid untouched", () => {
   const workspace = makeTempDir();
   seedJob(workspace, { id: "job-live", status: "running", phase: "delegating", pid: process.pid, logFile: null });

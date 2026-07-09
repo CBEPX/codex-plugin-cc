@@ -231,7 +231,11 @@ function markJobDead(workspaceRoot, jobSummary, errorMessage) {
     phase: "failed",
     errorMessage,
     pid: null,
-    completedAt
+    completedAt,
+    // Keep updatedAt current so the reaped job sorts newest-first in the same
+    // read that recorded it — otherwise a stale updatedAt can page it out of
+    // the first /codex:status report.
+    updatedAt: completedAt
   };
   writeJobFile(workspaceRoot, jobSummary.id, record);
   upsertJob(workspaceRoot, {
