@@ -270,6 +270,14 @@ export function reapDeadJobs(workspaceRoot, jobs) {
   });
 }
 
+// Guards only against in-process crashes (uncaughtException / unhandledRejection)
+// where a precise error is available and no other command is writing the job.
+// Signal-based deaths (SIGTERM/SIGINT/SIGHUP/SIGKILL) are intentionally NOT
+// caught here: SIGKILL is uncatchable so the reader-side reapDeadJobs must cover
+// it regardless, and /codex:cancel delivers SIGTERM as its teardown signal after
+// writing the job "cancelled" — catching it here would race that terminal state
+// back to "failed". reapDeadJobs handles every signal death and never rewrites a
+// job that already reached a terminal status.
 export function registerWorkerCrashGuard(workspaceRoot, jobId, logFile = null) {
   const mark = (label) => (reason) => {
     try {
@@ -283,7 +291,4 @@ export function registerWorkerCrashGuard(workspaceRoot, jobId, logFile = null) {
   };
   process.on("uncaughtException", mark("uncaughtException"));
   process.on("unhandledRejection", mark("unhandledRejection"));
-  for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"]) {
-    process.on(sig, mark(`received ${sig}`));
-  }
 }
