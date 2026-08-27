@@ -1,5 +1,7 @@
 # Codex plugin for Claude Code
 
+> **CBEPX fork.** Install with `claude plugin marketplace add CBEPX/codex-plugin-cc` then `claude plugin install codex@cbepx`. Differences from upstream are listed in [CHANGELOG.md](CHANGELOG.md). Upstream: openai/codex-plugin-cc.
+
 Use Codex from inside Claude Code for code reviews or to delegate tasks to Codex.
 
 This plugin is for Claude Code users who want an easy way to start using Codex from the workflow
@@ -24,13 +26,13 @@ they already have.
 Add the marketplace in Claude Code:
 
 ```bash
-/plugin marketplace add openai/codex-plugin-cc
+/plugin marketplace add CBEPX/codex-plugin-cc
 ```
 
 Install the plugin:
 
 ```bash
-/plugin install codex@openai-codex
+/plugin install codex@cbepx
 ```
 
 Reload plugins:
@@ -159,7 +161,9 @@ Ask Codex to redesign the database connection to be more resilient.
 **Notes:**
 
 - if you do not pass `--model` or `--effort`, Codex chooses its own defaults.
-- if you say `spark`, the plugin maps that to `gpt-5.3-codex-spark`
+- `--effort` accepts `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, and `ultra`. Which of those a given model actually supports is decided by Codex, not by the plugin — run `codex debug models` to see the reasoning levels each model advertises.
+- model aliases: `spark` -> `gpt-5.3-codex-spark`, `sol` -> `gpt-5.6-sol`, `luna` -> `gpt-5.6-luna`, `terra` -> `gpt-5.6-terra`, `mini` -> `gpt-5.4-mini`
+- `--config key=value` (repeatable, also on `/codex:review` and `/codex:adversarial-review`) forwards a `config.toml` override to the Codex thread, e.g. `--config model_provider=ollama`. On `--resume-last` the plugin opens a fresh app-server session (cold resume) so `--config` overrides, sandbox and approval policy take effect; model and effort for the resumed turn are sent on the turn, never on the resume request.
 - follow-up rescue requests can continue the latest Codex task in the repo
 
 ### `/codex:transfer`
@@ -235,6 +239,17 @@ When the review gate is enabled, the plugin uses a `Stop` hook to run a targeted
 
 > [!WARNING]
 > The review gate can create a long-running Claude/Codex loop and may drain usage limits quickly. Only enable it when you plan to actively monitor the session.
+
+#### Bounding the review gate
+
+By default the gate keeps blocking the stop until Codex is satisfied, which is what can create the loop above. Set `CODEX_REVIEW_GATE_MAX_ROUNDS` to cap how many consecutive gate rounds run in a single session before the stop is allowed through:
+
+```bash
+# allow at most 5 stop-gate review rounds per session, then let the stop proceed
+export CODEX_REVIEW_GATE_MAX_ROUNDS=5
+```
+
+When unset or `0`, the gate is unbounded (the previous behavior). The count is per session, increments on each blocked round (tracked via `stop_hook_active`), and resets once a stop is allowed or a fresh user turn begins.
 
 ## Typical Flows
 

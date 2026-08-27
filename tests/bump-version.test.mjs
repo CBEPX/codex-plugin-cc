@@ -86,3 +86,26 @@ test("bump-version check mode reports stale metadata", () => {
   assert.match(result.stderr, /plugins\/codex\/\.claude-plugin\/plugin\.json version/);
   assert.match(result.stderr, /\.claude-plugin\/marketplace\.json metadata\.version/);
 });
+
+test("bump-version check mode reports a lockfile whose name drifted from package.json", () => {
+  const root = makeVersionFixture();
+  const lockPath = path.join(root, "package-lock.json");
+  const lock = readJson(lockPath);
+  lock.name = "@upstream/codex-plugin-cc";
+  lock.packages[""].name = "@upstream/codex-plugin-cc";
+  writeJson(lockPath, lock);
+
+  const result = run("node", [SCRIPT, "--root", root, "--check"], { cwd: ROOT });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /package-lock\.json name: expected @openai\/codex-plugin-cc, found @upstream\/codex-plugin-cc/);
+  assert.match(result.stderr, /package-lock\.json packages\[""\]\.name/);
+});
+
+test("bump-version check mode passes when the lockfile identity matches", () => {
+  const root = makeVersionFixture();
+
+  const result = run("node", [SCRIPT, "--root", root, "--check", "1.0.2"], { cwd: ROOT });
+
+  assert.equal(result.status, 0, result.stderr);
+});

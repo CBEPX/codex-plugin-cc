@@ -22,6 +22,8 @@ const PLUGIN_MANIFEST = JSON.parse(fs.readFileSync(PLUGIN_MANIFEST_URL, "utf8"))
 export const BROKER_ENDPOINT_ENV = "CODEX_COMPANION_APP_SERVER_ENDPOINT";
 export const BROKER_BUSY_RPC_CODE = -32001;
 
+const NON_INTERACTIVE_DENIAL_REASON = "Non-interactive Codex runner: no operator to approve.";
+
 /** @type {ClientInfo} */
 const DEFAULT_CLIENT_INFO = {
   title: "Codex Plugin",
@@ -54,7 +56,7 @@ function createProtocolError(message, data) {
   return error;
 }
 
-class AppServerClientBase {
+export class AppServerClientBase {
   constructor(cwd, options = {}) {
     this.cwd = cwd;
     this.options = options;
@@ -153,11 +155,51 @@ class AppServerClientBase {
     }
   }
 
+  // `--write` runs use `approvalPolicy: "on-request"`, so app-server sends
+  // server->client approval requests. Rejecting them with -32601 makes the turn
+  // error out or hang. This client runs Codex non-interactively — there is no
+  // operator to ask — so every approval is answered with that request type's own
+  // refusal variant. The generated types disagree on shape: the v1 approvals take
+  // a `ReviewDecision` (refusal `{ denied: { rejection } }`), the v2 item
+  // approvals take a plain `"decline"` enum with no room for a reason, and
+  // `PermissionsRequestApprovalResponse` has no refusal variant at all, so
+  // granting nothing for the turn is its fail-closed answer.
   handleServerRequest(message) {
-    this.sendMessage({
-      id: message.id,
-      error: buildJsonRpcError(-32601, `Unsupported server request: ${message.method}`)
-    });
+    switch (message.method) {
+      case "execCommandApproval":
+      case "applyPatchApproval":
+        this.sendMessage({
+          id: message.id,
+          result: { decision: { denied: { rejection: NON_INTERACTIVE_DENIAL_REASON } } }
+        });
+        return;
+
+      case "item/commandExecution/requestApproval":
+      case "item/fileChange/requestApproval":
+        this.sendMessage({ id: message.id, result: { decision: "decline" } });
+        return;
+
+      case "item/permissions/requestApproval":
+        this.sendMessage({ id: message.id, result: { permissions: {}, scope: "turn" } });
+        return;
+
+      // MCP servers (e.g. ChatGPT connectors surfaced as `codex_apps`) ask for
+      // the operator's consent via an elicitation. Accepting one fabricates that
+      // consent: a url-mode accept tells the MCP server an out-of-band
+      // authorization succeeded when nobody completed it, and a form-mode accept
+      // with `content: null` lets the tool call proceed without the values it
+      // asked for. Decline every mode — url/form flows must be completed in an
+      // interactive Codex session.
+      case "mcpServer/elicitation/request":
+        this.sendMessage({ id: message.id, result: { action: "decline" } });
+        return;
+
+      default:
+        this.sendMessage({
+          id: message.id,
+          error: buildJsonRpcError(-32601, `Unsupported server request: ${message.method}`)
+        });
+    }
   }
 
   handleExit(error) {

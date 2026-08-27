@@ -116,6 +116,14 @@ function send(message) {
   process.stdout.write(JSON.stringify(message) + "\\n");
 }
 
+function resolvedModel(params) {
+  return params.model || params.config?.model || "gpt-5.4";
+}
+
+function resolvedEffort(params) {
+  return params.config?.model_reasoning_effort ?? (BEHAVIOR === "resolved-effort" ? "medium" : null);
+}
+
 function nextThread(state, cwd, ephemeral) {
   const thread = {
     id: "thr_" + state.nextThreadId++,
@@ -313,7 +321,9 @@ rl.on("line", (line) => {
           throw new Error("thread/start.persistFullHistory requires experimentalApi capability");
         }
         const thread = nextThread(state, message.params.cwd, message.params.ephemeral);
-        send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-5.4", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false }, reasoningEffort: null } });
+        state.lastThreadStart = { ...message.params, threadId: thread.id };
+        saveState(state);
+        send({ id: message.id, result: { thread: buildThread(thread), model: resolvedModel(message.params), modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: message.params.approvalPolicy || "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false }, reasoningEffort: resolvedEffort(message.params) } });
         send({ method: "thread/started", params: { thread: { id: thread.id } } });
         break;
       }
@@ -346,8 +356,9 @@ rl.on("line", (line) => {
         }
         const thread = ensureThread(state, message.params.threadId);
         thread.updatedAt = now();
+        state.lastThreadResume = { ...message.params };
         saveState(state);
-        send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-5.4", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false }, reasoningEffort: null } });
+        send({ id: message.id, result: { thread: buildThread(thread), model: resolvedModel(message.params), modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: message.params.approvalPolicy || "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false }, reasoningEffort: resolvedEffort(message.params) } });
         break;
       }
 
@@ -437,6 +448,9 @@ rl.on("line", (line) => {
       }
 
 	      case "turn/start": {
+	        if (BEHAVIOR === "turn-start-fails") {
+	          throw new Error("turn/start failed after thread resolution");
+	        }
 	        const thread = ensureThread(state, message.params.threadId);
 	        const prompt = (message.params.input || [])
           .filter((item) => item.type === "text")

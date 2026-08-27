@@ -27,12 +27,15 @@ import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "
 import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import {
+  consumeJobRequestFile,
   generateJobId,
   getConfig,
   listJobs,
+  removeJobRequestFile,
   setConfig,
   upsertJob,
-  writeJobFile
+  writeJobFile,
+  writeJobRequestFile
 } from "./lib/state.mjs";
 import {
   buildSingleJobSnapshot,
@@ -68,8 +71,23 @@ const ROOT_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const REVIEW_SCHEMA = path.join(ROOT_DIR, "schemas", "review-output.schema.json");
 const DEFAULT_STATUS_WAIT_TIMEOUT_MS = 240000;
 const DEFAULT_STATUS_POLL_INTERVAL_MS = 2000;
-const VALID_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
-const MODEL_ALIASES = new Map([["spark", "gpt-5.3-codex-spark"]]);
+const VALID_REASONING_EFFORTS = new Set([
+  "none",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+  "ultra"
+]);
+const MODEL_ALIASES = new Map([
+  ["spark", "gpt-5.3-codex-spark"],
+  ["sol", "gpt-5.6-sol"],
+  ["luna", "gpt-5.6-luna"],
+  ["terra", "gpt-5.6-terra"],
+  ["mini", "gpt-5.4-mini"]
+]);
 const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
 
 function printUsage() {
@@ -77,13 +95,16 @@ function printUsage() {
     [
       "Usage:",
       "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
-      "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
-      "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
-      "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
+      "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model|spark|sol|luna|terra|mini>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [--config key=value]...",
+      "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model|spark|sol|luna|terra|mini>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [--config key=value]... [focus text]",
+      "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark|sol|luna|terra|mini>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [--config key=value]... [prompt]",
       "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
-      "  node scripts/codex-companion.mjs cancel [job-id] [--json]"
+      "  node scripts/codex-companion.mjs cancel [job-id] [--json]",
+      "",
+      "Any subcommand also accepts --args-stdin: the whole argument string is read",
+      "from stdin and tokenized here, so no shell ever sees the caller's text."
     ].join("\n")
   );
 }
@@ -121,14 +142,48 @@ function normalizeReasoningEffort(effort) {
   }
   if (!VALID_REASONING_EFFORTS.has(normalized)) {
     throw new Error(
-      `Unsupported reasoning effort "${effort}". Use one of: none, minimal, low, medium, high, xhigh.`
+      `Unsupported reasoning effort "${effort}". Use one of: none, minimal, low, medium, high, xhigh, max, ultra.`
     );
   }
   return normalized;
 }
 
+function parseConfigOverrides(list = []) {
+  const config = {};
+  for (const pair of list) {
+    const eq = pair.indexOf("=");
+    if (eq <= 0) {
+      throw new Error(`--config expects key=value, got "${pair}".`);
+    }
+    config[pair.slice(0, eq)] = pair.slice(eq + 1);
+  }
+  return config;
+}
+
+// Claude Code substitutes `$ARGUMENTS` (and a rescue request's text) into the
+// command body *before* bash runs it, so any `$(...)`/backtick the user typed
+// would execute on the host shell, outside Codex's sandbox. Command bodies feed
+// the raw argument string in through a quoted heredoc on stdin instead, and
+// `--args-stdin` tokenizes it here with the same shell-like splitter
+// `normalizeArgv` already uses — never through a shell.
+const ARGS_STDIN_FLAG = "--args-stdin";
+let argvTokenizedFromStdin = false;
+
+function applyArgsStdin(argv) {
+  const flagIndex = argv.indexOf(ARGS_STDIN_FLAG);
+  if (flagIndex === -1) {
+    return argv;
+  }
+  argvTokenizedFromStdin = true;
+  return [
+    ...argv.slice(0, flagIndex),
+    ...splitRawArgumentString(readStdinIfPiped()),
+    ...argv.slice(flagIndex + 1)
+  ];
+}
+
 function normalizeArgv(argv) {
-  if (argv.length === 1) {
+  if (!argvTokenizedFromStdin && argv.length === 1) {
     const [raw] = argv;
     if (!raw || !raw.trim()) {
       return [];
@@ -140,12 +195,23 @@ function normalizeArgv(argv) {
 
 function parseCommandInput(argv, config = {}) {
   return parseArgs(normalizeArgv(argv), {
+    rejectUnknownOptions: true,
     ...config,
+    booleanOptions: ["help", ...(config.booleanOptions ?? [])],
     aliasMap: {
       C: "cwd",
+      h: "help",
       ...(config.aliasMap ?? {})
     }
   });
+}
+
+function maybePrintCommandHelp(options) {
+  if (!options.help) {
+    return false;
+  }
+  printUsage();
+  return true;
 }
 
 function resolveCommandCwd(options = {}) {
@@ -217,6 +283,9 @@ async function handleSetup(argv) {
     valueOptions: ["cwd"],
     booleanOptions: ["json", "enable-review-gate", "disable-review-gate"]
   });
+  if (maybePrintCommandHelp(options)) {
+    return;
+  }
 
   if (options["enable-review-gate"] && options["disable-review-gate"]) {
     throw new Error("Choose either --enable-review-gate or --disable-review-gate.");
@@ -370,6 +439,8 @@ async function executeReviewRun(request) {
     const result = await runAppServerReview(request.cwd, {
       target: reviewTarget,
       model: request.model,
+      effort: request.effort,
+      config: request.config,
       onProgress: request.onProgress
     });
     const payload = {
@@ -397,6 +468,7 @@ async function executeReviewRun(request) {
       exitStatus: result.status,
       threadId: result.threadId,
       turnId: result.turnId,
+      resolved: result.resolved,
       payload,
       rendered,
       summary: firstMeaningfulLine(result.reviewText, `${reviewName} completed.`),
@@ -411,6 +483,8 @@ async function executeReviewRun(request) {
   const result = await runAppServerTurn(context.repoRoot, {
     prompt,
     model: request.model,
+    effort: request.effort,
+    config: request.config,
     sandbox: "read-only",
     outputSchema: readOutputSchema(REVIEW_SCHEMA),
     onProgress: request.onProgress
@@ -444,6 +518,7 @@ async function executeReviewRun(request) {
     exitStatus: result.status,
     threadId: result.threadId,
     turnId: result.turnId,
+    resolved: result.resolved,
     payload,
     rendered: renderReviewResult(parsed, {
       reviewLabel: reviewName,
@@ -484,10 +559,13 @@ async function executeTaskRun(request) {
 
   const result = await runAppServerTurn(workspaceRoot, {
     resumeThreadId,
+    excludeJobId: request.jobId,
     prompt: request.prompt,
     defaultPrompt: resumeThreadId ? DEFAULT_CONTINUE_PROMPT : "",
     model: request.model,
     effort: request.effort,
+    config: request.config,
+    approvalPolicy: request.write ? "on-request" : "never",
     sandbox: request.write ? "workspace-write" : "read-only",
     onProgress: request.onProgress,
     persistThread: true,
@@ -520,6 +598,7 @@ async function executeTaskRun(request) {
     exitStatus: result.status,
     threadId: result.threadId,
     turnId: result.turnId,
+    resolved: result.resolved,
     payload,
     rendered,
     summary: firstMeaningfulLine(rawOutput, firstMeaningfulLine(failureMessage, `${taskMetadata.title} finished.`)),
@@ -601,11 +680,12 @@ function buildTaskJob(workspaceRoot, taskMetadata, write) {
   });
 }
 
-function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, jobId }) {
+function buildTaskRequest({ cwd, model, effort, config, prompt, write, resumeLast, jobId }) {
   return {
     cwd,
     model,
     effort,
+    config,
     prompt,
     write,
     resumeLast,
@@ -681,21 +761,61 @@ function spawnDetachedTaskWorker(cwd, jobId) {
   return child;
 }
 
+const PRIVATE_CONFIG_KEY_PATTERN = /key|token|secret|auth|password/i;
+
+// `status --json` / `result --json` echo the stored job record back to the user
+// and to Claude, so a `--config model_providers.x.http_headers.Authorization=...`
+// would end up in the transcript. The worker reads the real values from the
+// private one-shot payload file; the record keeps only a redacted copy.
+function redactPrivateConfigValues(config) {
+  if (!config || typeof config !== "object") {
+    return config;
+  }
+  return Object.fromEntries(
+    Object.entries(config).map(([key, value]) => [key, PRIVATE_CONFIG_KEY_PATTERN.test(key) ? "[redacted]" : value])
+  );
+}
+
 function enqueueBackgroundTask(cwd, job, request) {
   const { logFile } = createTrackedProgress(job);
   appendLogLine(logFile, "Queued for background execution.");
 
-  const child = spawnDetachedTaskWorker(cwd, job.id);
+  // Persist before spawning: a worker that starts instantly must find its
+  // record, otherwise it exits while the parent reports `queued`.
+  const requestFile = writeJobRequestFile(job.workspaceRoot, job.id, request);
   const queuedRecord = {
     ...job,
     status: "queued",
     phase: "queued",
-    pid: child.pid ?? null,
+    pid: null,
     logFile,
-    request
+    requestFile,
+    request: { ...request, config: redactPrivateConfigValues(request.config) }
   };
   writeJobFile(job.workspaceRoot, job.id, queuedRecord);
   upsertJob(job.workspaceRoot, queuedRecord);
+
+  let child;
+  try {
+    child = spawnDetachedTaskWorker(cwd, job.id);
+    if (child.pid === undefined) {
+      throw new Error("Could not spawn the background Codex worker.");
+    }
+  } catch (error) {
+    // No worker will ever read the payload, so do not leave it (0600, possibly
+    // holding `--config` secrets) on disk until the job is pruned.
+    removeJobRequestFile(job.workspaceRoot, job.id);
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    const failedRecord = { ...queuedRecord, status: "failed", phase: "failed", errorMessage, requestFile: null };
+    writeJobFile(job.workspaceRoot, job.id, failedRecord);
+    upsertJob(job.workspaceRoot, failedRecord);
+    throw error;
+  }
+
+  // Nothing writes this record from here on: the worker owns it from the moment
+  // it starts, and `runTrackedJob` stores its own pid (the same `child.pid`) as
+  // its first act. A post-spawn patch from the parent would race the worker's
+  // own `upsertJob` and could rewind `running` back to `queued`.
 
   return {
     payload: {
@@ -711,15 +831,25 @@ function enqueueBackgroundTask(cwd, job, request) {
 
 async function handleReviewCommand(argv, config) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["base", "scope", "model", "cwd"],
+    valueOptions: ["base", "scope", "model", "effort", "cwd"],
     booleanOptions: ["json", "background", "wait"],
+    repeatableOptions: ["config"],
+    // Only the adversarial variant takes free-form focus text; stop option
+    // parsing there so option-looking prompt words survive (#547).
+    stopAtFirstPositional: Boolean(config.acceptsFocusText),
     aliasMap: {
       m: "model"
     }
   });
+  if (maybePrintCommandHelp(options)) {
+    return;
+  }
 
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
+  const model = normalizeRequestedModel(options.model);
+  const effort = normalizeReasoningEffort(options.effort);
+  const configOverrides = parseConfigOverrides(options.config);
   const focusText = positionals.join(" ").trim();
   const target = resolveReviewTarget(cwd, {
     base: options.base,
@@ -743,7 +873,9 @@ async function handleReviewCommand(argv, config) {
         cwd,
         base: options.base,
         scope: options.scope,
-        model: options.model,
+        model,
+        effort,
+        config: configOverrides,
         focusText,
         reviewName: config.reviewName,
         onProgress: progress
@@ -763,15 +895,21 @@ async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["model", "effort", "cwd", "prompt-file"],
     booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background"],
+    repeatableOptions: ["config"],
+    stopAtFirstPositional: true,
     aliasMap: {
       m: "model"
     }
   });
+  if (maybePrintCommandHelp(options)) {
+    return;
+  }
 
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
   const model = normalizeRequestedModel(options.model);
   const effort = normalizeReasoningEffort(options.effort);
+  const configOverrides = parseConfigOverrides(options.config);
   const prompt = readTaskPrompt(cwd, options, positionals);
 
   const resumeLast = Boolean(options["resume-last"] || options.resume);
@@ -794,6 +932,7 @@ async function handleTask(argv) {
       cwd,
       model,
       effort,
+      config: configOverrides,
       prompt,
       write,
       resumeLast,
@@ -812,6 +951,7 @@ async function handleTask(argv) {
         cwd,
         model,
         effort,
+        config: configOverrides,
         prompt,
         write,
         resumeLast,
@@ -827,6 +967,9 @@ async function handleTransfer(argv) {
     valueOptions: ["cwd", "source"],
     booleanOptions: ["json"]
   });
+  if (maybePrintCommandHelp(options)) {
+    return;
+  }
 
   const cwd = resolveCommandCwd(options);
   const { payload, rendered } = await executeTransfer(cwd, {
@@ -851,7 +994,9 @@ async function handleTaskWorker(argv) {
     throw new Error(`No stored job found for ${options["job-id"]}.`);
   }
 
-  const request = storedJob.request;
+  // The private payload carries the unredacted request; fall back to the record
+  // for jobs queued before that file existed.
+  const request = consumeJobRequestFile(workspaceRoot, options["job-id"]) ?? storedJob.request;
   if (!request || typeof request !== "object") {
     throw new Error(`Stored job ${options["job-id"]} is missing its task request payload.`);
   }
@@ -885,6 +1030,9 @@ async function handleStatus(argv) {
     valueOptions: ["cwd", "timeout-ms", "poll-interval-ms"],
     booleanOptions: ["json", "all", "wait"]
   });
+  if (maybePrintCommandHelp(options)) {
+    return;
+  }
 
   const cwd = resolveCommandCwd(options);
   const reference = positionals[0] ?? "";
@@ -912,6 +1060,9 @@ function handleResult(argv) {
     valueOptions: ["cwd"],
     booleanOptions: ["json"]
   });
+  if (maybePrintCommandHelp(options)) {
+    return;
+  }
 
   const cwd = resolveCommandCwd(options);
   const reference = positionals[0] ?? "";
@@ -930,6 +1081,9 @@ function handleTaskResumeCandidate(argv) {
     valueOptions: ["cwd"],
     booleanOptions: ["json"]
   });
+  if (maybePrintCommandHelp(options)) {
+    return;
+  }
 
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
@@ -965,6 +1119,9 @@ async function handleCancel(argv) {
     valueOptions: ["cwd"],
     booleanOptions: ["json"]
   });
+  if (maybePrintCommandHelp(options)) {
+    return;
+  }
 
   const cwd = resolveCommandCwd(options);
   const reference = positionals[0] ?? "";
@@ -1022,11 +1179,13 @@ async function handleCancel(argv) {
 }
 
 async function main() {
-  const [subcommand, ...argv] = process.argv.slice(2);
+  const [subcommand, ...rawArgv] = process.argv.slice(2);
   if (!subcommand || subcommand === "help" || subcommand === "--help") {
     printUsage();
     return;
   }
+
+  const argv = applyArgsStdin(rawArgv);
 
   switch (subcommand) {
     case "setup":
@@ -1037,7 +1196,8 @@ async function main() {
       break;
     case "adversarial-review":
       await handleReviewCommand(argv, {
-        reviewName: "Adversarial Review"
+        reviewName: "Adversarial Review",
+        acceptsFocusText: true
       });
       break;
     case "task":

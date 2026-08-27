@@ -20,10 +20,10 @@ test("review command uses AskUserQuestion and background Bash while staying revi
   assert.match(source, /return Codex's output verbatim to the user/i);
   assert.match(source, /```bash/);
   assert.match(source, /```typescript/);
-  assert.match(source, /review "\$ARGUMENTS"/);
+  assert.match(source, /review --args-stdin <<'CODEX_ARGS'/);
   assert.match(source, /\[--scope auto\|working-tree\|branch\]/);
   assert.match(source, /run_in_background:\s*true/);
-  assert.match(source, /command:\s*`node "\$\{CLAUDE_PLUGIN_ROOT\}\/scripts\/codex-companion\.mjs" review "\$ARGUMENTS"`/);
+  assert.match(source, /command:\s*`node "\$\{CLAUDE_PLUGIN_ROOT\}\/scripts\/codex-companion\.mjs" review --args-stdin <<'CODEX_ARGS'\n\$ARGUMENTS\nCODEX_ARGS`/);
   assert.match(source, /description:\s*"Codex review"/);
   assert.match(source, /Do not call `BashOutput`/);
   assert.match(source, /Return the command stdout verbatim, exactly as-is/i);
@@ -48,10 +48,10 @@ test("adversarial review command uses AskUserQuestion and background Bash while 
   assert.match(source, /return Codex's output verbatim to the user/i);
   assert.match(source, /```bash/);
   assert.match(source, /```typescript/);
-  assert.match(source, /adversarial-review "\$ARGUMENTS"/);
-  assert.match(source, /\[--scope auto\|working-tree\|branch\] \[focus \.\.\.\]/);
+  assert.match(source, /adversarial-review --args-stdin <<'CODEX_ARGS'/);
+  assert.match(source, /\[--scope auto\|working-tree\|branch\].*\[focus \.\.\.\]/);
   assert.match(source, /run_in_background:\s*true/);
-  assert.match(source, /command:\s*`node "\$\{CLAUDE_PLUGIN_ROOT\}\/scripts\/codex-companion\.mjs" adversarial-review "\$ARGUMENTS"`/);
+  assert.match(source, /command:\s*`node "\$\{CLAUDE_PLUGIN_ROOT\}\/scripts\/codex-companion\.mjs" adversarial-review --args-stdin <<'CODEX_ARGS'\n\$ARGUMENTS\nCODEX_ARGS`/);
   assert.match(source, /description:\s*"Codex adversarial review"/);
   assert.match(source, /Do not call `BashOutput`/);
   assert.match(source, /Return the command stdout verbatim, exactly as-is/i);
@@ -90,8 +90,8 @@ test("rescue command absorbs continue semantics", () => {
   const readme = fs.readFileSync(path.join(ROOT, "README.md"), "utf8");
   const runtimeSkill = read("skills/codex-cli-runtime/SKILL.md");
 
-  assert.match(rescue, /The final user-visible response must be Codex's output verbatim/i);
-  assert.match(rescue, /allowed-tools:\s*Bash\(node:\*\),\s*AskUserQuestion,\s*Agent/);
+  assert.match(rescue, /Show the `result` output to the user verbatim/i);
+  assert.match(rescue, /allowed-tools:\s*Bash,\s*AskUserQuestion,\s*Agent/);
   // Regression for #234: `Skill(codex:rescue)` from the main agent recursed
   // because rescue.md named the routing with ambiguous prose ("Route this
   // request to the `codex:codex-rescue` subagent") while running under
@@ -99,50 +99,40 @@ test("rescue command absorbs continue semantics", () => {
   // `Agent` tool, so the fork fell back to `Skill` and re-entered this
   // command. Pin the explicit transport and the inline (no-fork) execution.
   assert.match(rescue, /subagent_type: "codex:codex-rescue"/);
-  assert.match(rescue, /do not call `Skill\(codex:codex-rescue\)`/i);
+  assert.match(rescue, /do not call `Skill\(codex:rescue\)`/i);
   assert.doesNotMatch(rescue, /^context:\s*fork\b/m);
   assert.match(rescue, /--background\|--wait/);
   assert.match(rescue, /--resume\|--fresh/);
-  assert.match(rescue, /--model <model\|spark>/);
-  assert.match(rescue, /--effort <none\|minimal\|low\|medium\|high\|xhigh>/);
+  assert.match(rescue, /--model <model\|spark\|sol\|luna\|terra\|mini>/);
+  assert.match(rescue, /--effort <none\|minimal\|low\|medium\|high\|xhigh\|max\|ultra>/);
   assert.match(rescue, /task-resume-candidate --json/);
-  assert.match(rescue, /AskUserQuestion/);
-  assert.match(rescue, /Continue current Codex thread/);
+  assert.match(rescue, /AskUserQuestion.*Continue current Codex thread/s);
   assert.match(rescue, /Start a new Codex thread/);
-  assert.match(rescue, /run the `codex:codex-rescue` subagent in the background/i);
-  assert.match(rescue, /default to foreground/i);
-  assert.match(rescue, /Do not forward them to `task`/i);
-  assert.match(rescue, /`--model` and `--effort` are runtime-selection flags/i);
-  assert.match(rescue, /Leave `--effort` unset unless the user explicitly asks for a specific reasoning effort/i);
-  assert.match(rescue, /If they ask for `spark`, map it to `gpt-5\.3-codex-spark`/i);
-  assert.match(rescue, /If the request includes `--resume`, do not ask whether to continue/i);
-  assert.match(rescue, /If the request includes `--fresh`, do not ask whether to continue/i);
-  assert.match(rescue, /If the user chooses continue, add `--resume`/i);
-  assert.match(rescue, /If the user chooses a new thread, add `--fresh`/i);
-  assert.match(rescue, /thin forwarder only/i);
-  assert.match(rescue, /Return the Codex companion stdout verbatim to the user/i);
-  assert.match(rescue, /Do not paraphrase, summarize, rewrite, or add commentary before or after it/i);
-  assert.match(rescue, /return that command's stdout as-is/i);
-  assert.match(rescue, /Leave `--resume` and `--fresh` in the forwarded request/i);
+  assert.match(rescue, /Default is synchronous/i);
+  assert.match(rescue, /Strip `--wait` if present/i);
+  assert.match(rescue, /Pass `--model`, `--effort` and every `--config key=value` through unchanged/i);
+  assert.match(rescue, /Delegate the request to Codex through the shared companion runtime/i);
   assert.match(agent, /--resume/);
   assert.match(agent, /--fresh/);
   assert.match(agent, /thin forwarding wrapper/i);
-  assert.match(agent, /prefer foreground for a small, clearly bounded rescue request/i);
-  assert.match(agent, /If the user did not explicitly choose `--background` or `--wait` and the task looks complicated, open-ended, multi-step, or likely to keep Codex running for a long time, prefer background execution/i);
-  assert.match(agent, /Use exactly one `Bash` call/i);
-  assert.match(agent, /Do not inspect the repository, read files, grep, monitor progress, poll status, fetch results, cancel jobs, summarize output, or do any follow-up work of your own/i);
-  assert.match(agent, /Do not call `review`, `adversarial-review`, `status`, `result`, or `cancel`/i);
+  assert.match(agent, /result "\$JOB"/);
+  assert.doesNotMatch(agent, /prefer background execution/i);
+  assert.match(runtimeSkill, /Launch exactly one job per rescue handoff with `task --background --json`/i);
+  assert.match(agent, /Bash tool's 10-minute cap/i);
+  assert.match(agent, /do not inspect the repository, read files, grep, cancel jobs, summarize output, or do any other follow-up work of your own/i);
+  assert.match(agent, /Do not call `review`, `adversarial-review`, or `cancel`/i);
   assert.match(agent, /Leave `--effort` unset unless the user explicitly requests a specific reasoning effort/i);
   assert.match(agent, /Leave model unset by default/i);
   assert.match(agent, /If the user asks for `spark`, map that to `--model gpt-5\.3-codex-spark`/i);
   assert.match(agent, /If the user asks for a concrete model name such as `gpt-5\.4-mini`, pass it through with `--model`/i);
-  assert.match(agent, /Return the stdout of the `codex-companion` command exactly as-is/i);
-  assert.match(agent, /If the Bash call fails or Codex cannot be invoked, return nothing/i);
+  assert.match(agent, /Return the `result` stdout exactly as-is/i);
+  assert.match(agent, /If the Bash call fails or Codex cannot be invoked, return the command's exit status and stderr verbatim/i);
   assert.match(agent, /gpt-5-4-prompting/);
   assert.match(agent, /only to tighten the user's request into a better Codex prompt/i);
   assert.match(agent, /Do not use that skill to inspect the repository, reason through the problem yourself, draft a solution, or do any independent work/i);
-  assert.match(runtimeSkill, /only job is to invoke `task` once and return that stdout unchanged/i);
-  assert.match(runtimeSkill, /Do not call `setup`, `review`, `adversarial-review`, `status`, `result`, or `cancel`/i);
+  assert.match(runtimeSkill, /launches once with `task --background --json`, polls only that job's own `status`, then returns the `result` stdout unchanged/i);
+  assert.match(runtimeSkill, /Do not call `setup`, `review`, `adversarial-review`, or `cancel` from `codex:codex-rescue`/i);
+  assert.match(runtimeSkill, /`status` and `result` are allowed, but only for the job you just launched/i);
   assert.match(runtimeSkill, /use the `gpt-5-4-prompting` skill to rewrite the user's request into a tighter Codex prompt/i);
   assert.match(runtimeSkill, /That prompt drafting is the only Claude-side work allowed/i);
   assert.match(runtimeSkill, /Leave `--effort` unset unless the user explicitly requests a specific effort/i);
@@ -150,13 +140,13 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(runtimeSkill, /Map `spark` to `--model gpt-5\.3-codex-spark`/i);
   assert.match(runtimeSkill, /If the forwarded request includes `--background` or `--wait`, treat that as Claude-side execution control only/i);
   assert.match(runtimeSkill, /Strip it before calling `task`/i);
-  assert.match(runtimeSkill, /`--effort`: accepted values are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`/i);
-  assert.match(runtimeSkill, /Do not inspect the repository, read files, grep, monitor progress, poll status, fetch results, cancel jobs, summarize output, or do any follow-up work of your own/i);
-  assert.match(runtimeSkill, /If the Bash call fails or Codex cannot be invoked, return nothing/i);
+  assert.match(runtimeSkill, /`--effort`: accepted values are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra`/i);
+  assert.match(runtimeSkill, /Do not inspect the repository, read files, grep, cancel jobs, summarize output, or do any other follow-up work of your own beyond launching and polling your own job/i);
+  assert.match(runtimeSkill, /If the Bash call fails or Codex cannot be invoked, return the command's exit status and stderr verbatim/i);
   assert.match(readme, /`codex:codex-rescue` subagent/i);
   assert.match(readme, /if you do not pass `--model` or `--effort`, Codex chooses its own defaults/i);
   assert.match(readme, /--model gpt-5\.4-mini --effort medium/i);
-  assert.match(readme, /`spark`, the plugin maps that to `gpt-5\.3-codex-spark`/i);
+  assert.match(readme, /`spark` -> `gpt-5\.3-codex-spark`/i);
   assert.match(readme, /continue a previous Codex task/i);
   assert.match(readme, /### `\/codex:setup`/);
   assert.match(readme, /### `\/codex:review`/);
@@ -170,6 +160,29 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(readme, /### `\/codex:cancel`/);
 });
 
+test("rescue runs synchronously through the companion and uses Agent only for --background", () => {
+  const rescue = fs.readFileSync(path.join(PLUGIN_ROOT, "commands", "rescue.md"), "utf8");
+  const agent = fs.readFileSync(path.join(PLUGIN_ROOT, "agents", "codex-rescue.md"), "utf8");
+  const runtimeSkill = fs.readFileSync(path.join(PLUGIN_ROOT, "skills", "codex-cli-runtime", "SKILL.md"), "utf8");
+  assert.match(rescue, /task --background --json/);
+  assert.match(rescue, /status "\$JOB" --wait --timeout-ms 540000/);
+  assert.match(rescue, /result "\$JOB"/);
+  assert.match(rescue, /Only when the request contains `--background`.*Agent/s);
+  assert.match(rescue, /--config/);
+  assert.doesNotMatch(agent, /^model:/m);
+  assert.doesNotMatch(agent, /return nothing/i);
+  assert.match(agent, /exit status and stderr/i);
+  assert.match(agent, /task --background --json/);
+  assert.match(agent, /status "\$JOB" --wait --timeout-ms 540000/);
+  assert.doesNotMatch(agent, /Do not .*poll status/i);
+  assert.match(agent, /--config/);
+  assert.doesNotMatch(runtimeSkill, /return nothing/i);
+  assert.match(runtimeSkill, /Map `sol` to `--model gpt-5\.6-sol`/i);
+  assert.match(runtimeSkill, /\$agent-compat:skill-router/);
+  assert.doesNotMatch(agent, /adding `--write` unless/i);
+  assert.doesNotMatch(runtimeSkill, /adding `--write` unless/i);
+});
+
 test("transfer, result, and cancel commands are exposed as deterministic runtime entrypoints", () => {
   const transfer = read("commands/transfer.md");
   const result = read("commands/result.md");
@@ -177,12 +190,12 @@ test("transfer, result, and cancel commands are exposed as deterministic runtime
   const resultHandling = read("skills/codex-result-handling/SKILL.md");
 
   assert.match(transfer, /disable-model-invocation:\s*true/);
-  assert.match(transfer, /codex-companion\.mjs" transfer "\$ARGUMENTS"/);
+  assert.match(transfer, /codex-companion\.mjs" transfer --args-stdin <<'CODEX_ARGS'/);
   assert.match(transfer, /codex resume <session-id>/);
   assert.match(result, /disable-model-invocation:\s*true/);
-  assert.match(result, /codex-companion\.mjs" result "\$ARGUMENTS"/);
+  assert.match(result, /codex-companion\.mjs" result --args-stdin <<'CODEX_ARGS'/);
   assert.match(cancel, /disable-model-invocation:\s*true/);
-  assert.match(cancel, /codex-companion\.mjs" cancel "\$ARGUMENTS"/);
+  assert.match(cancel, /codex-companion\.mjs" cancel --args-stdin <<'CODEX_ARGS'/);
   assert.match(resultHandling, /do not turn a failed or incomplete Codex run into a Claude-side implementation attempt/i);
   assert.match(resultHandling, /if Codex was never successfully invoked, do not generate a substitute answer at all/i);
 });
@@ -210,6 +223,13 @@ test("hooks keep session-end cleanup and stop gating enabled", () => {
   assert.match(source, /session-lifecycle-hook\.mjs/);
 });
 
+test("session start hook allows enough time to restore session state", () => {
+  const hooks = JSON.parse(read("hooks/hooks.json"));
+  const sessionStartHook = hooks.hooks.SessionStart[0].hooks[0];
+
+  assert.equal(sessionStartHook.timeout, 60);
+});
+
 test("setup command can offer Codex install and still points users to codex login", () => {
   const setup = read("commands/setup.md");
   const readme = fs.readFileSync(path.join(ROOT, "README.md"), "utf8");
@@ -217,9 +237,133 @@ test("setup command can offer Codex install and still points users to codex logi
   assert.match(setup, /argument-hint:\s*'\[--enable-review-gate\|--disable-review-gate\]'/);
   assert.match(setup, /AskUserQuestion/);
   assert.match(setup, /npm install -g @openai\/codex/);
-  assert.match(setup, /codex-companion\.mjs" setup --json \$ARGUMENTS/);
+  assert.match(setup, /codex-companion\.mjs" setup --json --args-stdin <<'CODEX_ARGS'/);
   assert.match(readme, /!codex login/);
   assert.match(readme, /offer to install Codex for you/i);
   assert.match(readme, /\/codex:setup --enable-review-gate/);
   assert.match(readme, /\/codex:setup --disable-review-gate/);
+});
+
+test("stop gate script timeout is shorter than the Stop hook timeout and its message matches", () => {
+  const hooks = JSON.parse(fs.readFileSync(path.join(PLUGIN_ROOT, "hooks", "hooks.json"), "utf8"));
+  const stopTimeoutSeconds = hooks.hooks.Stop[0].hooks[0].timeout;
+  const source = fs.readFileSync(path.join(PLUGIN_ROOT, "scripts", "stop-review-gate-hook.mjs"), "utf8");
+  const minutes = source.match(/const STOP_REVIEW_TIMEOUT_MINUTES = (\d+);/);
+  assert.ok(minutes, "STOP_REVIEW_TIMEOUT_MINUTES must be a named constant");
+  assert.match(source, /const STOP_REVIEW_TIMEOUT_MS = STOP_REVIEW_TIMEOUT_MINUTES \* 60 \* 1000;/);
+  assert.ok(Number(minutes[1]) * 60 < stopTimeoutSeconds, "script timeout must be below the hook timeout");
+  assert.doesNotMatch(source, /15 minutes/);
+  assert.match(source, /\$\{STOP_REVIEW_TIMEOUT_MINUTES\} minutes/);
+  assert.match(source, /killSignal: "SIGKILL"/);
+  assert.match(source, /maxBuffer: 16 \* 1024 \* 1024/);
+});
+
+test("marketplace is published under cbepx while the plugin keeps the codex name", () => {
+  const marketplace = JSON.parse(fs.readFileSync(path.join(ROOT, ".claude-plugin", "marketplace.json"), "utf8"));
+  const plugin = JSON.parse(fs.readFileSync(path.join(PLUGIN_ROOT, ".claude-plugin", "plugin.json"), "utf8"));
+  assert.equal(marketplace.name, "cbepx");
+  assert.equal(marketplace.owner.name, "CBEPX");
+  assert.equal(plugin.name, "codex");
+  assert.equal(marketplace.plugins[0].name, "codex");
+  assert.equal(marketplace.plugins[0].version, plugin.version);
+});
+
+function assertArgumentsNeverReachTheShell(label, body) {
+  body.split("\n").forEach((line, index) => {
+    if (!line.includes("$ARGUMENTS")) {
+      return;
+    }
+    const trimmed = line.trim();
+    assert.ok(
+      trimmed === "$ARGUMENTS" || trimmed === "`$ARGUMENTS`",
+      `${label}:${index + 1} exposes $ARGUMENTS to the shell: ${line}`
+    );
+  });
+}
+
+test("command bodies hand arguments to the companion via a quoted heredoc, never inside a shell string", () => {
+  const commandFiles = fs.readdirSync(path.join(PLUGIN_ROOT, "commands")).sort();
+  for (const file of commandFiles) {
+    const body = read(path.join("commands", file));
+    assert.doesNotMatch(body, /"\$ARGUMENTS"/, `${file} still interpolates $ARGUMENTS inside a shell string`);
+    // $ARGUMENTS may only appear as inline-code prose (`$ARGUMENTS`) or as the
+    // whole body line of a quoted heredoc. Anywhere else the shell expands what
+    // Claude Code substituted before bash ever ran.
+    assertArgumentsNeverReachTheShell(file, body);
+    // rescue.md randomizes its delimiter suffix per call; the flag-only bodies keep the fixed one.
+    const expectedDelimiter = file === "rescue.md" ? /--args-stdin <<'CODEX_ARGS_/ : /--args-stdin <<'CODEX_ARGS'/;
+    assert.match(body, expectedDelimiter, `${file} must pass arguments through a quoted heredoc`);
+  }
+
+  const rescue = read("commands/rescue.md");
+  const agent = read("agents/codex-rescue.md");
+  for (const [label, body] of [["rescue.md", rescue], ["codex-rescue.md", agent]]) {
+    assert.doesNotMatch(body, /"<request text>"/, `${label} still interpolates the request text inside a shell string`);
+    assert.match(
+      body,
+      /task --background --json --prompt-file "\$PROMPT" --args-stdin <<'CODEX_ARGS/,
+      `${label} must launch through a quoted heredoc`
+    );
+    assert.match(
+      body,
+      /\[\[ "\$JOB" =~ \^\[A-Za-z0-9_-\]\+\$ \]\] \|\| \{ echo "invalid job id"; exit 1; \}/,
+      `${label} must validate the job id before using it`
+    );
+  }
+});
+
+// The request prose and the runtime flags travel in separate channels: the prose
+// via --prompt-file (byte-exact) and only the flags through the tokenizer.
+function readArgsHeredocBody(body) {
+  const lines = body.split("\n");
+  const start = lines.findIndex((line) => line.includes("--args-stdin <<'CODEX_ARGS"));
+  assert.notEqual(start, -1, "no --args-stdin heredoc found");
+  const end = lines.findIndex((line, index) => index > start && line.trim().startsWith("CODEX_ARGS"));
+  assert.notEqual(end, -1, "unterminated --args-stdin heredoc");
+  return lines.slice(start + 1, end).join("\n");
+}
+
+test("rescue sends the request prose through --prompt-file, never through the argument tokenizer", () => {
+  for (const [label, body] of [
+    ["rescue.md", read("commands/rescue.md")],
+    ["codex-rescue.md", read("agents/codex-rescue.md")]
+  ]) {
+    assert.match(body, /cat > "\$PROMPT" <<'CODEX_PROMPT_/, `${label} must write the request prose with its own quoted heredoc`);
+    assert.match(body, /--prompt-file "\$PROMPT"/, `${label} must pass the prose file to the companion`);
+    assert.doesNotMatch(
+      readArgsHeredocBody(body),
+      /<request text>/,
+      `${label} still routes the request text through the argument tokenizer`
+    );
+    assert.match(body, /rm -f "\$ERR" "\$OUT" "\$PROMPT"/, `${label} must clean up the prose file`);
+
+    // A payload line equal to a fixed delimiter would close the heredoc early and
+    // run the rest on the host shell.
+    assert.match(body, /fresh random suffix on every call/, `${label} must require per-call heredoc delimiters`);
+    assert.match(body, /`CODEX_PROMPT_<random>` \/ `CODEX_ARGS_<random>`/, `${label} must name both randomized delimiters`);
+  }
+});
+
+test("README documents the fork's own install commands", () => {
+  const readme = fs.readFileSync(path.join(ROOT, "README.md"), "utf8");
+
+  assert.match(readme, /plugin marketplace add CBEPX\/codex-plugin-cc/);
+  assert.match(readme, /plugin install codex@cbepx/);
+
+  // No install line may point at the upstream marketplace or plugin id. The one
+  // line allowed to name upstream is the "Upstream:" attribution.
+  readme.split("\n").forEach((line, index) => {
+    if (!/plugin (marketplace add|install)/.test(line) || !line.includes("openai")) {
+      return;
+    }
+    assert.ok(line.includes("Upstream:"), `README.md:${index + 1} still documents an upstream install: ${line}`);
+  });
+  assert.doesNotMatch(readme, /openai-codex/);
+});
+
+test("bump-version --check pins the lockfile identity to package.json", () => {
+  const lock = JSON.parse(fs.readFileSync(path.join(ROOT, "package-lock.json"), "utf8"));
+  const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, "package.json"), "utf8"));
+  assert.equal(lock.name, pkg.name);
+  assert.equal(lock.packages[""].name, pkg.name);
 });

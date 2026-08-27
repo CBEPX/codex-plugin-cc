@@ -4,6 +4,7 @@
  * @typedef {import("./app-server-protocol").ThreadItem} ThreadItem
  * @typedef {import("./app-server-protocol").ThreadResumeParams} ThreadResumeParams
  * @typedef {import("./app-server-protocol").ThreadStartParams} ThreadStartParams
+ * @typedef {NonNullable<ThreadStartParams["config"]>} ThreadConfig
  * @typedef {import("./app-server-protocol").Turn} Turn
  * @typedef {import("./app-server-protocol").UserInput} UserInput
  * @typedef {((update: string | { message: string, phase: string | null, threadId?: string | null, turnId?: string | null, stderrMessage?: string | null, logTitle?: string | null, logBody?: string | null }) => void)} ProgressReporter
@@ -43,6 +44,7 @@ import { readJsonFile } from "./fs.mjs";
 import { BROKER_BUSY_RPC_CODE, BROKER_ENDPOINT_ENV, CodexAppServerClient } from "./app-server.mjs";
 import { loadBrokerSession } from "./broker-lifecycle.mjs";
 import { binaryAvailable } from "./process.mjs";
+import { listJobs } from "./state.mjs";
 
 const SERVICE_NAME = "claude_code_codex_plugin";
 const TASK_THREAD_PREFIX = "Codex Companion Task";
@@ -59,6 +61,47 @@ function cleanCodexStderr(stderr) {
     .join("\n");
 }
 
+/**
+ * @param {unknown} value
+ * @returns {any}
+ */
+function parseConfigValue(value) {
+  if (typeof value !== "string") {
+    return value;
+  }
+  try {
+    return JSON.parse(value);
+  } catch {
+    return value;
+  }
+}
+
+/**
+ * Codex honours per-thread `config.toml` overrides on `thread/start`/`thread/resume`,
+ * which is the only reliable way to pin a model or reasoning effort for a review
+ * (`ReviewStartParams` carries neither) — see upstream #476/#651/#408.
+ * @param {{ model?: string | null, effort?: string | null, config?: Record<string, unknown> | null, reviewModel?: string | null }} [options]
+ * @returns {ThreadConfig | null}
+ */
+export function buildThreadConfig(options = {}) {
+  const { model, effort, config, reviewModel } = options;
+  /** @type {ThreadConfig} */
+  const merged = {};
+  for (const [key, value] of Object.entries(config ?? {})) {
+    merged[key] = parseConfigValue(value);
+  }
+  if (model) {
+    merged.model = model;
+  }
+  if (reviewModel) {
+    merged.review_model = reviewModel;
+  }
+  if (effort) {
+    merged.model_reasoning_effort = effort;
+  }
+  return Object.keys(merged).length > 0 ? merged : null;
+}
+
 /** @returns {ThreadStartParams} */
 function buildThreadParams(cwd, options = {}) {
   return {
@@ -66,19 +109,27 @@ function buildThreadParams(cwd, options = {}) {
     model: options.model ?? null,
     approvalPolicy: options.approvalPolicy ?? "never",
     sandbox: options.sandbox ?? "read-only",
+    config: buildThreadConfig(options),
     serviceName: SERVICE_NAME,
     ephemeral: options.ephemeral ?? true
   };
 }
 
-/** @returns {ThreadResumeParams} */
+/**
+ * Resume deliberately forwards only the explicit `--config` overrides: a
+ * `config.model_reasoning_effort` — or a top-level `model` — on resume counts as
+ * a model override in app-server (`has_model_resume_override`) and would cancel
+ * the thread's persisted model/provider. Model and effort for the resumed turn
+ * ride on `turn/start` instead.
+ * @returns {ThreadResumeParams}
+ */
 function buildResumeParams(threadId, cwd, options = {}) {
   return {
     threadId,
     cwd,
-    model: options.model ?? null,
     approvalPolicy: options.approvalPolicy ?? "never",
-    sandbox: options.sandbox ?? "read-only"
+    sandbox: options.sandbox ?? "read-only",
+    config: buildThreadConfig({ config: options.config })
   };
 }
 
@@ -263,6 +314,8 @@ function describeStartedItem(state, item) {
     }
     case "webSearch":
       return { message: `Searching: ${shorten(item.query, 96)}`, phase: "investigating" };
+    case "reasoning":
+      return { message: "Thinking.", phase: null };
     default:
       return null;
   }
@@ -610,10 +663,10 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
   }
 }
 
-async function withAppServer(cwd, fn) {
+async function withAppServer(cwd, fn, clientOptions = {}) {
   let client = null;
   try {
-    client = await CodexAppServerClient.connect(cwd);
+    client = await CodexAppServerClient.connect(cwd, clientOptions);
     const result = await fn(client);
     await client.close();
     return result;
@@ -632,7 +685,7 @@ async function withAppServer(cwd, fn) {
       throw error;
     }
 
-    const directClient = await CodexAppServerClient.connect(cwd, { disableBroker: true });
+    const directClient = await CodexAppServerClient.connect(cwd, { ...clientOptions, disableBroker: true });
     try {
       return await fn(directClient);
     } finally {
@@ -1007,15 +1060,25 @@ export async function runAppServerReview(cwd, options = {}) {
 
   return withAppServer(cwd, async (client) => {
     emitProgress(options.onProgress, "Starting Codex review thread.", "starting");
-    const thread = await startThread(client, cwd, {
+    const response = await startThread(client, cwd, {
       model: options.model,
+      effort: options.effort,
+      config: options.config,
+      reviewModel: options.model,
       sandbox: "read-only",
       ephemeral: true,
       threadName: options.threadName
     });
-    const sourceThreadId = thread.thread.id;
+    const sourceThreadId = response.thread.id;
+    const resolved = {
+      model: response.model,
+      modelProvider: response.modelProvider,
+      reasoningEffort: response.reasoningEffort,
+      sandbox: response.sandbox
+    };
     emitProgress(options.onProgress, `Thread ready (${sourceThreadId}).`, "starting", {
-      threadId: sourceThreadId
+      threadId: sourceThreadId,
+      resolved
     });
     const delivery = options.delivery ?? "inline";
 
@@ -1046,6 +1109,7 @@ export async function runAppServerReview(cwd, options = {}) {
       threadId: turnState.threadId,
       sourceThreadId,
       turnId: turnState.turnId,
+      resolved,
       reviewText: turnState.reviewText,
       reasoningSummary: turnState.reasoningSummary,
       turn: turnState.finalTurn,
@@ -1092,36 +1156,65 @@ export async function importExternalAgentSession(cwd, options = {}) {
   });
 }
 
+// Two concurrent turns on one thread interleave their history. The
+// session-scoped resume-candidate lookup cannot see jobs from other Claude
+// sessions, so the thread itself is checked here, where every resume passes.
+function assertThreadIsFree(cwd, threadId, excludeJobId = null) {
+  const busy = listJobs(cwd).find(
+    (job) =>
+      job.id !== excludeJobId &&
+      job.threadId === threadId &&
+      (job.status === "queued" || job.status === "running")
+  );
+  if (busy) {
+    throw new Error(`Thread ${threadId} is busy in job ${busy.id}; wait for it or run cancel ${busy.id} first.`);
+  }
+}
+
 export async function runAppServerTurn(cwd, options = {}) {
   const availability = getCodexAvailability(cwd);
   if (!availability.available) {
     throw new Error("Codex CLI is not installed or is missing required runtime support. Install it with `npm install -g @openai/codex`, then rerun `/codex:setup`.");
   }
 
+  // A resume must run on its own app-server: a broker-backed server keeps the
+  // thread loaded, so `thread/resume` becomes a hot rejoin and its config,
+  // approvalPolicy and sandbox overrides are ignored.
   return withAppServer(cwd, async (client) => {
-    let threadId;
+    let response;
 
     if (options.resumeThreadId) {
+      assertThreadIsFree(cwd, options.resumeThreadId, options.excludeJobId);
       emitProgress(options.onProgress, `Resuming thread ${options.resumeThreadId}.`, "starting");
-      const response = await resumeThread(client, options.resumeThreadId, cwd, {
-        model: options.model,
+      response = await resumeThread(client, options.resumeThreadId, cwd, {
+        config: options.config,
+        approvalPolicy: options.approvalPolicy,
         sandbox: options.sandbox,
         ephemeral: false
       });
-      threadId = response.thread.id;
     } else {
       emitProgress(options.onProgress, "Starting Codex task thread.", "starting");
-      const response = await startThread(client, cwd, {
+      response = await startThread(client, cwd, {
         model: options.model,
+        effort: options.effort,
+        config: options.config,
+        approvalPolicy: options.approvalPolicy,
         sandbox: options.sandbox,
         ephemeral: options.persistThread ? false : true,
         threadName: options.persistThread ? options.threadName : options.threadName ?? null
       });
-      threadId = response.thread.id;
     }
 
+    const threadId = response.thread.id;
+    let resolved = {
+      model: response.model,
+      modelProvider: response.modelProvider,
+      reasoningEffort: response.reasoningEffort,
+      sandbox: response.sandbox
+    };
     emitProgress(options.onProgress, `Thread ready (${threadId}).`, "starting", {
-      threadId
+      threadId,
+      resolved
     });
 
     const prompt = options.prompt?.trim() || options.defaultPrompt || "";
@@ -1140,13 +1233,23 @@ export async function runAppServerTurn(cwd, options = {}) {
           effort: options.effort ?? null,
           outputSchema: options.outputSchema ?? null
         }),
-      { onProgress: options.onProgress }
+      {
+        onProgress: options.onProgress,
+        onResponse() {
+          if (!options.effort) {
+            return;
+          }
+          resolved = { ...resolved, reasoningEffort: options.effort };
+          options.onProgress?.({ message: "", resolved });
+        }
+      }
     );
 
     return {
       status: buildResultStatus(turnState),
       threadId,
       turnId: turnState.turnId,
+      resolved,
       finalMessage: turnState.lastAgentMessage,
       reasoningSummary: turnState.reasoningSummary,
       turn: turnState.finalTurn,
@@ -1156,7 +1259,7 @@ export async function runAppServerTurn(cwd, options = {}) {
       touchedFiles: collectTouchedFiles(turnState.fileChanges),
       commandExecutions: turnState.commandExecutions
     };
-  });
+  }, { disableBroker: Boolean(options.resumeThreadId) });
 }
 
 export async function findLatestTaskThread(cwd) {
