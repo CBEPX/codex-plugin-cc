@@ -8,6 +8,7 @@ import process from "node:process";
 import { parseArgs } from "./lib/args.mjs";
 import { BROKER_BUSY_RPC_CODE, CodexAppServerClient } from "./lib/app-server.mjs";
 import { parseBrokerEndpoint } from "./lib/broker-endpoint.mjs";
+import { clearBrokerSession, loadBrokerSession } from "./lib/broker-lifecycle.mjs";
 
 const STREAMING_METHODS = new Set(["turn/start", "review/start", "thread/compact/start"]);
 
@@ -24,9 +25,10 @@ const IDLE_TIMEOUT_ENV = "CODEX_COMPANION_BROKER_IDLE_TIMEOUT_MS";
 const DEFAULT_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
 
 // Resolve the idle timeout from the CLI flag, then the environment, then the
-// default. A value <= 0 (or a non-finite/negative override) disables the timeout
-// so the broker never self-terminates, which keeps the old behavior available for
-// callers that manage lifecycle themselves.
+// default. Exactly `0` disables the timeout so the broker never self-terminates,
+// which keeps the old behavior available for callers that manage lifecycle
+// themselves; a negative or non-finite override is treated as garbage and falls
+// back to the default.
 function resolveIdleTimeoutMs(optionValue, env = process.env) {
   const raw = optionValue ?? env[IDLE_TIMEOUT_ENV];
   if (raw === undefined || raw === null || raw === "") {
@@ -100,6 +102,7 @@ async function main() {
   let activeStreamThreadIds = null;
   const sockets = new Set();
   let idleTimer = null;
+  let shuttingDown = false;
 
   function disarmIdleTimer() {
     if (idleTimer) {
@@ -153,13 +156,40 @@ async function main() {
     }
   }
 
+  // The ownership record in broker.json outlives the process unless we drop it:
+  // after an idle self-terminate a later SessionEnd hook would load it and
+  // signal a PID the OS may have recycled, and `status`/`reuseExistingBroker`
+  // would advertise or dial an endpoint nothing is listening on. Only clear a
+  // record that still points at this broker — a newer broker may have replaced
+  // us in it. The state dir derives from --cwd plus the inherited environment,
+  // exactly as it did in the process that spawned us.
+  function clearOwnSessionRecord() {
+    try {
+      if (loadBrokerSession(cwd)?.endpoint === endpoint) {
+        clearBrokerSession(cwd);
+      }
+    } catch {
+      // Best-effort: never block shutdown on state-file cleanup.
+    }
+  }
+
+  // Closing the app-server child can take a while. Stop listening before the
+  // first await instead of after it: a client accepted in that window would be
+  // served the broker-local `initialize` and then fail its first real RPC with
+  // "codex app-server client is closed", which callers do not retry.
   async function shutdown(server) {
+    if (shuttingDown) {
+      return;
+    }
+    shuttingDown = true;
     disarmIdleTimer();
+    clearOwnSessionRecord();
+    const serverClosed = new Promise((resolve) => server.close(resolve));
     for (const socket of sockets) {
       socket.end();
     }
     await appClient.close().catch(() => {});
-    await new Promise((resolve) => server.close(resolve));
+    await serverClosed;
     if (listenTarget.kind === "unix" && fs.existsSync(listenTarget.path)) {
       fs.unlinkSync(listenTarget.path);
     }
@@ -171,6 +201,12 @@ async function main() {
   appClient.setNotificationHandler(routeNotification);
 
   const server = net.createServer((socket) => {
+    if (shuttingDown) {
+      // Already accepted before the listener finished closing: reset it so the
+      // client retries or reports a connection error instead of half-working.
+      socket.destroy();
+      return;
+    }
     sockets.add(socket);
     disarmIdleTimer();
     socket.setEncoding("utf8");

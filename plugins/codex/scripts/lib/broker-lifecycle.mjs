@@ -6,6 +6,7 @@ import process from "node:process";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { createBrokerEndpoint, parseBrokerEndpoint } from "./broker-endpoint.mjs";
+import { processCommandLine } from "./process.mjs";
 import { resolveStateDir } from "./state.mjs";
 
 export const PID_FILE_ENV = "CODEX_COMPANION_APP_SERVER_PID_FILE";
@@ -170,8 +171,24 @@ export async function ensureBrokerSession(cwd, options = {}) {
   return session;
 }
 
+// A recorded PID is only worth signalling while it still belongs to this
+// session's broker: an idle self-terminate (or any abnormal exit) can leave the
+// record behind long enough for the OS to hand the PID — and with it the process
+// group `terminateProcessTree` kills — to something unrelated. Windows has no
+// cheap equivalent probe, so it keeps the previous unconditional behavior.
+function ownsBrokerProcess(pid, endpoint) {
+  if (process.platform === "win32") {
+    return true;
+  }
+  const commandLine = processCommandLine(pid);
+  if (!commandLine || !commandLine.includes("app-server-broker.mjs")) {
+    return false;
+  }
+  return !endpoint || commandLine.includes(endpoint);
+}
+
 export function teardownBrokerSession({ endpoint = null, pidFile, logFile, sessionDir = null, pid = null, killProcess = null }) {
-  if (Number.isFinite(pid) && killProcess) {
+  if (Number.isFinite(pid) && killProcess && ownsBrokerProcess(pid, endpoint)) {
     try {
       killProcess(pid);
     } catch {

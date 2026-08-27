@@ -283,6 +283,18 @@ bootState.appServerStarts = (bootState.appServerStarts || 0) + 1;
 saveState(bootState);
 
 const rl = readline.createInterface({ input: process.stdin });
+
+// Test knob: linger after stdin closes (and ignore the client's SIGTERM
+// escalation) so a test can observe the window while a broker is shutting its
+// app-server child down.
+const CLOSE_DELAY_MS = Number(process.env.FAKE_CODEX_CLOSE_DELAY_MS || 0);
+if (CLOSE_DELAY_MS > 0) {
+  process.on("SIGTERM", () => {});
+  rl.on("close", () => {
+    setTimeout(() => process.exit(0), CLOSE_DELAY_MS);
+  });
+}
+
 rl.on("line", (line) => {
   if (!line.trim()) {
     return;

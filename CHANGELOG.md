@@ -3,6 +3,7 @@
 ## 1.1.1 — 2026-08-28
 
 - Broker idle self-terminate (upstream #457): the shared Codex runtime exits after 30 minutes without a connected client (`CODEX_COMPANION_BROKER_IDLE_TIMEOUT_MS` / `--idle-timeout`), so idle brokers and their app-server children no longer accumulate (#543).
+- Broker lifecycle races found in #457: a broker that self-terminates on idle now drops its `broker.json` ownership record (a later `SessionEnd` could otherwise signal a recycled PID, and `status` could advertise a dead endpoint), teardown verifies the recorded PID really is this session's broker before signalling it, and the broker stops listening before it closes its app-server child so a client connecting mid-shutdown is refused instead of being served and then failing its first RPC.
 - Test suite no longer leaks fake `codex app-server`/broker processes (5 s idle timeout in the test environment; CI fails if any `codex-plugin-test-*` process survives).
 - Rescue shell blocks use `command rm -f --` in their cleanup trap (no noise from `rm` aliases such as `trash`).
 

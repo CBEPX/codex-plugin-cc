@@ -57,6 +57,32 @@ function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// Connect and try one `initialize`, reporting whether the broker served it.
+function connectAndInitialize(endpoint, { timeoutMs = 1000 } = {}) {
+  const target = parseBrokerEndpoint(endpoint);
+  return new Promise((resolve) => {
+    const socket = net.createConnection({ path: target.path });
+    let settled = false;
+    const finish = (outcome) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      socket.destroy();
+      resolve(outcome);
+    };
+    const timer = setTimeout(() => finish({ initialized: false, reason: "timeout" }), timeoutMs);
+    socket.setEncoding("utf8");
+    socket.on("connect", () => {
+      socket.write(`${JSON.stringify({ id: 1, method: "initialize", params: {} })}\n`);
+    });
+    socket.on("data", (chunk) => finish({ initialized: chunk.includes("result"), reason: chunk.trim() }));
+    socket.on("error", (error) => finish({ initialized: false, reason: error.code ?? error.message }));
+    socket.on("close", () => finish({ initialized: false, reason: "closed" }));
+  });
+}
+
 test("broker self-terminates after the idle timeout when no client is connected", async () => {
   const binDir = makeTempDir();
   installFakeCodex(binDir);
@@ -131,6 +157,42 @@ test("broker with the idle timeout disabled keeps running while idle", async () 
   } finally {
     if (child.exitCode === null && child.signalCode === null) {
       child.kill();
+    }
+  }
+});
+
+// Shutting down takes as long as the app-server child needs to exit. A client
+// that connects during that window used to be accepted and answered locally by
+// the broker's own `initialize`, then failed its first real RPC with
+// "codex app-server client is closed" — an error the caller does not retry.
+test("broker refuses clients that connect after the idle shutdown starts", async () => {
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const sessionDir = makeTempDir("cxc-");
+  const endpoint = createBrokerEndpoint(sessionDir);
+  const child = spawnBroker({
+    cwd: sessionDir,
+    endpoint,
+    env: buildEnv(binDir, { FAKE_CODEX_CLOSE_DELAY_MS: "2000" }),
+    idleTimeoutMs: 300
+  });
+
+  try {
+    const ready = await waitForBrokerEndpoint(endpoint, 3000);
+    assert.equal(ready, true);
+
+    // No endpoint probing between here and the late connect: every probe
+    // connection re-arms the idle timer, so the window would never open.
+    await delay(700);
+
+    const outcome = await connectAndInitialize(endpoint);
+    assert.equal(outcome.initialized, false, `late client must not be served: ${JSON.stringify(outcome)}`);
+
+    const result = await waitForExit(child, { timeoutMs: 10000 });
+    assert.equal(result.code, 0, "broker must still exit after refusing the late client");
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) {
+      child.kill("SIGKILL");
     }
   }
 });
