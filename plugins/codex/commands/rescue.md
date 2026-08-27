@@ -20,7 +20,7 @@ The request prose and the runtime flags travel in two separate channels of the s
 2a. Launch (one Bash call):
 
 ```bash
-trap 'rm -f "$ERR" "$OUT" "$PROMPT"' EXIT
+trap 'command rm -f -- "$ERR" "$OUT" "$PROMPT"' EXIT
 ERR=$(mktemp); PROMPT=$(mktemp)
 cat > "$PROMPT" <<'CODEX_PROMPT_<random>'
 <request text>
@@ -38,7 +38,7 @@ If this call exits non-zero, its output is the launch failure (Codex missing, un
 2b. Wait and fetch the result (one Bash call, tool `timeout: 600000`). Set `JOB=<id>` literally as the first line, using the id you just read from 2a:
 
 ```bash
-trap 'rm -f "$ERR" "$OUT" "$PROMPT"' EXIT
+trap 'command rm -f -- "$ERR" "$OUT" "$PROMPT"' EXIT
 JOB=<id>
 [[ "$JOB" =~ ^[A-Za-z0-9_-]+$ ]] || { echo "invalid job id"; exit 1; }
 OUT=$(mktemp); ERR=$(mktemp)

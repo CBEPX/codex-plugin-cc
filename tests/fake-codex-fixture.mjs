@@ -663,10 +663,15 @@ rl.on("line", (line) => {
   }
 }
 
-export function buildEnv(binDir) {
+export function buildEnv(binDir, overrides = {}) {
   const sep = process.platform === "win32" ? ";" : ":";
   return {
     ...process.env,
-    PATH: `${binDir}${sep}${process.env.PATH}`
+    PATH: `${binDir}${sep}${process.env.PATH}`,
+    // Keep test brokers short-lived so a run that leaves one behind (crash,
+    // interrupted test, etc.) doesn't linger as an orphaned process for the
+    // default 30-minute idle timeout. See PR #457.
+    CODEX_COMPANION_BROKER_IDLE_TIMEOUT_MS: "2000",
+    ...overrides
   };
 }
