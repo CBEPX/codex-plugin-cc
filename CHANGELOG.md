@@ -21,6 +21,8 @@ Fork of [openai/codex-plugin-cc](https://github.com/openai/codex-plugin-cc) 1.0.
 - `--resume-last` opens a fresh app-server session (cold resume) so `--config`, sandbox and approval policy take effect, and never sends `model` on `thread/resume` (it would drop the persisted model); the resumed turn's model/effort ride on `turn/start`.
 - All MCP elicitations are declined (no operator is present); URL/form flows must be completed in an interactive Codex session.
 - `/codex:rescue` is synchronous by default without the `Agent` tool: `task --background` → `status --wait` in ≤9-minute slices (job id carried literally between Bash calls) → `result`; launch failures stop immediately with visible stderr; `Agent` only for `--background`; `--write` is never added unless the user explicitly asked Codex to modify files.
+- `/codex:rescue` asks before continuing an existing Codex thread (`Continue current Codex thread` / `Start a new Codex thread`) instead of resuming silently; its `allowed-tools` is now `Bash, AskUserQuestion, Agent` because the body is multi-command shell.
+- A resume refuses to start a second turn on a thread that a queued or running job is still using, including a job from another Claude session.
 - Model aliases: `sol`, `luna`, `terra`, `mini` (plus `spark`); rescue agent has no pinned `model:`; runtime skill mentions `$agent-compat:skill-router` for uncommon domains.
 - Stop-gate script timeout (13 min) is below the hook timeout (15 min); `spawnSync` uses `SIGKILL` and a 16 MiB buffer.
 - Hermetic test environment (`tests/test-env.mjs`); CI on push; `npm run build` type-checks the JSDoc.

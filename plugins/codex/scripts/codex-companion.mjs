@@ -558,6 +558,7 @@ async function executeTaskRun(request) {
 
   const result = await runAppServerTurn(workspaceRoot, {
     resumeThreadId,
+    excludeJobId: request.jobId,
     prompt: request.prompt,
     defaultPrompt: resumeThreadId ? DEFAULT_CONTINUE_PROMPT : "",
     model: request.model,

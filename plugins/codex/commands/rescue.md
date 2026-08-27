@@ -1,7 +1,7 @@
 ---
 description: Delegate investigation, an explicit fix request, or follow-up rescue work to the Codex rescue subagent
 argument-hint: "[--background|--wait] [--resume|--fresh] [--model <model|spark|sol|luna|terra|mini>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [--config key=value]... [what Codex should investigate, solve, or continue]"
-allowed-tools: Bash(node:*), AskUserQuestion, Agent
+allowed-tools: Bash, AskUserQuestion, Agent
 ---
 
 Delegate the request to Codex through the shared companion runtime. Default is synchronous: the user gets Codex's answer in this turn.
@@ -11,7 +11,7 @@ Raw slash-command arguments:
 
 If the request contains `--background`, skip directly to step 3 — steps 1 and 2 are the default synchronous path and do not run for a `--background` request.
 
-1. Strip `--wait` if present (it is the default). If the request contains `--resume`, use `task --resume-last`; if `--fresh`, use a fresh `task`; otherwise run `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task-resume-candidate --json` and follow its recommendation. Pass `--model`, `--effort` and every `--config key=value` through unchanged. Never add `--write` unless the user explicitly asked Codex to modify files.
+1. Strip `--wait` if present (it is the default). If the request contains `--resume`, use `task --resume-last`; if `--fresh`, use a fresh `task`. Otherwise run `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task-resume-candidate --json`: when it reports no resumable thread, start a fresh `task`; when it reports one, ask with `AskUserQuestion` exactly once before choosing — options `Continue current Codex thread` (use `task --resume-last`) and `Start a new Codex thread` (use a fresh `task`). Resuming silently would append this request to an unrelated earlier thread, so never pick `--resume-last` on your own. Pass `--model`, `--effort` and every `--config key=value` through unchanged. Never add `--write` unless the user explicitly asked Codex to modify files.
 
 2. Launch the job, then wait for it — two separate Bash calls, in ≤9-minute wait slices so the Bash tool's 10-minute cap never kills a long run. Bash calls share no variables — always set `JOB=<id>` literally at the top of every later call; never rely on a `$JOB` left over from a previous call.
 

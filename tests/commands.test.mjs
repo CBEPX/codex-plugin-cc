@@ -91,7 +91,7 @@ test("rescue command absorbs continue semantics", () => {
   const runtimeSkill = read("skills/codex-cli-runtime/SKILL.md");
 
   assert.match(rescue, /Show the `result` output to the user verbatim/i);
-  assert.match(rescue, /allowed-tools:\s*Bash\(node:\*\),\s*AskUserQuestion,\s*Agent/);
+  assert.match(rescue, /allowed-tools:\s*Bash,\s*AskUserQuestion,\s*Agent/);
   // Regression for #234: `Skill(codex:rescue)` from the main agent recursed
   // because rescue.md named the routing with ambiguous prose ("Route this
   // request to the `codex:codex-rescue` subagent") while running under
@@ -106,7 +106,8 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(rescue, /--model <model\|spark\|sol\|luna\|terra\|mini>/);
   assert.match(rescue, /--effort <none\|minimal\|low\|medium\|high\|xhigh\|max\|ultra>/);
   assert.match(rescue, /task-resume-candidate --json/);
-  assert.match(rescue, /AskUserQuestion/);
+  assert.match(rescue, /AskUserQuestion.*Continue current Codex thread/s);
+  assert.match(rescue, /Start a new Codex thread/);
   assert.match(rescue, /Default is synchronous/i);
   assert.match(rescue, /Strip `--wait` if present/i);
   assert.match(rescue, /Pass `--model`, `--effort` and every `--config key=value` through unchanged/i);

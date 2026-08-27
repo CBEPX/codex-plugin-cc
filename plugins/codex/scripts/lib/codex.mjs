@@ -44,6 +44,7 @@ import { readJsonFile } from "./fs.mjs";
 import { BROKER_BUSY_RPC_CODE, BROKER_ENDPOINT_ENV, CodexAppServerClient } from "./app-server.mjs";
 import { loadBrokerSession } from "./broker-lifecycle.mjs";
 import { binaryAvailable } from "./process.mjs";
+import { listJobs } from "./state.mjs";
 
 const SERVICE_NAME = "claude_code_codex_plugin";
 const TASK_THREAD_PREFIX = "Codex Companion Task";
@@ -1155,6 +1156,21 @@ export async function importExternalAgentSession(cwd, options = {}) {
   });
 }
 
+// Two concurrent turns on one thread interleave their history. The
+// session-scoped resume-candidate lookup cannot see jobs from other Claude
+// sessions, so the thread itself is checked here, where every resume passes.
+function assertThreadIsFree(cwd, threadId, excludeJobId = null) {
+  const busy = listJobs(cwd).find(
+    (job) =>
+      job.id !== excludeJobId &&
+      job.threadId === threadId &&
+      (job.status === "queued" || job.status === "running")
+  );
+  if (busy) {
+    throw new Error(`Thread ${threadId} is busy in job ${busy.id}; wait for it or run cancel ${busy.id} first.`);
+  }
+}
+
 export async function runAppServerTurn(cwd, options = {}) {
   const availability = getCodexAvailability(cwd);
   if (!availability.available) {
@@ -1168,6 +1184,7 @@ export async function runAppServerTurn(cwd, options = {}) {
     let response;
 
     if (options.resumeThreadId) {
+      assertThreadIsFree(cwd, options.resumeThreadId, options.excludeJobId);
       emitProgress(options.onProgress, `Resuming thread ${options.resumeThreadId}.`, "starting");
       response = await resumeThread(client, options.resumeThreadId, cwd, {
         config: options.config,

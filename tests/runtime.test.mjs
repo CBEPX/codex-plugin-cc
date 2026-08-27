@@ -2735,3 +2735,50 @@ test("task --background keeps secret --config values out of every job record", (
   assert.equal(fakeState.lastThreadStart.config["model_providers.x.http_headers.Authorization"], "SECRET_SENTINEL_42");
   assert.equal(fakeState.lastThreadStart.config.model_provider, "ollama");
 });
+
+test("a resume refuses to start a second turn on a thread another job is still using", () => {
+  const repo = seededRepo();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const env = { ...buildEnv(binDir), CODEX_COMPANION_SESSION_ID: "sess-current" };
+
+  const first = run("node", [SCRIPT, "task", "first"], { cwd: repo, env });
+  assert.equal(first.status, 0, first.stderr);
+
+  // Another Claude session is mid-turn on the very thread this session would
+  // resume. Its job is invisible to this session's resume-candidate lookup, so
+  // only the thread-level guard can catch it.
+  const statePath = path.join(resolveStateDir(repo), "state.json");
+  const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  const busyJob = {
+    id: "task-other-running",
+    status: "running",
+    phase: "running",
+    title: "Codex Task",
+    jobClass: "task",
+    sessionId: "sess-other",
+    threadId: "thr_1",
+    summary: "Other session active task",
+    updatedAt: "2026-03-24T20:05:00.000Z"
+  };
+  state.jobs.push(busyJob);
+  fs.writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+
+  const blocked = run("node", [SCRIPT, "task", "--resume-last", "follow up"], { cwd: repo, env });
+  assert.notEqual(blocked.status, 0);
+  assert.match(
+    blocked.stderr,
+    /Thread thr_1 is busy in job task-other-running; wait for it or run cancel task-other-running first\./
+  );
+
+  // Once that job finishes, the same resume goes through.
+  busyJob.status = "completed";
+  busyJob.phase = "done";
+  fs.writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+
+  const resumed = run("node", [SCRIPT, "task", "--resume-last", "follow up"], { cwd: repo, env });
+  assert.equal(resumed.status, 0, resumed.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+  assert.equal(fakeState.lastTurnStart.threadId, "thr_1");
+  assert.equal(fakeState.lastTurnStart.prompt, "follow up");
+});
