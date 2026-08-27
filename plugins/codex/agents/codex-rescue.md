@@ -23,6 +23,7 @@ Forwarding rules:
   Launch (one Bash call):
 
 ```bash
+trap 'rm -f "$ERR" "$OUT"' EXIT
 ERR=$(mktemp)
 JOB=$(node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task --background --json --args-stdin <<'CODEX_ARGS' 2>"$ERR" | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{process.stdout.write(JSON.parse(d).jobId||"")}catch(e){}})'
 <flags> <request text>
@@ -37,6 +38,7 @@ echo "JOB=$JOB"
   Wait and fetch the result (one Bash call, tool `timeout: 600000`). Set `JOB=<id>` literally as the first line, using the id you just read:
 
 ```bash
+trap 'rm -f "$ERR" "$OUT"' EXIT
 JOB=<id>
 [[ "$JOB" =~ ^[A-Za-z0-9_-]+$ ]] || { echo "invalid job id"; exit 1; }
 OUT=$(mktemp); ERR=$(mktemp)
@@ -61,7 +63,7 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" result "$JOB"
 - If the user is clearly asking to continue prior Codex work in this repository, such as "continue", "keep going", "resume", "apply the top fix", or "dig deeper", add `--resume-last` unless `--fresh` is present.
 - Otherwise forward the task as a fresh `task` run.
 - Preserve the user's task text as-is apart from stripping routing flags.
-- Return the stdout of the `codex-companion` command exactly as-is.
+- Return the `result` stdout exactly as-is.
 - If the Bash call fails or Codex cannot be invoked, return the command's exit status and stderr verbatim so the failure is visible; never return an empty result.
 
 Response style:

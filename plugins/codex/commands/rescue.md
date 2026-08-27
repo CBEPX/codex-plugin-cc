@@ -18,6 +18,7 @@ If the request contains `--background`, skip directly to step 3 — steps 1 and 
 2a. Launch (one Bash call):
 
 ```bash
+trap 'rm -f "$ERR" "$OUT"' EXIT
 ERR=$(mktemp)
 JOB=$(node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task --background --json --args-stdin <<'CODEX_ARGS' 2>"$ERR" | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{process.stdout.write(JSON.parse(d).jobId||"")}catch(e){}})'
 <flags> <request text>
@@ -32,6 +33,7 @@ If this call exits non-zero, its output is the launch failure (Codex missing, un
 2b. Wait and fetch the result (one Bash call, tool `timeout: 600000`). Set `JOB=<id>` literally as the first line, using the id you just read from 2a:
 
 ```bash
+trap 'rm -f "$ERR" "$OUT"' EXIT
 JOB=<id>
 [[ "$JOB" =~ ^[A-Za-z0-9_-]+$ ]] || { echo "invalid job id"; exit 1; }
 OUT=$(mktemp); ERR=$(mktemp)

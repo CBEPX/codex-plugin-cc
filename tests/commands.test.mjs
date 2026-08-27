@@ -125,7 +125,7 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(agent, /Leave model unset by default/i);
   assert.match(agent, /If the user asks for `spark`, map that to `--model gpt-5\.3-codex-spark`/i);
   assert.match(agent, /If the user asks for a concrete model name such as `gpt-5\.4-mini`, pass it through with `--model`/i);
-  assert.match(agent, /Return the stdout of the `codex-companion` command exactly as-is/i);
+  assert.match(agent, /Return the `result` stdout exactly as-is/i);
   assert.match(agent, /If the Bash call fails or Codex cannot be invoked, return the command's exit status and stderr verbatim/i);
   assert.match(agent, /gpt-5-4-prompting/);
   assert.match(agent, /only to tighten the user's request into a better Codex prompt/i);
@@ -304,4 +304,28 @@ test("command bodies hand arguments to the companion via a quoted heredoc, never
       `${label} must validate the job id before using it`
     );
   }
+});
+
+test("README documents the fork's own install commands", () => {
+  const readme = fs.readFileSync(path.join(ROOT, "README.md"), "utf8");
+
+  assert.match(readme, /plugin marketplace add CBEPX\/codex-plugin-cc/);
+  assert.match(readme, /plugin install codex@cbepx/);
+
+  // No install line may point at the upstream marketplace or plugin id. The one
+  // line allowed to name upstream is the "Upstream:" attribution.
+  readme.split("\n").forEach((line, index) => {
+    if (!/plugin (marketplace add|install)/.test(line) || !line.includes("openai")) {
+      return;
+    }
+    assert.ok(line.includes("Upstream:"), `README.md:${index + 1} still documents an upstream install: ${line}`);
+  });
+  assert.doesNotMatch(readme, /openai-codex/);
+});
+
+test("bump-version --check pins the lockfile identity to package.json", () => {
+  const lock = JSON.parse(fs.readFileSync(path.join(ROOT, "package-lock.json"), "utf8"));
+  const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, "package.json"), "utf8"));
+  assert.equal(lock.name, pkg.name);
+  assert.equal(lock.packages[""].name, pkg.name);
 });

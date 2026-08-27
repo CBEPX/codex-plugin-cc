@@ -156,6 +156,26 @@ function readPackageVersion(root) {
   return packageJson.version;
 }
 
+// `npm install` rewrites package-lock.json from package.json, but a lockfile
+// carried over from a fork's upstream keeps the upstream package name until
+// someone regenerates it. Check it here so the drift cannot ship.
+function checkLockfileIdentity(root) {
+  const expectedName = readJson(root, "package.json").name;
+  const lock = readJson(root, "package-lock.json");
+  const mismatches = [];
+
+  for (const [label, actual] of [
+    ["name", lock.name],
+    ['packages[""].name', lock.packages?.[""]?.name]
+  ]) {
+    if (actual !== expectedName) {
+      mismatches.push(`package-lock.json ${label}: expected ${expectedName}, found ${actual ?? "<missing>"}`);
+    }
+  }
+
+  return mismatches;
+}
+
 function checkVersions(root, expectedVersion) {
   const mismatches = [];
 
@@ -169,7 +189,7 @@ function checkVersions(root, expectedVersion) {
     }
   }
 
-  return mismatches;
+  return [...mismatches, ...checkLockfileIdentity(root)];
 }
 
 function bumpVersion(root, version) {
@@ -208,7 +228,7 @@ function main() {
   if (options.check) {
     const mismatches = checkVersions(options.root, version);
     if (mismatches.length > 0) {
-      throw new Error(`Version metadata is out of sync:\n${mismatches.join("\n")}`);
+      throw new Error(`Release metadata is out of sync:\n${mismatches.join("\n")}`);
     }
     console.log(`All version metadata matches ${version}.`);
     return;

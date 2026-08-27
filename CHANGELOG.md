@@ -11,11 +11,14 @@ Fork of [openai/codex-plugin-cc](https://github.com/openai/codex-plugin-cc) 1.0.
 - #501 answer MCP elicitation requests instead of rejecting them
 - #608 rescue agent awaits the delegated result instead of returning a placeholder
 - #690 explicit Bash blocks in `status`/`result`/`cancel`/`transfer` commands (pass permission classifiers)
-- #547 `task --help` and unknown flags are CLI errors, never a prompt
+- #547 unknown flags are CLI errors, never part of the prompt; `--help` prints usage and exits 0
 - #645 / #644 job records store resolved model/effort/sandbox; reasoning start is logged
 - #672 SessionStart hook timeout raised; #668 idempotent `CLAUDE_ENV_FILE` exports; #682 stop gate fails closed on malformed input; #396 `CODEX_REVIEW_GATE_MAX_ROUNDS`
 
 ### Fork changes
+- Slash-command arguments reach the companion through a quoted heredoc on stdin (`--args-stdin`) instead of a shell string: Claude Code substitutes `$ARGUMENTS` before bash runs, so `$(...)`/backticks in a prompt used to execute on the host shell, outside Codex's sandbox. Rescue job ids are validated before use.
+- Approval requests (`execCommandApproval`, `applyPatchApproval`, `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`, `item/permissions/requestApproval`) are answered with each type's refusal variant instead of a `-32601` protocol error that made `--write` turns fail or hang.
+- Background task records are written before the worker is spawned (a fast worker used to find no record and exit while the launch reported `queued`), and the worker reads the full request — including `--config` values — from a private one-shot `jobs/<id>.request.json` (mode 0600); the job record `status`/`result` echo keeps secret-looking config values redacted.
 - Model and reasoning effort are sent per thread via `thread/start.config` (`model`, `review_model` for native review, `model_reasoning_effort`); generic `--config` pairs are applied first, dedicated flags override them; `--effort` now works on `review` and `adversarial-review`.
 - Repeatable `--config key=value` on `task`, `review`, `adversarial-review` forwards any `config.toml` override to the thread (values are JSON-parsed; quote a literal string as `'"true"'`). Prompt-taking commands stop option parsing at the first positional, so prompt text like `ls -R` is never mis-parsed.
 - `--resume-last` opens a fresh app-server session (cold resume) so `--config`, sandbox and approval policy take effect, and never sends `model` on `thread/resume` (it would drop the persisted model); the resumed turn's model/effort ride on `turn/start`.
