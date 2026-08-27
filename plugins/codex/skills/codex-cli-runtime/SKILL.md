@@ -20,10 +20,12 @@ Execution rules:
 - That prompt drafting is the only Claude-side work allowed. Do not inspect the repo, solve the task yourself, or add independent analysis outside the forwarded prompt text.
 - Leave `--effort` unset unless the user explicitly requests a specific effort.
 - Leave model unset by default. Add `--model` only when the user explicitly asks for one.
-- Map `spark` to `--model gpt-5.3-codex-spark`, `sol` to `gpt-5.6-sol`, `luna` to `gpt-5.6-luna`, `terra` to `gpt-5.6-terra`, and `mini` to `gpt-5.4-mini`.
+- Map `spark` to `--model gpt-5.3-codex-spark`.
+- Map `sol` to `--model gpt-5.6-sol`, `luna` to `--model gpt-5.6-luna`, `terra` to `--model gpt-5.6-terra`, `mini` to `--model gpt-5.4-mini`.
 - Default to a write-capable Codex run by adding `--write` unless the user explicitly asks for read-only behavior or only wants review, diagnosis, or research without edits.
 
 Command selection:
+- If the request names an uncommon domain (private infra runbooks, vendor-specific tooling), prepend to the task text: "If a matching skill is not already loaded, run `$agent-compat:skill-router` to find a reviewed playbook before starting." (Codex has the agent-compat plugin installed; it routes to reviewed route-only skills offline.)
 - Use exactly one `task` invocation per rescue handoff.
 - Always run that Bash call in the foreground. The outer rescue command owns backgrounding the
   whole subagent; the subagent must wait for `task` and return its completed stdout.
@@ -44,4 +46,4 @@ Safety rules:
 - Preserve the user's task text as-is apart from stripping routing flags.
 - Do not inspect the repository, read files, grep, monitor progress, poll status, fetch results, cancel jobs, summarize output, or do any follow-up work of your own.
 - Return the stdout of the `task` command exactly as-is.
-- If the Bash call fails or Codex cannot be invoked, return nothing.
+- If the Bash call fails or Codex cannot be invoked, return the command's exit status and stderr verbatim so the failure is visible; never return an empty result.
