@@ -2652,3 +2652,86 @@ test("task --args-stdin keeps shell metacharacters inside the prompt instead of 
   assert.equal(fakeState.lastTurnStart.prompt, `investigate $(touch ${sentinel}) \`id\``);
   assert.equal(fs.existsSync(sentinel), false);
 });
+
+test("task --background persists the job record before spawning the worker", () => {
+  const repo = seededRepo();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "slow-task");
+
+  const launched = run("node", [SCRIPT, "task", "--background", "--json", "investigate the ordering"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(launched.status, 0, launched.stderr);
+  const { jobId } = JSON.parse(launched.stdout);
+
+  // The launch command has returned, so the record must already be readable by
+  // the worker no matter how fast it started.
+  const stateDir = resolveStateDir(repo);
+  const indexed = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8")).jobs.find((job) => job.id === jobId);
+  assert.ok(indexed, "job must be in the state index as soon as the launch returns");
+  assert.ok(["queued", "running"].includes(indexed.status), `unexpected status ${indexed.status}`);
+  assert.ok(fs.existsSync(path.join(stateDir, "jobs", `${jobId}.json`)), "job file must exist as soon as the launch returns");
+
+  const waited = run("node", [SCRIPT, "status", jobId, "--wait", "--timeout-ms", "20000", "--json"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(waited.status, 0, waited.stderr);
+  assert.equal(JSON.parse(waited.stdout).job.status, "completed");
+});
+
+test("task --background keeps secret --config values out of every job record", () => {
+  const repo = seededRepo();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+
+  const launched = run(
+    "node",
+    [
+      SCRIPT,
+      "task",
+      "--background",
+      "--json",
+      "--config",
+      "model_providers.x.http_headers.Authorization=SECRET_SENTINEL_42",
+      "--config",
+      "model_provider=ollama",
+      "x"
+    ],
+    { cwd: repo, env: buildEnv(binDir) }
+  );
+  assert.equal(launched.status, 0, launched.stderr);
+  const { jobId } = JSON.parse(launched.stdout);
+
+  const waited = run("node", [SCRIPT, "status", jobId, "--wait", "--timeout-ms", "20000", "--json"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(waited.status, 0, waited.stderr);
+  assert.equal(JSON.parse(waited.stdout).job.status, "completed");
+  const resultRun = run("node", [SCRIPT, "result", jobId, "--json"], { cwd: repo, env: buildEnv(binDir) });
+  assert.equal(resultRun.status, 0, resultRun.stderr);
+
+  const stateDir = resolveStateDir(repo);
+  const exposures = {
+    "state index": fs.readFileSync(path.join(stateDir, "state.json"), "utf8"),
+    "job file": fs.readFileSync(path.join(stateDir, "jobs", `${jobId}.json`), "utf8"),
+    "status --json stdout": waited.stdout,
+    "result --json stdout": resultRun.stdout
+  };
+  for (const [label, text] of Object.entries(exposures)) {
+    assert.equal(text.includes("SECRET_SENTINEL_42"), false, `${label} leaked the secret --config value`);
+    assert.equal(text.includes("[redacted]"), true, `${label} should keep the redacted placeholder`);
+    assert.equal(text.includes("ollama"), true, `${label} should keep non-secret config values readable`);
+  }
+
+  // The one-shot payload file is deleted by the worker once it has read it.
+  assert.equal(fs.existsSync(path.join(stateDir, "jobs", `${jobId}.request.json`)), false);
+
+  // The worker still forwarded the real value to Codex.
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(fakeState.lastThreadStart.config["model_providers.x.http_headers.Authorization"], "SECRET_SENTINEL_42");
+  assert.equal(fakeState.lastThreadStart.config.model_provider, "ollama");
+});

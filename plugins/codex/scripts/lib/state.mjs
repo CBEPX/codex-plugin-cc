@@ -108,6 +108,7 @@ export function saveState(cwd, state) {
       continue;
     }
     removeJobFile(resolveJobFile(cwd, job.id));
+    removeFileIfExists(resolveJobRequestFile(cwd, job.id));
     removeFileIfExists(job.logFile);
   }
 
@@ -188,4 +189,28 @@ export function resolveJobLogFile(cwd, jobId) {
 export function resolveJobFile(cwd, jobId) {
   ensureStateDir(cwd);
   return path.join(resolveJobsDir(cwd), `${jobId}.json`);
+}
+
+// The full task request can carry secrets (`--config` values such as auth
+// headers), so background workers read it from a private one-shot file instead
+// of the job record that `status`/`result` echo back to the user.
+export function resolveJobRequestFile(cwd, jobId) {
+  ensureStateDir(cwd);
+  return path.join(resolveJobsDir(cwd), `${jobId}.request.json`);
+}
+
+export function writeJobRequestFile(cwd, jobId, payload) {
+  const requestFile = resolveJobRequestFile(cwd, jobId);
+  fs.writeFileSync(requestFile, `${JSON.stringify(payload, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+  return requestFile;
+}
+
+export function consumeJobRequestFile(cwd, jobId) {
+  const requestFile = resolveJobRequestFile(cwd, jobId);
+  if (!fs.existsSync(requestFile)) {
+    return null;
+  }
+  const payload = JSON.parse(fs.readFileSync(requestFile, "utf8"));
+  fs.unlinkSync(requestFile);
+  return payload;
 }

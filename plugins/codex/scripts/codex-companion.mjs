@@ -27,12 +27,14 @@ import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "
 import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import {
+  consumeJobRequestFile,
   generateJobId,
   getConfig,
   listJobs,
   setConfig,
   upsertJob,
-  writeJobFile
+  writeJobFile,
+  writeJobRequestFile
 } from "./lib/state.mjs";
 import {
   buildSingleJobSnapshot,
@@ -757,21 +759,58 @@ function spawnDetachedTaskWorker(cwd, jobId) {
   return child;
 }
 
+const PRIVATE_CONFIG_KEY_PATTERN = /key|token|secret|auth|password/i;
+
+// `status --json` / `result --json` echo the stored job record back to the user
+// and to Claude, so a `--config model_providers.x.http_headers.Authorization=...`
+// would end up in the transcript. The worker reads the real values from the
+// private one-shot payload file; the record keeps only a redacted copy.
+function redactPrivateConfigValues(config) {
+  if (!config || typeof config !== "object") {
+    return config;
+  }
+  return Object.fromEntries(
+    Object.entries(config).map(([key, value]) => [key, PRIVATE_CONFIG_KEY_PATTERN.test(key) ? "[redacted]" : value])
+  );
+}
+
 function enqueueBackgroundTask(cwd, job, request) {
   const { logFile } = createTrackedProgress(job);
   appendLogLine(logFile, "Queued for background execution.");
 
-  const child = spawnDetachedTaskWorker(cwd, job.id);
+  // Persist before spawning: a worker that starts instantly must find its
+  // record, otherwise it exits while the parent reports `queued`.
+  const requestFile = writeJobRequestFile(job.workspaceRoot, job.id, request);
   const queuedRecord = {
     ...job,
     status: "queued",
     phase: "queued",
-    pid: child.pid ?? null,
+    pid: null,
     logFile,
-    request
+    requestFile,
+    request: { ...request, config: redactPrivateConfigValues(request.config) }
   };
   writeJobFile(job.workspaceRoot, job.id, queuedRecord);
   upsertJob(job.workspaceRoot, queuedRecord);
+
+  let child;
+  try {
+    child = spawnDetachedTaskWorker(cwd, job.id);
+    if (child.pid === undefined) {
+      throw new Error("Could not spawn the background Codex worker.");
+    }
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    const failedRecord = { ...queuedRecord, status: "failed", phase: "failed", errorMessage };
+    writeJobFile(job.workspaceRoot, job.id, failedRecord);
+    upsertJob(job.workspaceRoot, failedRecord);
+    throw error;
+  }
+
+  // Nothing writes this record from here on: the worker owns it from the moment
+  // it starts, and `runTrackedJob` stores its own pid (the same `child.pid`) as
+  // its first act. A post-spawn patch from the parent would race the worker's
+  // own `upsertJob` and could rewind `running` back to `queued`.
 
   return {
     payload: {
@@ -950,7 +989,9 @@ async function handleTaskWorker(argv) {
     throw new Error(`No stored job found for ${options["job-id"]}.`);
   }
 
-  const request = storedJob.request;
+  // The private payload carries the unredacted request; fall back to the record
+  // for jobs queued before that file existed.
+  const request = consumeJobRequestFile(workspaceRoot, options["job-id"]) ?? storedJob.request;
   if (!request || typeof request !== "object") {
     throw new Error(`Stored job ${options["job-id"]} is missing its task request payload.`);
   }

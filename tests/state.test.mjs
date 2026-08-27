@@ -5,7 +5,16 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { makeTempDir } from "./helpers.mjs";
-import { resolveJobFile, resolveJobLogFile, resolveStateDir, resolveStateFile, saveState } from "../plugins/codex/scripts/lib/state.mjs";
+import {
+  consumeJobRequestFile,
+  resolveJobFile,
+  resolveJobLogFile,
+  resolveJobRequestFile,
+  resolveStateDir,
+  resolveStateFile,
+  saveState,
+  writeJobRequestFile
+} from "../plugins/codex/scripts/lib/state.mjs";
 
 test("resolveStateDir uses a temp-backed per-workspace directory", () => {
   const workspace = makeTempDir();
@@ -102,4 +111,28 @@ test("saveState prunes dropped job artifacts when indexed jobs exceed the cap", 
       .flatMap((jobId) => [`${jobId}.json`, `${jobId}.log`])
       .sort()
   );
+});
+
+test("job request payloads are written owner-only and consumed exactly once", () => {
+  const workspace = makeTempDir();
+  const payload = { prompt: "go", config: { "http_headers.Authorization": "SECRET" } };
+
+  const requestFile = writeJobRequestFile(workspace, "task-1", payload);
+  assert.equal(requestFile, resolveJobRequestFile(workspace, "task-1"));
+  assert.equal(fs.statSync(requestFile).mode & 0o777, 0o600);
+
+  assert.deepEqual(consumeJobRequestFile(workspace, "task-1"), payload);
+  assert.equal(fs.existsSync(requestFile), false);
+  assert.equal(consumeJobRequestFile(workspace, "task-1"), null);
+});
+
+test("saveState drops the private request payload of pruned jobs", () => {
+  const workspace = makeTempDir();
+  const requestFile = writeJobRequestFile(workspace, "task-dropped", { prompt: "go" });
+
+  saveState(workspace, { jobs: [{ id: "task-dropped", updatedAt: "2026-01-01T00:00:00.000Z" }] });
+  assert.equal(fs.existsSync(requestFile), true);
+
+  saveState(workspace, { jobs: [] });
+  assert.equal(fs.existsSync(requestFile), false);
 });
