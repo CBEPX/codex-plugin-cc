@@ -1009,15 +1009,22 @@ export async function runAppServerReview(cwd, options = {}) {
 
   return withAppServer(cwd, async (client) => {
     emitProgress(options.onProgress, "Starting Codex review thread.", "starting");
-    const thread = await startThread(client, cwd, {
+    const response = await startThread(client, cwd, {
       model: options.model,
       sandbox: "read-only",
       ephemeral: true,
       threadName: options.threadName
     });
-    const sourceThreadId = thread.thread.id;
+    const sourceThreadId = response.thread.id;
+    const resolved = {
+      model: response.model,
+      modelProvider: response.modelProvider,
+      reasoningEffort: response.reasoningEffort,
+      sandbox: response.sandbox
+    };
     emitProgress(options.onProgress, `Thread ready (${sourceThreadId}).`, "starting", {
-      threadId: sourceThreadId
+      threadId: sourceThreadId,
+      resolved
     });
     const delivery = options.delivery ?? "inline";
 
@@ -1048,6 +1055,7 @@ export async function runAppServerReview(cwd, options = {}) {
       threadId: turnState.threadId,
       sourceThreadId,
       turnId: turnState.turnId,
+      resolved,
       reviewText: turnState.reviewText,
       reasoningSummary: turnState.reasoningSummary,
       turn: turnState.finalTurn,
@@ -1101,31 +1109,37 @@ export async function runAppServerTurn(cwd, options = {}) {
   }
 
   return withAppServer(cwd, async (client) => {
-    let threadId;
+    let response;
 
     if (options.resumeThreadId) {
       emitProgress(options.onProgress, `Resuming thread ${options.resumeThreadId}.`, "starting");
-      const response = await resumeThread(client, options.resumeThreadId, cwd, {
+      response = await resumeThread(client, options.resumeThreadId, cwd, {
         model: options.model,
         approvalPolicy: options.approvalPolicy,
         sandbox: options.sandbox,
         ephemeral: false
       });
-      threadId = response.thread.id;
     } else {
       emitProgress(options.onProgress, "Starting Codex task thread.", "starting");
-      const response = await startThread(client, cwd, {
+      response = await startThread(client, cwd, {
         model: options.model,
         approvalPolicy: options.approvalPolicy,
         sandbox: options.sandbox,
         ephemeral: options.persistThread ? false : true,
         threadName: options.persistThread ? options.threadName : options.threadName ?? null
       });
-      threadId = response.thread.id;
     }
 
+    const threadId = response.thread.id;
+    let resolved = {
+      model: response.model,
+      modelProvider: response.modelProvider,
+      reasoningEffort: response.reasoningEffort,
+      sandbox: response.sandbox
+    };
     emitProgress(options.onProgress, `Thread ready (${threadId}).`, "starting", {
-      threadId
+      threadId,
+      resolved
     });
 
     const prompt = options.prompt?.trim() || options.defaultPrompt || "";
@@ -1144,13 +1158,23 @@ export async function runAppServerTurn(cwd, options = {}) {
           effort: options.effort ?? null,
           outputSchema: options.outputSchema ?? null
         }),
-      { onProgress: options.onProgress }
+      {
+        onProgress: options.onProgress,
+        onResponse() {
+          if (!options.effort) {
+            return;
+          }
+          resolved = { ...resolved, reasoningEffort: options.effort };
+          options.onProgress?.({ message: "", resolved });
+        }
+      }
     );
 
     return {
       status: buildResultStatus(turnState),
       threadId,
       turnId: turnState.turnId,
+      resolved,
       finalMessage: turnState.lastAgentMessage,
       reasoningSummary: turnState.reasoningSummary,
       turn: turnState.finalTurn,
