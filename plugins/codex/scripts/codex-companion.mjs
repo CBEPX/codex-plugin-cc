@@ -149,12 +149,23 @@ function normalizeArgv(argv) {
 
 function parseCommandInput(argv, config = {}) {
   return parseArgs(normalizeArgv(argv), {
+    rejectUnknownOptions: true,
     ...config,
+    booleanOptions: ["help", ...(config.booleanOptions ?? [])],
     aliasMap: {
       C: "cwd",
+      h: "help",
       ...(config.aliasMap ?? {})
     }
   });
+}
+
+function maybePrintCommandHelp(options) {
+  if (!options.help) {
+    return false;
+  }
+  printUsage();
+  return true;
 }
 
 function resolveCommandCwd(options = {}) {
@@ -226,6 +237,9 @@ async function handleSetup(argv) {
     valueOptions: ["cwd"],
     booleanOptions: ["json", "enable-review-gate", "disable-review-gate"]
   });
+  if (maybePrintCommandHelp(options)) {
+    return;
+  }
 
   if (options["enable-review-gate"] && options["disable-review-gate"]) {
     throw new Error("Choose either --enable-review-gate or --disable-review-gate.");
@@ -727,6 +741,9 @@ async function handleReviewCommand(argv, config) {
       m: "model"
     }
   });
+  if (maybePrintCommandHelp(options)) {
+    return;
+  }
 
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
@@ -778,6 +795,9 @@ async function handleTask(argv) {
       m: "model"
     }
   });
+  if (maybePrintCommandHelp(options)) {
+    return;
+  }
 
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
@@ -838,6 +858,9 @@ async function handleTransfer(argv) {
     valueOptions: ["cwd", "source"],
     booleanOptions: ["json"]
   });
+  if (maybePrintCommandHelp(options)) {
+    return;
+  }
 
   const cwd = resolveCommandCwd(options);
   const { payload, rendered } = await executeTransfer(cwd, {
@@ -896,6 +919,9 @@ async function handleStatus(argv) {
     valueOptions: ["cwd", "timeout-ms", "poll-interval-ms"],
     booleanOptions: ["json", "all", "wait"]
   });
+  if (maybePrintCommandHelp(options)) {
+    return;
+  }
 
   const cwd = resolveCommandCwd(options);
   const reference = positionals[0] ?? "";
@@ -923,6 +949,9 @@ function handleResult(argv) {
     valueOptions: ["cwd"],
     booleanOptions: ["json"]
   });
+  if (maybePrintCommandHelp(options)) {
+    return;
+  }
 
   const cwd = resolveCommandCwd(options);
   const reference = positionals[0] ?? "";
@@ -941,6 +970,9 @@ function handleTaskResumeCandidate(argv) {
     valueOptions: ["cwd"],
     booleanOptions: ["json"]
   });
+  if (maybePrintCommandHelp(options)) {
+    return;
+  }
 
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
@@ -976,6 +1008,9 @@ async function handleCancel(argv) {
     valueOptions: ["cwd"],
     booleanOptions: ["json"]
   });
+  if (maybePrintCommandHelp(options)) {
+    return;
+  }
 
   const cwd = resolveCommandCwd(options);
   const reference = positionals[0] ?? "";
