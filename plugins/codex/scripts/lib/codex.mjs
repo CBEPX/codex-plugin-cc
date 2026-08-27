@@ -1217,7 +1217,10 @@ export async function runAppServerTurn(cwd, options = {}) {
       resolved
     });
 
-    const prompt = options.prompt?.trim() || options.defaultPrompt || "";
+    // `promptRaw` marks a prompt the caller already normalised byte for byte
+    // (`task --prompt-stdin`): trimming it here would eat indentation the user
+    // typed on purpose.
+    const prompt = (options.promptRaw ? options.prompt : options.prompt?.trim()) || options.defaultPrompt || "";
     if (!prompt) {
       throw new Error("A prompt is required for this Codex run.");
     }

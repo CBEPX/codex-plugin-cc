@@ -2820,3 +2820,202 @@ test("task --prompt-file wins over --args-stdin and keeps the prompt byte-exact"
   assert.equal(fakeState.lastTurnStart.prompt, promptText);
   assert.equal(fakeState.lastTurnStart.effort, "max");
 });
+
+test("task --await launches a tracked job, waits, and prints the result", () => {
+  const repo = seededRepo();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  const result = run("node", [SCRIPT, "task", "--await", "--json", "--model", "sol", "--effort", "low", "--prompt-stdin"], {
+    cwd: repo, env: buildEnv(binDir), input: "line one \\d+ \"quoted\" 'single'\nline two\n"
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const out = JSON.parse(result.stdout);
+  assert.match(out.job.id, /^task-/);
+  assert.equal(out.job.status, "completed");
+  assert.ok(typeof out.storedJob.result.rawOutput === "string" && out.storedJob.result.rawOutput.length > 0);
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(fakeState.lastTurnStart.prompt, "line one \\d+ \"quoted\" 'single'\nline two");
+  assert.equal(fakeState.lastTurnStart.effort, "low");
+  const status = run("node", [SCRIPT, "status", out.job.id, "--json"], { cwd: repo, env: buildEnv(binDir) });
+  assert.equal(JSON.parse(status.stdout).job.status, "completed");
+});
+
+test("task --await exits 3 with a resumable hint when the await timeout elapses", () => {
+  const repo = seededRepo();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const env = buildEnv(binDir, { FAKE_CODEX_TURN_DELAY_MS: "3000" });
+  const result = run("node", [SCRIPT, "task", "--await", "--await-timeout-ms", "500", "--prompt-stdin"], { cwd: repo, env, input: "slow task\n" });
+  assert.equal(result.status, 3);
+  assert.match(result.stdout, /Still running: job task-[A-Za-z0-9_-]+\. Re-run: node .*result task-[A-Za-z0-9_-]+ --wait --timeout-ms 540000/);
+  const jobId = result.stdout.match(/job (task-[A-Za-z0-9_-]+)/)[1];
+  const done = run("node", [SCRIPT, "result", jobId, "--wait", "--timeout-ms", "20000"], { cwd: repo, env });
+  assert.equal(done.status, 0, done.stderr);
+});
+
+test("task rejects --prompt-stdin combined with --args-stdin or --prompt-file", () => {
+  const repo = seededRepo();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const r = run("node", [SCRIPT, "task", "--prompt-stdin", "--args-stdin"], { cwd: repo, env: buildEnv(binDir), input: "x" });
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /--prompt-stdin/);
+});
+
+test("result on a still-running job exits 3 with the wait hint instead of \"No job found\"", () => {
+  const repo = seededRepo();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const env = buildEnv(binDir, { FAKE_CODEX_TURN_DELAY_MS: "3000" });
+  const launch = run("node", [SCRIPT, "task", "--background", "--json", "--prompt-stdin"], {
+    cwd: repo, env, input: "slow background task\n"
+  });
+  assert.equal(launch.status, 0, launch.stderr);
+  const { jobId } = JSON.parse(launch.stdout);
+
+  const active = run("node", [SCRIPT, "result", jobId], { cwd: repo, env });
+  assert.equal(active.status, 3, active.stderr);
+  assert.match(
+    active.stdout,
+    new RegExp(`Job ${jobId} is still (queued|running)\\. Re-run: node .*result ${jobId} --wait --timeout-ms 540000`)
+  );
+
+  const done = run("node", [SCRIPT, "result", jobId, "--wait", "--timeout-ms", "20000"], { cwd: repo, env });
+  assert.equal(done.status, 0, done.stderr);
+  assert.ok(done.stdout.trim().length > 0);
+});
+
+test("task usage errors around --prompt-stdin arrive without waiting for stdin", async () => {
+  const repo = seededRepo();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const cases = [
+    [["--prompt-stdin", "--args-stdin"], /--prompt-stdin cannot be combined with --args-stdin/],
+    [["--prompt-stdin", "--await", "--background"], /Choose either --await or --background/]
+  ];
+
+  for (const [args, pattern] of cases) {
+    const startedAt = Date.now();
+    const child = spawn("node", [SCRIPT, "task", ...args], {
+      cwd: repo,
+      env: buildEnv(binDir),
+      stdio: ["pipe", "pipe", "pipe"]
+    });
+    let stderr = "";
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
+    // stdin stays open and empty: the error must not wait for EOF.
+    const code = await new Promise((resolve, reject) => {
+      child.on("error", reject);
+      child.on("exit", resolve);
+    });
+    child.stdin.destroy();
+
+    assert.notEqual(code, 0, args.join(" "));
+    assert.match(stderr, pattern, args.join(" "));
+    assert.ok(Date.now() - startedAt < 2000, `${args.join(" ")} took ${Date.now() - startedAt}ms`);
+  }
+});
+
+test("task --prompt-stdin sends the prompt verbatim minus one trailing newline", () => {
+  const repo = seededRepo();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  const promptText = "\n   indented first line   \r\nsecond\tline\n\nlast line without a newline";
+
+  const withNewline = run("node", [SCRIPT, "task", "--prompt-stdin"], {
+    cwd: repo, env: buildEnv(binDir), input: `${promptText}\r\n`
+  });
+  assert.equal(withNewline.status, 0, withNewline.stderr);
+  assert.equal(JSON.parse(fs.readFileSync(statePath, "utf8")).lastTurnStart.prompt, promptText);
+
+  const withoutNewline = run("node", [SCRIPT, "task", "--prompt-stdin"], {
+    cwd: repo, env: buildEnv(binDir), input: promptText
+  });
+  assert.equal(withoutNewline.status, 0, withoutNewline.stderr);
+  assert.equal(JSON.parse(fs.readFileSync(statePath, "utf8")).lastTurnStart.prompt, promptText);
+});
+
+test("task rejects contradictory await and prompt flag combinations", () => {
+  const repo = seededRepo();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const cases = [
+    [["--prompt-stdin", "inline prompt text"], /--prompt-stdin cannot be combined with --prompt-file or prompt text/],
+    [["--prompt-stdin", "--prompt-file", "prompt.txt"], /--prompt-stdin cannot be combined with --prompt-file or prompt text/],
+    [["--await", "--background", "do it"], /Choose either --await or --background/],
+    [["--await-timeout-ms", "1000", "do it"], /--await-timeout-ms requires --await/],
+    [["--await", "--await-timeout-ms", "0", "do it"], /--await-timeout-ms expects a positive integer/],
+    [["--await", "--await-timeout-ms", "-5", "do it"], /--await-timeout-ms expects a positive integer/],
+    [["--await", "--await-timeout-ms", "1.5", "do it"], /--await-timeout-ms expects a positive integer/],
+    [["--await", "--await-timeout-ms", "nope", "do it"], /--await-timeout-ms expects a positive integer/]
+  ];
+
+  for (const [args, pattern] of cases) {
+    const result = run("node", [SCRIPT, "task", ...args], { cwd: repo, env: buildEnv(binDir), input: "" });
+    assert.notEqual(result.status, 0, args.join(" "));
+    assert.match(result.stderr, pattern, args.join(" "));
+  }
+
+  const badResultTimeout = run("node", [SCRIPT, "result", "task-x", "--wait", "--timeout-ms", "0"], {
+    cwd: repo, env: buildEnv(binDir)
+  });
+  assert.notEqual(badResultTimeout.status, 0);
+  assert.match(badResultTimeout.stderr, /--timeout-ms expects a positive integer/);
+});
+
+test("task --await reports a failed job with exit 1 while result stays exit 0", () => {
+  const repo = seededRepo();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "turn-start-fails");
+
+  const awaited = run("node", [SCRIPT, "task", "--await", "--json", "--prompt-stdin"], {
+    cwd: repo, env: buildEnv(binDir), input: "break on purpose\n"
+  });
+  assert.equal(awaited.status, 1, awaited.stderr);
+  const out = JSON.parse(awaited.stdout);
+  assert.equal(out.job.status, "failed");
+  assert.match(out.storedJob.errorMessage, /turn\/start failed after thread resolution/);
+
+  const stored = run("node", [SCRIPT, "result", out.job.id], { cwd: repo, env: buildEnv(binDir) });
+  assert.equal(stored.status, 0, stored.stderr);
+  assert.match(stored.stdout, /turn\/start failed after thread resolution/);
+});
+
+test("cancelling an awaited job ends the await with exit 1 and leaves a readable result", async () => {
+  const repo = seededRepo();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const env = buildEnv(binDir, { FAKE_CODEX_TURN_DELAY_MS: "6000" });
+
+  const child = spawn("node", [SCRIPT, "task", "--await", "--await-timeout-ms", "30000", "--prompt-stdin"], {
+    cwd: repo,
+    env,
+    stdio: ["pipe", "pipe", "pipe"]
+  });
+  child.stdin.end("cancel me\n");
+  const exited = new Promise((resolve, reject) => {
+    child.on("error", reject);
+    child.on("exit", resolve);
+  });
+
+  const stateFile = path.join(resolveStateDir(repo), "state.json");
+  const jobId = await waitFor(() => {
+    if (!fs.existsSync(stateFile)) {
+      return null;
+    }
+    const job = JSON.parse(fs.readFileSync(stateFile, "utf8")).jobs?.[0];
+    return job && (job.status === "queued" || job.status === "running") ? job.id : null;
+  }, { timeoutMs: 15000 });
+
+  const cancelled = run("node", [SCRIPT, "cancel", jobId], { cwd: repo, env });
+  assert.equal(cancelled.status, 0, cancelled.stderr);
+  assert.equal(await exited, 1);
+
+  const stored = run("node", [SCRIPT, "result", jobId, "--json"], { cwd: repo, env });
+  assert.equal(stored.status, 0, stored.stderr);
+  assert.equal(JSON.parse(stored.stdout).job.status, "cancelled");
+});

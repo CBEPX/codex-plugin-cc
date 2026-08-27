@@ -288,6 +288,10 @@ const rl = readline.createInterface({ input: process.stdin });
 // escalation) so a test can observe the window while a broker is shutting its
 // app-server child down.
 const CLOSE_DELAY_MS = Number(process.env.FAKE_CODEX_CLOSE_DELAY_MS || 0);
+
+// Test knob: hold a plain turn open for this long before completing it, so a
+// test can observe a job that is still running.
+const TURN_DELAY_MS = Number(process.env.FAKE_CODEX_TURN_DELAY_MS || 0);
 if (CLOSE_DELAY_MS > 0) {
   process.on("SIGTERM", () => {});
   rl.on("close", () => {
@@ -628,6 +632,8 @@ rl.on("line", (line) => {
 	          interruptibleTurns.set(turnId, { threadId: thread.id, timer });
 	        } else if (BEHAVIOR === "slow-task") {
 	          emitTurnCompletedLater(thread.id, turnId, items, 400);
+	        } else if (TURN_DELAY_MS > 0) {
+	          emitTurnCompletedLater(thread.id, turnId, items, TURN_DELAY_MS);
 	        } else {
 	          emitTurnCompleted(thread.id, turnId, items);
 	        }

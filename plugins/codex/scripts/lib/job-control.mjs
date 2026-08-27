@@ -188,7 +188,7 @@ export function readStoredJob(workspaceRoot, jobId) {
   return readJobFile(jobFile);
 }
 
-function matchJobReference(jobs, reference, predicate = () => true) {
+function matchJobReference(jobs, reference, predicate = () => true, options = {}) {
   const filtered = jobs.filter(predicate);
   if (!reference) {
     return filtered[0] ?? null;
@@ -205,6 +205,10 @@ function matchJobReference(jobs, reference, predicate = () => true) {
   }
   if (prefixMatches.length > 1) {
     throw new Error(`Job reference "${reference}" is ambiguous. Use a longer job id.`);
+  }
+
+  if (options.optional) {
+    return null;
   }
 
   throw new Error(`No job found for "${reference}". Run /codex:status to list known jobs.`);
@@ -253,26 +257,36 @@ export function buildSingleJobSnapshot(cwd, reference, options = {}) {
   };
 }
 
+// Resolves the job `result` should report on: a finished one when there is one,
+// otherwise the still-active job the reference points at. Filtering by terminal
+// status *before* matching used to make `result <running-id>` fail with
+// "No job found" (#498/#524); the caller decides how to report an active job.
 export function resolveResultJob(cwd, reference) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const jobs = sortJobsNewestFirst(reference ? listJobs(workspaceRoot) : filterJobsForCurrentSession(listJobs(workspaceRoot)));
   const selected = matchJobReference(
     jobs,
     reference,
-    (job) => job.status === "completed" || job.status === "failed" || job.status === "cancelled"
+    (job) => job.status === "completed" || job.status === "failed" || job.status === "cancelled",
+    { optional: true }
   );
 
   if (selected) {
     return { workspaceRoot, job: selected };
   }
 
-  const active = matchJobReference(jobs, reference, (job) => job.status === "queued" || job.status === "running");
+  const active = matchJobReference(
+    jobs,
+    reference,
+    (job) => job.status === "queued" || job.status === "running",
+    { optional: true }
+  );
   if (active) {
-    throw new Error(`Job ${active.id} is still ${active.status}. Check /codex:status and try again once it finishes.`);
+    return { workspaceRoot, job: active };
   }
 
   if (reference) {
-    throw new Error(`No finished job found for "${reference}". Run /codex:status to inspect active jobs.`);
+    throw new Error(`No job found for "${reference}". Run /codex:status to list known jobs.`);
   }
 
   throw new Error("No finished Codex jobs found for this repository yet.");

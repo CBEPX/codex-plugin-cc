@@ -68,8 +68,13 @@ import {
 } from "./lib/render.mjs";
 
 const ROOT_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
+const COMPANION_SCRIPT = path.join(ROOT_DIR, "scripts", "codex-companion.mjs");
 const REVIEW_SCHEMA = path.join(ROOT_DIR, "schemas", "review-output.schema.json");
 const DEFAULT_STATUS_WAIT_TIMEOUT_MS = 240000;
+// Claude Code kills a Bash tool call at 600000ms, so an awaited task has to
+// hand control back before that with a resumable hint.
+const DEFAULT_AWAIT_TIMEOUT_MS = 540000;
+const DEFAULT_AWAIT_POLL_INTERVAL_MS = 1000;
 const DEFAULT_STATUS_POLL_INTERVAL_MS = 2000;
 const VALID_REASONING_EFFORTS = new Set([
   "none",
@@ -97,14 +102,17 @@ function printUsage() {
       "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
       "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model|spark|sol|luna|terra|mini>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [--config key=value]...",
       "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model|spark|sol|luna|terra|mini>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [--config key=value]... [focus text]",
-      "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark|sol|luna|terra|mini>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [--config key=value]... [prompt]",
+      "  node scripts/codex-companion.mjs task [--background|--await [--await-timeout-ms <ms>]] [--prompt-stdin] [--write] [--resume-last|--resume|--fresh] [--model <model|spark|sol|luna|terra|mini>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [--config key=value]... [prompt]",
       "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
-      "  node scripts/codex-companion.mjs result [job-id] [--json]",
+      "  node scripts/codex-companion.mjs result [job-id] [--wait [--timeout-ms <ms>]] [--json]",
       "  node scripts/codex-companion.mjs cancel [job-id] [--json]",
       "",
       "Any subcommand also accepts --args-stdin: the whole argument string is read",
-      "from stdin and tokenized here, so no shell ever sees the caller's text."
+      "from stdin and tokenized here, so no shell ever sees the caller's text.",
+      "`task --prompt-stdin` instead takes stdin verbatim as the prompt, so flags",
+      "must be on the command line and --args-stdin cannot be combined with it.",
+      "`task --await` and `result --wait` exit 3 with a re-run hint on timeout."
     ].join("\n")
   );
 }
@@ -167,10 +175,24 @@ function parseConfigOverrides(list = []) {
 // `--args-stdin` tokenizes it here with the same shell-like splitter
 // `normalizeArgv` already uses — never through a shell.
 const ARGS_STDIN_FLAG = "--args-stdin";
+const PROMPT_STDIN_FLAG = "--prompt-stdin";
 let argvTokenizedFromStdin = false;
 
 function applyArgsStdin(argv) {
   const flagIndex = argv.indexOf(ARGS_STDIN_FLAG);
+
+  // Decided before anything reads stdin: both flags consume it and it can only
+  // be read once. `--prompt-stdin` therefore has to be on the command line, and
+  // is never visible inside the `--args-stdin` heredoc.
+  if (argv.includes(PROMPT_STDIN_FLAG)) {
+    if (flagIndex !== -1) {
+      throw new Error(
+        `${PROMPT_STDIN_FLAG} cannot be combined with ${ARGS_STDIN_FLAG}; put flags on the command line.`
+      );
+    }
+    return argv;
+  }
+
   if (flagIndex === -1) {
     return argv;
   }
@@ -402,6 +424,60 @@ async function waitForSingleJobSnapshot(cwd, reference, options = {}) {
   };
 }
 
+function buildResumeWaitCommand(jobId) {
+  return `node "${COMPANION_SCRIPT}" result ${jobId} --wait --timeout-ms ${DEFAULT_AWAIT_TIMEOUT_MS}`;
+}
+
+// Every "the job outlived this command" exit looks the same: the lead-in, the
+// exact command that resumes the wait, and exit code 3.
+function outputActiveJobHint(snapshot, leadIn, asJson) {
+  const resumeCommand = buildResumeWaitCommand(snapshot.job.id);
+  outputCommandResult({ ...snapshot, resumeCommand }, `${leadIn} Re-run: ${resumeCommand}\n`, asJson);
+  process.exitCode = 3;
+}
+
+function parseTimeoutOption(value, flag) {
+  if (value == null) {
+    return null;
+  }
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new Error(`${flag} expects a positive integer number of milliseconds, got "${value}".`);
+  }
+  return parsed;
+}
+
+// Waits for a job to reach a terminal status and returns its id. On timeout it
+// prints the re-run hint, sets exit code 3 and returns null, so the caller
+// (`task --await`, `result --wait`) hands control back before Claude Code's
+// Bash timeout kills it mid-run.
+async function waitForTerminalJobOrHint(cwd, reference, options = {}) {
+  const snapshot = await waitForSingleJobSnapshot(cwd, reference, {
+    timeoutMs: Number(options.timeoutMs ?? DEFAULT_AWAIT_TIMEOUT_MS),
+    pollIntervalMs: DEFAULT_AWAIT_POLL_INTERVAL_MS
+  });
+  if (!snapshot.waitTimedOut) {
+    return snapshot.job.id;
+  }
+
+  outputActiveJobHint(snapshot, `Still running: job ${snapshot.job.id}.`, options.json);
+  return null;
+}
+
+// Prints exactly what `result <reference>` prints — the awaited task path reuses
+// it so both commands stay on one rendering — and returns the resolved job.
+function outputJobResult(cwd, reference, asJson) {
+  const { workspaceRoot, job } = resolveResultJob(cwd, reference);
+  if (isActiveJobStatus(job.status)) {
+    outputActiveJobHint(buildSingleJobSnapshot(cwd, job.id), `Job ${job.id} is still ${job.status}.`, asJson);
+    return job;
+  }
+
+  const storedJob = readStoredJob(workspaceRoot, job.id);
+  outputCommandResult({ job, storedJob }, renderStoredJobResult(job, storedJob), asJson);
+  return job;
+}
+
 async function resolveLatestTrackedTaskThread(cwd, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const sessionId = getCurrentClaudeSessionId();
@@ -561,6 +637,7 @@ async function executeTaskRun(request) {
     resumeThreadId,
     excludeJobId: request.jobId,
     prompt: request.prompt,
+    promptRaw: request.promptRaw,
     defaultPrompt: resumeThreadId ? DEFAULT_CONTINUE_PROMPT : "",
     model: request.model,
     effort: request.effort,
@@ -680,13 +757,14 @@ function buildTaskJob(workspaceRoot, taskMetadata, write) {
   });
 }
 
-function buildTaskRequest({ cwd, model, effort, config, prompt, write, resumeLast, jobId }) {
+function buildTaskRequest({ cwd, model, effort, config, prompt, promptRaw, write, resumeLast, jobId }) {
   return {
     cwd,
     model,
     effort,
     config,
     prompt,
+    promptRaw,
     write,
     resumeLast,
     jobId
@@ -721,6 +799,19 @@ async function executeTransfer(cwd, options = {}) {
 }
 
 function readTaskPrompt(cwd, options, positionals) {
+  if (options["prompt-stdin"]) {
+    if (options["prompt-file"] || positionals.length > 0) {
+      throw new Error(`${PROMPT_STDIN_FLAG} cannot be combined with --prompt-file or prompt text.`);
+    }
+    // Raw bytes, no tokenization: only the one trailing newline the caller's
+    // heredoc adds is removed, so indentation and blank lines survive.
+    const prompt = readStdinIfPiped().replace(/\r?\n$/, "");
+    if (!prompt.trim()) {
+      throw new Error(`${PROMPT_STDIN_FLAG} was set but stdin was empty.`);
+    }
+    return prompt;
+  }
+
   if (options["prompt-file"]) {
     return fs.readFileSync(path.resolve(cwd, options["prompt-file"]), "utf8");
   }
@@ -749,8 +840,7 @@ async function runForegroundCommand(job, runner, options = {}) {
 }
 
 function spawnDetachedTaskWorker(cwd, jobId) {
-  const scriptPath = path.join(ROOT_DIR, "scripts", "codex-companion.mjs");
-  const child = spawn(process.execPath, [scriptPath, "task-worker", "--cwd", cwd, "--job-id", jobId], {
+  const child = spawn(process.execPath, [COMPANION_SCRIPT, "task-worker", "--cwd", cwd, "--job-id", jobId], {
     cwd,
     env: process.env,
     detached: true,
@@ -893,8 +983,8 @@ async function handleReview(argv) {
 
 async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["model", "effort", "cwd", "prompt-file"],
-    booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background"],
+    valueOptions: ["model", "effort", "cwd", "prompt-file", "await-timeout-ms"],
+    booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background", "await", "prompt-stdin"],
     repeatableOptions: ["config"],
     stopAtFirstPositional: true,
     aliasMap: {
@@ -910,20 +1000,35 @@ async function handleTask(argv) {
   const model = normalizeRequestedModel(options.model);
   const effort = normalizeReasoningEffort(options.effort);
   const configOverrides = parseConfigOverrides(options.config);
-  const prompt = readTaskPrompt(cwd, options, positionals);
-
+  // Every flag conflict is decided before the prompt is read: `--prompt-stdin`
+  // blocks on an open stdin, so a usage error must never wait for EOF.
   const resumeLast = Boolean(options["resume-last"] || options.resume);
   const fresh = Boolean(options.fresh);
   if (resumeLast && fresh) {
     throw new Error("Choose either --resume/--resume-last or --fresh.");
   }
+  if (options.await && options.background) {
+    throw new Error("Choose either --await or --background.");
+  }
+  if (options["await-timeout-ms"] != null && !options.await) {
+    throw new Error("--await-timeout-ms requires --await.");
+  }
+  const awaitTimeoutMs = parseTimeoutOption(options["await-timeout-ms"], "--await-timeout-ms");
+
+  const prompt = readTaskPrompt(cwd, options, positionals);
+  // A `--prompt-stdin` prompt is already exactly what the caller typed; nothing
+  // downstream may trim it further.
+  const promptRaw = Boolean(options["prompt-stdin"]);
   const write = Boolean(options.write);
   const taskMetadata = buildTaskRunMetadata({
     prompt,
     resumeLast
   });
 
-  if (options.background) {
+  // `--await` runs the same detached worker as `--background` — same job
+  // record, so status/result/cancel work on it — and only differs in waiting for
+  // it here instead of returning the queued line.
+  if (options.background || options.await) {
     ensureCodexAvailable(cwd);
     requireTaskRequest(prompt, resumeLast);
 
@@ -934,12 +1039,24 @@ async function handleTask(argv) {
       effort,
       config: configOverrides,
       prompt,
+      promptRaw,
       write,
       resumeLast,
       jobId: job.id
     });
     const { payload } = enqueueBackgroundTask(cwd, job, request);
-    outputCommandResult(payload, renderQueuedTaskLaunch(payload), options.json);
+    if (!options.await) {
+      outputCommandResult(payload, renderQueuedTaskLaunch(payload), options.json);
+      return;
+    }
+
+    const jobId = await waitForTerminalJobOrHint(cwd, job.id, {
+      timeoutMs: awaitTimeoutMs,
+      json: options.json
+    });
+    if (jobId && outputJobResult(cwd, jobId, options.json).status !== "completed") {
+      process.exitCode = 1;
+    }
     return;
   }
 
@@ -953,6 +1070,7 @@ async function handleTask(argv) {
         effort,
         config: configOverrides,
         prompt,
+        promptRaw,
         write,
         resumeLast,
         jobId: job.id,
@@ -1055,25 +1173,32 @@ async function handleStatus(argv) {
   outputResult(renderStatusPayload(report, options.json), options.json);
 }
 
-function handleResult(argv) {
+async function handleResult(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["cwd"],
-    booleanOptions: ["json"]
+    valueOptions: ["cwd", "timeout-ms"],
+    booleanOptions: ["json", "wait"]
   });
   if (maybePrintCommandHelp(options)) {
     return;
   }
 
   const cwd = resolveCommandCwd(options);
-  const reference = positionals[0] ?? "";
-  const { workspaceRoot, job } = resolveResultJob(cwd, reference);
-  const storedJob = readStoredJob(workspaceRoot, job.id);
-  const payload = {
-    job,
-    storedJob
-  };
+  let reference = positionals[0] ?? "";
+  if (options.wait) {
+    if (!reference) {
+      throw new Error("`result --wait` requires a job id.");
+    }
+    const jobId = await waitForTerminalJobOrHint(cwd, reference, {
+      timeoutMs: parseTimeoutOption(options["timeout-ms"], "--timeout-ms"),
+      json: options.json
+    });
+    if (!jobId) {
+      return;
+    }
+    reference = jobId;
+  }
 
-  outputCommandResult(payload, renderStoredJobResult(job, storedJob), options.json);
+  outputJobResult(cwd, reference, options.json);
 }
 
 function handleTaskResumeCandidate(argv) {
@@ -1213,7 +1338,7 @@ async function main() {
       await handleStatus(argv);
       break;
     case "result":
-      handleResult(argv);
+      await handleResult(argv);
       break;
     case "task-resume-candidate":
       handleTaskResumeCandidate(argv);
