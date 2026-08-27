@@ -54,3 +54,45 @@ test("form-mode elicitation requests are declined instead of accepted with empty
   });
   assert.deepEqual(urlClient.sent, [{ id: 10, result: { action: "accept", content: null, _meta: null } }]);
 });
+
+// The non-interactive runner has no operator, so every approval request must be
+// answered with that request type's own refusal variant. The generated types
+// disagree on shape: the v1 approvals take a `ReviewDecision` whose refusal is
+// `{ denied: { rejection } }`, the v2 item approvals take a plain `"decline"`
+// enum with no room for a reason, and `PermissionsRequestApprovalResponse` has
+// no refusal variant at all — granting nothing is its fail-closed answer.
+const DENIAL_REASON = "Non-interactive Codex runner: no operator to approve.";
+
+test("v1 approval requests are answered with the ReviewDecision denied variant", () => {
+  for (const [id, method] of [
+    [21, "execCommandApproval"],
+    [22, "applyPatchApproval"]
+  ]) {
+    const client = new CapturingClient();
+    client.handleServerRequest({ id, method, params: { threadId: "t1" } });
+    assert.deepEqual(client.sent, [
+      { id, result: { decision: { denied: { rejection: DENIAL_REASON } } } }
+    ]);
+  }
+});
+
+test("v2 item approval requests are answered with the decline decision", () => {
+  for (const [id, method] of [
+    [23, "item/commandExecution/requestApproval"],
+    [24, "item/fileChange/requestApproval"]
+  ]) {
+    const client = new CapturingClient();
+    client.handleServerRequest({ id, method, params: { threadId: "t1" } });
+    assert.deepEqual(client.sent, [{ id, result: { decision: "decline" } }]);
+  }
+});
+
+test("permission approval requests grant nothing for the turn", () => {
+  const client = new CapturingClient();
+  client.handleServerRequest({
+    id: 25,
+    method: "item/permissions/requestApproval",
+    params: { threadId: "t1", permissions: { network: { enabled: true } } }
+  });
+  assert.deepEqual(client.sent, [{ id: 25, result: { permissions: {}, scope: "turn" } }]);
+});

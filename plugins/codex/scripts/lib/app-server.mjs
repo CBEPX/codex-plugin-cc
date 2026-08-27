@@ -22,6 +22,8 @@ const PLUGIN_MANIFEST = JSON.parse(fs.readFileSync(PLUGIN_MANIFEST_URL, "utf8"))
 export const BROKER_ENDPOINT_ENV = "CODEX_COMPANION_APP_SERVER_ENDPOINT";
 export const BROKER_BUSY_RPC_CODE = -32001;
 
+const NON_INTERACTIVE_DENIAL_REASON = "Non-interactive Codex runner: no operator to approve.";
+
 /** @type {ClientInfo} */
 const DEFAULT_CLIENT_INFO = {
   title: "Codex Plugin",
@@ -153,33 +155,57 @@ export class AppServerClientBase {
     }
   }
 
+  // `--write` runs use `approvalPolicy: "on-request"`, so app-server sends
+  // server->client approval requests. Rejecting them with -32601 makes the turn
+  // error out or hang. This client runs Codex non-interactively — there is no
+  // operator to ask — so every approval is answered with that request type's own
+  // refusal variant. The generated types disagree on shape: the v1 approvals take
+  // a `ReviewDecision` (refusal `{ denied: { rejection } }`), the v2 item
+  // approvals take a plain `"decline"` enum with no room for a reason, and
+  // `PermissionsRequestApprovalResponse` has no refusal variant at all, so
+  // granting nothing for the turn is its fail-closed answer.
   handleServerRequest(message) {
-    // MCP servers (e.g. ChatGPT connectors surfaced as `codex_apps`) request the
-    // operator's consent via an elicitation, which app-server delivers as a
-    // server->client request. This client runs Codex non-interactively, so there
-    // is no human to answer it; blanket-rejecting every server request with
-    // -32601 makes those tool calls fail ("user rejected MCP tool call") on the
-    // background runner and hang on `codex exec` / `codex mcp-server`. Accept the
-    // elicitation so connectors the operator has already enabled can run.
-    if (message.method === "mcpServer/elicitation/request") {
-      // Form-mode elicitations expect structured content back; a blanket accept
-      // with `content: null` violates the contract and lets the tool call
-      // proceed without the values it asked for. Decline instead.
-      const mode = message.params?.mode;
-      if (mode === "form" || mode === "openai/form") {
-        this.sendMessage({ id: message.id, result: { action: "decline" } });
+    switch (message.method) {
+      case "execCommandApproval":
+      case "applyPatchApproval":
+        this.sendMessage({
+          id: message.id,
+          result: { decision: { denied: { rejection: NON_INTERACTIVE_DENIAL_REASON } } }
+        });
+        return;
+
+      case "item/commandExecution/requestApproval":
+      case "item/fileChange/requestApproval":
+        this.sendMessage({ id: message.id, result: { decision: "decline" } });
+        return;
+
+      case "item/permissions/requestApproval":
+        this.sendMessage({ id: message.id, result: { permissions: {}, scope: "turn" } });
+        return;
+
+      // MCP servers (e.g. ChatGPT connectors surfaced as `codex_apps`) request
+      // the operator's consent via an elicitation. Form-mode elicitations expect
+      // structured content back, so a blanket accept with `content: null`
+      // violates the contract; decline those and accept the rest.
+      case "mcpServer/elicitation/request": {
+        const mode = message.params?.mode;
+        if (mode === "form" || mode === "openai/form") {
+          this.sendMessage({ id: message.id, result: { action: "decline" } });
+          return;
+        }
+        this.sendMessage({
+          id: message.id,
+          result: { action: "accept", content: null, _meta: null }
+        });
         return;
       }
-      this.sendMessage({
-        id: message.id,
-        result: { action: "accept", content: null, _meta: null }
-      });
-      return;
+
+      default:
+        this.sendMessage({
+          id: message.id,
+          error: buildJsonRpcError(-32601, `Unsupported server request: ${message.method}`)
+        });
     }
-    this.sendMessage({
-      id: message.id,
-      error: buildJsonRpcError(-32601, `Unsupported server request: ${message.method}`)
-    });
   }
 
   handleExit(error) {
