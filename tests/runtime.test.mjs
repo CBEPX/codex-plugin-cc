@@ -2548,6 +2548,7 @@ test("task --resume-last never puts model or effort into thread/resume config", 
 
   const first = run("node", [SCRIPT, "task", "--model", "sol", "--effort", "high", "first"], { cwd: repo, env: buildEnv(binDir) });
   assert.equal(first.status, 0, first.stderr);
+  const startsAfterFirst = JSON.parse(fs.readFileSync(statePath, "utf8")).appServerStarts;
   const second = run("node", [SCRIPT, "task", "--resume-last", "--effort", "max", "--config", "model_provider=ollama", "again"], {
     cwd: repo,
     env: buildEnv(binDir)
@@ -2556,6 +2557,35 @@ test("task --resume-last never puts model or effort into thread/resume config", 
 
   const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
   assert.deepEqual(fakeState.lastThreadResume.config, { model_provider: "ollama" });
+  assert.equal(fakeState.lastTurnStart.effort, "max");
+  // A hot broker rejoin would ignore the config/sandbox overrides, so the resume
+  // must have run on a freshly spawned app-server process.
+  assert.equal(fakeState.appServerStarts, startsAfterFirst + 1);
+});
+
+test("task --resume-last cold-resumes without a thread/resume model override", () => {
+  const repo = seededRepo();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+
+  const first = run("node", [SCRIPT, "task", "--model", "sol", "--effort", "high", "first"], { cwd: repo, env: buildEnv(binDir) });
+  assert.equal(first.status, 0, first.stderr);
+  const startsAfterFirst = JSON.parse(fs.readFileSync(statePath, "utf8")).appServerStarts;
+
+  const second = run("node", [SCRIPT, "task", "--resume-last", "--model", "sol", "--effort", "max", "again"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(second.status, 0, second.stderr);
+
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  // A top-level `model` on thread/resume sets has_model_resume_override and stops
+  // Codex restoring the thread's persisted model/provider/effort.
+  assert.equal(fakeState.lastThreadResume.model, undefined);
+  assert.equal(fakeState.lastThreadResume.config, null);
+  assert.equal(fakeState.appServerStarts, startsAfterFirst + 1);
+  assert.equal(fakeState.lastTurnStart.model, "gpt-5.6-sol");
   assert.equal(fakeState.lastTurnStart.effort, "max");
 });
 

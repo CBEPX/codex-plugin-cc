@@ -4,6 +4,7 @@
  * @typedef {import("./app-server-protocol").ThreadItem} ThreadItem
  * @typedef {import("./app-server-protocol").ThreadResumeParams} ThreadResumeParams
  * @typedef {import("./app-server-protocol").ThreadStartParams} ThreadStartParams
+ * @typedef {NonNullable<ThreadStartParams["config"]>} ThreadConfig
  * @typedef {import("./app-server-protocol").Turn} Turn
  * @typedef {import("./app-server-protocol").UserInput} UserInput
  * @typedef {((update: string | { message: string, phase: string | null, threadId?: string | null, turnId?: string | null, stderrMessage?: string | null, logTitle?: string | null, logBody?: string | null }) => void)} ProgressReporter
@@ -59,6 +60,10 @@ function cleanCodexStderr(stderr) {
     .join("\n");
 }
 
+/**
+ * @param {unknown} value
+ * @returns {any}
+ */
 function parseConfigValue(value) {
   if (typeof value !== "string") {
     return value;
@@ -74,9 +79,12 @@ function parseConfigValue(value) {
  * Codex honours per-thread `config.toml` overrides on `thread/start`/`thread/resume`,
  * which is the only reliable way to pin a model or reasoning effort for a review
  * (`ReviewStartParams` carries neither) — see upstream #476/#651/#408.
- * @returns {Record<string, unknown> | null}
+ * @param {{ model?: string | null, effort?: string | null, config?: Record<string, unknown> | null, reviewModel?: string | null }} [options]
+ * @returns {ThreadConfig | null}
  */
-export function buildThreadConfig({ model, effort, config, reviewModel } = {}) {
+export function buildThreadConfig(options = {}) {
+  const { model, effort, config, reviewModel } = options;
+  /** @type {ThreadConfig} */
   const merged = {};
   for (const [key, value] of Object.entries(config ?? {})) {
     merged[key] = parseConfigValue(value);
@@ -108,16 +116,16 @@ function buildThreadParams(cwd, options = {}) {
 
 /**
  * Resume deliberately forwards only the explicit `--config` overrides: a
- * `config.model_reasoning_effort` on resume counts as a model override in
- * app-server (`has_model_resume_override`) and would cancel the thread's
- * persisted model/provider. Effort on resume goes through `turn/start.effort`.
+ * `config.model_reasoning_effort` — or a top-level `model` — on resume counts as
+ * a model override in app-server (`has_model_resume_override`) and would cancel
+ * the thread's persisted model/provider. Model and effort for the resumed turn
+ * ride on `turn/start` instead.
  * @returns {ThreadResumeParams}
  */
 function buildResumeParams(threadId, cwd, options = {}) {
   return {
     threadId,
     cwd,
-    model: options.model ?? null,
     approvalPolicy: options.approvalPolicy ?? "never",
     sandbox: options.sandbox ?? "read-only",
     config: buildThreadConfig({ config: options.config })
@@ -654,10 +662,10 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
   }
 }
 
-async function withAppServer(cwd, fn) {
+async function withAppServer(cwd, fn, clientOptions = {}) {
   let client = null;
   try {
-    client = await CodexAppServerClient.connect(cwd);
+    client = await CodexAppServerClient.connect(cwd, clientOptions);
     const result = await fn(client);
     await client.close();
     return result;
@@ -676,7 +684,7 @@ async function withAppServer(cwd, fn) {
       throw error;
     }
 
-    const directClient = await CodexAppServerClient.connect(cwd, { disableBroker: true });
+    const directClient = await CodexAppServerClient.connect(cwd, { ...clientOptions, disableBroker: true });
     try {
       return await fn(directClient);
     } finally {
@@ -1153,13 +1161,15 @@ export async function runAppServerTurn(cwd, options = {}) {
     throw new Error("Codex CLI is not installed or is missing required runtime support. Install it with `npm install -g @openai/codex`, then rerun `/codex:setup`.");
   }
 
+  // A resume must run on its own app-server: a broker-backed server keeps the
+  // thread loaded, so `thread/resume` becomes a hot rejoin and its config,
+  // approvalPolicy and sandbox overrides are ignored.
   return withAppServer(cwd, async (client) => {
     let response;
 
     if (options.resumeThreadId) {
       emitProgress(options.onProgress, `Resuming thread ${options.resumeThreadId}.`, "starting");
       response = await resumeThread(client, options.resumeThreadId, cwd, {
-        model: options.model,
         config: options.config,
         approvalPolicy: options.approvalPolicy,
         sandbox: options.sandbox,
@@ -1232,7 +1242,7 @@ export async function runAppServerTurn(cwd, options = {}) {
       touchedFiles: collectTouchedFiles(turnState.fileChanges),
       commandExecutions: turnState.commandExecutions
     };
-  });
+  }, { disableBroker: Boolean(options.resumeThreadId) });
 }
 
 export async function findLatestTaskThread(cwd) {
