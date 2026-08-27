@@ -2837,6 +2837,7 @@ test("task --await launches a tracked job, waits, and prints the result", () => 
   const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
   assert.equal(fakeState.lastTurnStart.prompt, "line one \\d+ \"quoted\" 'single'\nline two");
   assert.equal(fakeState.lastTurnStart.effort, "low");
+  assert.equal(fakeState.lastTurnStart.model, "gpt-5.6-sol");
   const status = run("node", [SCRIPT, "status", out.job.id, "--json"], { cwd: repo, env: buildEnv(binDir) });
   assert.equal(JSON.parse(status.stdout).job.status, "completed");
 });
@@ -2850,6 +2851,16 @@ test("task --await exits 3 with a resumable hint when the await timeout elapses"
   assert.equal(result.status, 3);
   assert.match(result.stdout, /Still running: job task-[A-Za-z0-9_-]+\. Re-run: node .*result task-[A-Za-z0-9_-]+ --wait --timeout-ms 540000/);
   const jobId = result.stdout.match(/job (task-[A-Za-z0-9_-]+)/)[1];
+
+  const timedOutJson = run("node", [SCRIPT, "result", jobId, "--wait", "--timeout-ms", "100", "--json"], { cwd: repo, env });
+  assert.equal(timedOutJson.status, 3, timedOutJson.stderr);
+  const snapshot = JSON.parse(timedOutJson.stdout);
+  assert.ok(["queued", "running"].includes(snapshot.job.status), snapshot.job.status);
+  assert.match(
+    snapshot.resumeCommand,
+    new RegExp(`^node ".*codex-companion\\.mjs" result ${jobId} --wait --timeout-ms 540000$`)
+  );
+
   const done = run("node", [SCRIPT, "result", jobId, "--wait", "--timeout-ms", "20000"], { cwd: repo, env });
   assert.equal(done.status, 0, done.stderr);
 });
@@ -2951,7 +2962,8 @@ test("task rejects contradictory await and prompt flag combinations", () => {
     [["--await", "--await-timeout-ms", "0", "do it"], /--await-timeout-ms expects a positive integer/],
     [["--await", "--await-timeout-ms", "-5", "do it"], /--await-timeout-ms expects a positive integer/],
     [["--await", "--await-timeout-ms", "1.5", "do it"], /--await-timeout-ms expects a positive integer/],
-    [["--await", "--await-timeout-ms", "nope", "do it"], /--await-timeout-ms expects a positive integer/]
+    [["--await", "--await-timeout-ms", "nope", "do it"], /--await-timeout-ms expects a positive integer/],
+    [["--await", "--await-timeout-ms", "1e400", "do it"], /--await-timeout-ms expects a positive integer/]
   ];
 
   for (const [args, pattern] of cases) {
@@ -3008,7 +3020,9 @@ test("cancelling an awaited job ends the await with exit 1 and leaves a readable
       return null;
     }
     const job = JSON.parse(fs.readFileSync(stateFile, "utf8")).jobs?.[0];
-    return job && (job.status === "queued" || job.status === "running") ? job.id : null;
+    // Wait for the worker to own the record: cancelling a still-`queued` job has
+    // no pid to terminate, so the worker would survive and finish the turn.
+    return job && job.status === "running" && job.pid ? job.id : null;
   }, { timeoutMs: 15000 });
 
   const cancelled = run("node", [SCRIPT, "cancel", jobId], { cwd: repo, env });

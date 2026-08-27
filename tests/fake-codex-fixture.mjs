@@ -615,7 +615,12 @@ rl.on("line", (line) => {
           }
         ];
 
-	        if (BEHAVIOR === "interruptible-slow-task") {
+	        // Any held-open turn is interruptible: an unregistered timer would fire
+	        // after a turn/interrupt and complete a turn the client already cancelled.
+	        const heldTurnDelayMs = BEHAVIOR === "interruptible-slow-task" ? 5000 : TURN_DELAY_MS;
+	        if (BEHAVIOR === "slow-task") {
+	          emitTurnCompletedLater(thread.id, turnId, items, 400);
+	        } else if (heldTurnDelayMs > 0) {
 	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
 	          const timer = setTimeout(() => {
 	            if (!interruptibleTurns.has(turnId)) {
@@ -628,12 +633,8 @@ rl.on("line", (line) => {
 	              }
 	            }
 	            send({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(turnId, "completed") } });
-	          }, 5000);
+	          }, heldTurnDelayMs);
 	          interruptibleTurns.set(turnId, { threadId: thread.id, timer });
-	        } else if (BEHAVIOR === "slow-task") {
-	          emitTurnCompletedLater(thread.id, turnId, items, 400);
-	        } else if (TURN_DELAY_MS > 0) {
-	          emitTurnCompletedLater(thread.id, turnId, items, TURN_DELAY_MS);
 	        } else {
 	          emitTurnCompleted(thread.id, turnId, items);
 	        }
