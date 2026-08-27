@@ -2782,3 +2782,27 @@ test("a resume refuses to start a second turn on a thread another job is still u
   assert.equal(fakeState.lastTurnStart.threadId, "thr_1");
   assert.equal(fakeState.lastTurnStart.prompt, "follow up");
 });
+
+test("task --prompt-file wins over --args-stdin and keeps the prompt byte-exact", () => {
+  const repo = seededRepo();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+
+  // Everything splitRawArgumentString would eat: quotes as grouping, backslashes
+  // as escapes, newlines as separators.
+  const promptText = `line one \\d+ "quoted" 'single' C:\\Users\\x\nsecond line with $(id) and \`backticks\``;
+  const promptFile = path.join(makeTempDir(), "request.txt");
+  fs.writeFileSync(promptFile, promptText, "utf8");
+
+  const result = run("node", [SCRIPT, "task", "--prompt-file", promptFile, "--args-stdin"], {
+    cwd: repo,
+    env: buildEnv(binDir),
+    input: "--effort max\n"
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(fakeState.lastTurnStart.prompt, promptText);
+  assert.equal(fakeState.lastTurnStart.effort, "max");
+});

@@ -15,14 +15,19 @@ If the request contains `--background`, skip directly to step 3 — steps 1 and 
 
 2. Launch the job, then wait for it — two separate Bash calls, in ≤9-minute wait slices so the Bash tool's 10-minute cap never kills a long run. Bash calls share no variables — always set `JOB=<id>` literally at the top of every later call; never rely on a `$JOB` left over from a previous call.
 
+The request prose and the runtime flags travel in two separate channels of the same Bash call: the prose is written byte-exact to `$PROMPT` by its own quoted heredoc and passed as `--prompt-file`, while the `--args-stdin` heredoc carries only the runtime flags (`--model`, `--effort`, `--config key=value`, `--resume-last`, `--write` as applicable). Never put the request text in the flags heredoc: it is tokenized, so quotes, backslashes and newlines in a stack trace, a regex or a code block would be mangled. Give both heredoc delimiters a fresh random suffix on every call — `CODEX_PROMPT_<random>` / `CODEX_ARGS_<random>`, e.g. 8 hex characters — and never reuse a suffix that appears in the request text: a payload line equal to the delimiter would end the heredoc early and run the rest on the host shell.
+
 2a. Launch (one Bash call):
 
 ```bash
-trap 'rm -f "$ERR" "$OUT"' EXIT
-ERR=$(mktemp)
-JOB=$(node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task --background --json --args-stdin <<'CODEX_ARGS' 2>"$ERR" | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{process.stdout.write(JSON.parse(d).jobId||"")}catch(e){}})'
-<flags> <request text>
-CODEX_ARGS
+trap 'rm -f "$ERR" "$OUT" "$PROMPT"' EXIT
+ERR=$(mktemp); PROMPT=$(mktemp)
+cat > "$PROMPT" <<'CODEX_PROMPT_<random>'
+<request text>
+CODEX_PROMPT_<random>
+JOB=$(node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task --background --json --prompt-file "$PROMPT" --args-stdin <<'CODEX_ARGS_<random>' 2>"$ERR" | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{process.stdout.write(JSON.parse(d).jobId||"")}catch(e){}})'
+<flags>
+CODEX_ARGS_<random>
 )
 [ -n "$JOB" ] || { cat "$ERR"; exit 1; }
 [[ "$JOB" =~ ^[A-Za-z0-9_-]+$ ]] || { echo "invalid job id"; exit 1; }
@@ -33,7 +38,7 @@ If this call exits non-zero, its output is the launch failure (Codex missing, un
 2b. Wait and fetch the result (one Bash call, tool `timeout: 600000`). Set `JOB=<id>` literally as the first line, using the id you just read from 2a:
 
 ```bash
-trap 'rm -f "$ERR" "$OUT"' EXIT
+trap 'rm -f "$ERR" "$OUT" "$PROMPT"' EXIT
 JOB=<id>
 [[ "$JOB" =~ ^[A-Za-z0-9_-]+$ ]] || { echo "invalid job id"; exit 1; }
 OUT=$(mktemp); ERR=$(mktemp)

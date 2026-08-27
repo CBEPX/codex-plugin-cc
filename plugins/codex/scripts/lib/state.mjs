@@ -205,6 +205,10 @@ export function writeJobRequestFile(cwd, jobId, payload) {
   return requestFile;
 }
 
+export function removeJobRequestFile(cwd, jobId) {
+  removeFileIfExists(resolveJobRequestFile(cwd, jobId));
+}
+
 export function consumeJobRequestFile(cwd, jobId) {
   const requestFile = resolveJobRequestFile(cwd, jobId);
   if (!fs.existsSync(requestFile)) {

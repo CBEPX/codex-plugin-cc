@@ -290,19 +290,57 @@ test("command bodies hand arguments to the companion via a quoted heredoc, never
     // whole body line of a quoted heredoc. Anywhere else the shell expands what
     // Claude Code substituted before bash ever ran.
     assertArgumentsNeverReachTheShell(file, body);
-    assert.match(body, /--args-stdin <<'CODEX_ARGS'/, `${file} must pass arguments through a quoted heredoc`);
+    // rescue.md randomizes its delimiter suffix per call; the flag-only bodies keep the fixed one.
+    const expectedDelimiter = file === "rescue.md" ? /--args-stdin <<'CODEX_ARGS_/ : /--args-stdin <<'CODEX_ARGS'/;
+    assert.match(body, expectedDelimiter, `${file} must pass arguments through a quoted heredoc`);
   }
 
   const rescue = read("commands/rescue.md");
   const agent = read("agents/codex-rescue.md");
   for (const [label, body] of [["rescue.md", rescue], ["codex-rescue.md", agent]]) {
     assert.doesNotMatch(body, /"<request text>"/, `${label} still interpolates the request text inside a shell string`);
-    assert.match(body, /task --background --json --args-stdin <<'CODEX_ARGS'/, `${label} must launch through a quoted heredoc`);
+    assert.match(
+      body,
+      /task --background --json --prompt-file "\$PROMPT" --args-stdin <<'CODEX_ARGS/,
+      `${label} must launch through a quoted heredoc`
+    );
     assert.match(
       body,
       /\[\[ "\$JOB" =~ \^\[A-Za-z0-9_-\]\+\$ \]\] \|\| \{ echo "invalid job id"; exit 1; \}/,
       `${label} must validate the job id before using it`
     );
+  }
+});
+
+// The request prose and the runtime flags travel in separate channels: the prose
+// via --prompt-file (byte-exact) and only the flags through the tokenizer.
+function readArgsHeredocBody(body) {
+  const lines = body.split("\n");
+  const start = lines.findIndex((line) => line.includes("--args-stdin <<'CODEX_ARGS"));
+  assert.notEqual(start, -1, "no --args-stdin heredoc found");
+  const end = lines.findIndex((line, index) => index > start && line.trim().startsWith("CODEX_ARGS"));
+  assert.notEqual(end, -1, "unterminated --args-stdin heredoc");
+  return lines.slice(start + 1, end).join("\n");
+}
+
+test("rescue sends the request prose through --prompt-file, never through the argument tokenizer", () => {
+  for (const [label, body] of [
+    ["rescue.md", read("commands/rescue.md")],
+    ["codex-rescue.md", read("agents/codex-rescue.md")]
+  ]) {
+    assert.match(body, /cat > "\$PROMPT" <<'CODEX_PROMPT_/, `${label} must write the request prose with its own quoted heredoc`);
+    assert.match(body, /--prompt-file "\$PROMPT"/, `${label} must pass the prose file to the companion`);
+    assert.doesNotMatch(
+      readArgsHeredocBody(body),
+      /<request text>/,
+      `${label} still routes the request text through the argument tokenizer`
+    );
+    assert.match(body, /rm -f "\$ERR" "\$OUT" "\$PROMPT"/, `${label} must clean up the prose file`);
+
+    // A payload line equal to a fixed delimiter would close the heredoc early and
+    // run the rest on the host shell.
+    assert.match(body, /fresh random suffix on every call/, `${label} must require per-call heredoc delimiters`);
+    assert.match(body, /`CODEX_PROMPT_<random>` \/ `CODEX_ARGS_<random>`/, `${label} must name both randomized delimiters`);
   }
 });
 

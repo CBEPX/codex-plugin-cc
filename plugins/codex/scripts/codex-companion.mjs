@@ -31,6 +31,7 @@ import {
   generateJobId,
   getConfig,
   listJobs,
+  removeJobRequestFile,
   setConfig,
   upsertJob,
   writeJobFile,
@@ -801,8 +802,11 @@ function enqueueBackgroundTask(cwd, job, request) {
       throw new Error("Could not spawn the background Codex worker.");
     }
   } catch (error) {
+    // No worker will ever read the payload, so do not leave it (0600, possibly
+    // holding `--config` secrets) on disk until the job is pruned.
+    removeJobRequestFile(job.workspaceRoot, job.id);
     const errorMessage = error instanceof Error ? error.message : String(error);
-    const failedRecord = { ...queuedRecord, status: "failed", phase: "failed", errorMessage };
+    const failedRecord = { ...queuedRecord, status: "failed", phase: "failed", errorMessage, requestFile: null };
     writeJobFile(job.workspaceRoot, job.id, failedRecord);
     upsertJob(job.workspaceRoot, failedRecord);
     throw error;
