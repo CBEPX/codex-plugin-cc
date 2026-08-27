@@ -117,6 +117,12 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(agent, /thin forwarding wrapper/i);
   assert.match(agent, /result "\$JOB"/);
   assert.doesNotMatch(agent, /prefer background execution/i);
+  // The rescue shell traps must use `command rm -f --` so a shadowing/aliased
+  // `rm` (or a filename starting with `-`) can't hijack cleanup on EXIT.
+  assert.match(rescue, /trap 'command rm -f -- /);
+  assert.match(agent, /trap 'command rm -f -- /);
+  assert.doesNotMatch(rescue, /trap 'rm -f/);
+  assert.doesNotMatch(agent, /trap 'rm -f/);
   assert.match(runtimeSkill, /Launch exactly one job per rescue handoff with `task --background --json`/i);
   assert.match(agent, /Bash tool's 10-minute cap/i);
   assert.match(agent, /do not inspect the repository, read files, grep, cancel jobs, summarize output, or do any other follow-up work of your own/i);
@@ -335,7 +341,7 @@ test("rescue sends the request prose through --prompt-file, never through the ar
       /<request text>/,
       `${label} still routes the request text through the argument tokenizer`
     );
-    assert.match(body, /rm -f "\$ERR" "\$OUT" "\$PROMPT"/, `${label} must clean up the prose file`);
+    assert.match(body, /command rm -f -- "\$ERR" "\$OUT" "\$PROMPT"/, `${label} must clean up the prose file`);
 
     // A payload line equal to a fixed delimiter would close the heredoc early and
     // run the rest on the host shell.

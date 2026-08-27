@@ -25,7 +25,7 @@ Forwarding rules:
   Launch (one Bash call):
 
 ```bash
-trap 'rm -f "$ERR" "$OUT" "$PROMPT"' EXIT
+trap 'command rm -f -- "$ERR" "$OUT" "$PROMPT"' EXIT
 ERR=$(mktemp); PROMPT=$(mktemp)
 cat > "$PROMPT" <<'CODEX_PROMPT_<random>'
 <request text>
@@ -43,7 +43,7 @@ echo "JOB=$JOB"
   Wait and fetch the result (one Bash call, tool `timeout: 600000`). Set `JOB=<id>` literally as the first line, using the id you just read:
 
 ```bash
-trap 'rm -f "$ERR" "$OUT" "$PROMPT"' EXIT
+trap 'command rm -f -- "$ERR" "$OUT" "$PROMPT"' EXIT
 JOB=<id>
 [[ "$JOB" =~ ^[A-Za-z0-9_-]+$ ]] || { echo "invalid job id"; exit 1; }
 OUT=$(mktemp); ERR=$(mktemp)

@@ -1,7 +1,9 @@
+import path from "node:path";
+import process from "node:process";
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { terminateProcessTree } from "../plugins/codex/scripts/lib/process.mjs";
+import { processCommandLine, terminateProcessTree } from "../plugins/codex/scripts/lib/process.mjs";
 
 test("terminateProcessTree uses taskkill on Windows", () => {
   let captured = null;
@@ -52,4 +54,14 @@ test("terminateProcessTree treats missing Windows processes as already stopped",
   assert.equal(outcome.method, "taskkill");
   assert.equal(outcome.result.status, 128);
   assert.match(outcome.result.stdout, /not found/i);
+});
+
+test("processCommandLine reads the command line of a live process", { skip: process.platform === "win32" }, () => {
+  const line = processCommandLine(process.pid);
+  assert.ok(line, "expected a command line for the current process");
+  assert.ok(line.includes(path.basename(process.execPath)), line);
+});
+
+test("processCommandLine returns null for a pid that is not running", { skip: process.platform === "win32" }, () => {
+  assert.equal(processCommandLine(2 ** 31 - 1), null);
 });

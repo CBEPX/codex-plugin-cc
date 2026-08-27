@@ -283,6 +283,18 @@ bootState.appServerStarts = (bootState.appServerStarts || 0) + 1;
 saveState(bootState);
 
 const rl = readline.createInterface({ input: process.stdin });
+
+// Test knob: linger after stdin closes (and ignore the client's SIGTERM
+// escalation) so a test can observe the window while a broker is shutting its
+// app-server child down.
+const CLOSE_DELAY_MS = Number(process.env.FAKE_CODEX_CLOSE_DELAY_MS || 0);
+if (CLOSE_DELAY_MS > 0) {
+  process.on("SIGTERM", () => {});
+  rl.on("close", () => {
+    setTimeout(() => process.exit(0), CLOSE_DELAY_MS);
+  });
+}
+
 rl.on("line", (line) => {
   if (!line.trim()) {
     return;
@@ -663,10 +675,15 @@ rl.on("line", (line) => {
   }
 }
 
-export function buildEnv(binDir) {
+export function buildEnv(binDir, overrides = {}) {
   const sep = process.platform === "win32" ? ";" : ":";
   return {
     ...process.env,
-    PATH: `${binDir}${sep}${process.env.PATH}`
+    PATH: `${binDir}${sep}${process.env.PATH}`,
+    // Keep test brokers short-lived so a run that leaves one behind (crash,
+    // interrupted test, etc.) doesn't linger as an orphaned process for the
+    // default 30-minute idle timeout. See PR #457.
+    CODEX_COMPANION_BROKER_IDLE_TIMEOUT_MS: "5000",
+    ...overrides
   };
 }

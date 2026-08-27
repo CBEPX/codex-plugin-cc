@@ -54,6 +54,27 @@ function looksLikeMissingProcessMessage(text) {
   return /not found|no running instance|cannot find|does not exist|no such process/i.test(text);
 }
 
+// Command line of a running process, or null when it is gone (or the platform
+// has no `ps`). Callers use it to prove a recorded PID is still the process they
+// believe it is before signalling it — PIDs get recycled.
+export function processCommandLine(pid, options = {}) {
+  if (!Number.isFinite(pid)) {
+    return null;
+  }
+
+  const platform = options.platform ?? process.platform;
+  if (platform === "win32") {
+    return null;
+  }
+
+  const runCommandImpl = options.runCommandImpl ?? runCommand;
+  const result = runCommandImpl("ps", ["-o", "command=", "-p", String(pid)]);
+  if (result.error || result.status !== 0) {
+    return null;
+  }
+  return result.stdout.trim() || null;
+}
+
 export function terminateProcessTree(pid, options = {}) {
   if (!Number.isFinite(pid)) {
     return { attempted: false, delivered: false, method: null };

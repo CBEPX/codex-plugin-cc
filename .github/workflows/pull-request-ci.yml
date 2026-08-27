@@ -33,5 +33,10 @@ jobs:
       - name: Run test suite
         run: npm test
 
+      - name: No leaked test processes
+        run: |
+          sleep 10
+          if pgrep -f codex-plugin-test- ; then echo "leaked test processes" >&2; exit 1; fi
+
       - name: Run build
         run: npm run build
