@@ -162,6 +162,14 @@ export class AppServerClientBase {
     // background runner and hang on `codex exec` / `codex mcp-server`. Accept the
     // elicitation so connectors the operator has already enabled can run.
     if (message.method === "mcpServer/elicitation/request") {
+      // Form-mode elicitations expect structured content back; a blanket accept
+      // with `content: null` violates the contract and lets the tool call
+      // proceed without the values it asked for. Decline instead.
+      const mode = message.params?.mode;
+      if (mode === "form" || mode === "openai/form") {
+        this.sendMessage({ id: message.id, result: { action: "decline" } });
+        return;
+      }
       this.sendMessage({
         id: message.id,
         result: { action: "accept", content: null, _meta: null }
