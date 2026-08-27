@@ -231,3 +231,17 @@ test("setup command can offer Codex install and still points users to codex logi
   assert.match(readme, /\/codex:setup --enable-review-gate/);
   assert.match(readme, /\/codex:setup --disable-review-gate/);
 });
+
+test("stop gate script timeout is shorter than the Stop hook timeout and its message matches", () => {
+  const hooks = JSON.parse(fs.readFileSync(path.join(PLUGIN_ROOT, "hooks", "hooks.json"), "utf8"));
+  const stopTimeoutSeconds = hooks.hooks.Stop[0].hooks[0].timeout;
+  const source = fs.readFileSync(path.join(PLUGIN_ROOT, "scripts", "stop-review-gate-hook.mjs"), "utf8");
+  const minutes = source.match(/const STOP_REVIEW_TIMEOUT_MINUTES = (\d+);/);
+  assert.ok(minutes, "STOP_REVIEW_TIMEOUT_MINUTES must be a named constant");
+  assert.match(source, /const STOP_REVIEW_TIMEOUT_MS = STOP_REVIEW_TIMEOUT_MINUTES \* 60 \* 1000;/);
+  assert.ok(Number(minutes[1]) * 60 < stopTimeoutSeconds, "script timeout must be below the hook timeout");
+  assert.doesNotMatch(source, /15 minutes/);
+  assert.match(source, /\$\{STOP_REVIEW_TIMEOUT_MINUTES\} minutes/);
+  assert.match(source, /killSignal: "SIGKILL"/);
+  assert.match(source, /maxBuffer: 16 \* 1024 \* 1024/);
+});
