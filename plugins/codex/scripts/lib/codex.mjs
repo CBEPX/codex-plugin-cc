@@ -59,6 +59,40 @@ function cleanCodexStderr(stderr) {
     .join("\n");
 }
 
+function parseConfigValue(value) {
+  if (typeof value !== "string") {
+    return value;
+  }
+  try {
+    return JSON.parse(value);
+  } catch {
+    return value;
+  }
+}
+
+/**
+ * Codex honours per-thread `config.toml` overrides on `thread/start`/`thread/resume`,
+ * which is the only reliable way to pin a model or reasoning effort for a review
+ * (`ReviewStartParams` carries neither) — see upstream #476/#651/#408.
+ * @returns {Record<string, unknown> | null}
+ */
+export function buildThreadConfig({ model, effort, config, reviewModel } = {}) {
+  const merged = {};
+  for (const [key, value] of Object.entries(config ?? {})) {
+    merged[key] = parseConfigValue(value);
+  }
+  if (model) {
+    merged.model = model;
+  }
+  if (reviewModel) {
+    merged.review_model = reviewModel;
+  }
+  if (effort) {
+    merged.model_reasoning_effort = effort;
+  }
+  return Object.keys(merged).length > 0 ? merged : null;
+}
+
 /** @returns {ThreadStartParams} */
 function buildThreadParams(cwd, options = {}) {
   return {
@@ -66,19 +100,27 @@ function buildThreadParams(cwd, options = {}) {
     model: options.model ?? null,
     approvalPolicy: options.approvalPolicy ?? "never",
     sandbox: options.sandbox ?? "read-only",
+    config: buildThreadConfig(options),
     serviceName: SERVICE_NAME,
     ephemeral: options.ephemeral ?? true
   };
 }
 
-/** @returns {ThreadResumeParams} */
+/**
+ * Resume deliberately forwards only the explicit `--config` overrides: a
+ * `config.model_reasoning_effort` on resume counts as a model override in
+ * app-server (`has_model_resume_override`) and would cancel the thread's
+ * persisted model/provider. Effort on resume goes through `turn/start.effort`.
+ * @returns {ThreadResumeParams}
+ */
 function buildResumeParams(threadId, cwd, options = {}) {
   return {
     threadId,
     cwd,
     model: options.model ?? null,
     approvalPolicy: options.approvalPolicy ?? "never",
-    sandbox: options.sandbox ?? "read-only"
+    sandbox: options.sandbox ?? "read-only",
+    config: buildThreadConfig({ config: options.config })
   };
 }
 
@@ -1011,6 +1053,9 @@ export async function runAppServerReview(cwd, options = {}) {
     emitProgress(options.onProgress, "Starting Codex review thread.", "starting");
     const response = await startThread(client, cwd, {
       model: options.model,
+      effort: options.effort,
+      config: options.config,
+      reviewModel: options.model,
       sandbox: "read-only",
       ephemeral: true,
       threadName: options.threadName
@@ -1115,6 +1160,7 @@ export async function runAppServerTurn(cwd, options = {}) {
       emitProgress(options.onProgress, `Resuming thread ${options.resumeThreadId}.`, "starting");
       response = await resumeThread(client, options.resumeThreadId, cwd, {
         model: options.model,
+        config: options.config,
         approvalPolicy: options.approvalPolicy,
         sandbox: options.sandbox,
         ephemeral: false
@@ -1123,6 +1169,8 @@ export async function runAppServerTurn(cwd, options = {}) {
       emitProgress(options.onProgress, "Starting Codex task thread.", "starting");
       response = await startThread(client, cwd, {
         model: options.model,
+        effort: options.effort,
+        config: options.config,
         approvalPolicy: options.approvalPolicy,
         sandbox: options.sandbox,
         ephemeral: options.persistThread ? false : true,

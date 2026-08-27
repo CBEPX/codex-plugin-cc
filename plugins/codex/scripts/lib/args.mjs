@@ -1,8 +1,10 @@
 export function parseArgs(argv, config = {}) {
   const valueOptions = new Set(config.valueOptions ?? []);
   const booleanOptions = new Set(config.booleanOptions ?? []);
+  const repeatableOptions = new Set(config.repeatableOptions ?? []);
   const aliasMap = config.aliasMap ?? {};
   const rejectUnknownOptions = Boolean(config.rejectUnknownOptions);
+  const stopAtFirstPositional = Boolean(config.stopAtFirstPositional);
   const options = {};
   const positionals = [];
   let passthrough = false;
@@ -22,11 +24,16 @@ export function parseArgs(argv, config = {}) {
 
     if (!token.startsWith("-") || token === "-") {
       positionals.push(token);
+      if (stopAtFirstPositional) {
+        passthrough = true;
+      }
       continue;
     }
 
     if (token.startsWith("--")) {
-      const [rawKey, inlineValue] = token.slice(2).split("=", 2);
+      const separator = token.indexOf("=");
+      const rawKey = separator === -1 ? token.slice(2) : token.slice(2, separator);
+      const inlineValue = separator === -1 ? undefined : token.slice(separator + 1);
       const key = aliasMap[rawKey] ?? rawKey;
 
       if (booleanOptions.has(key)) {
@@ -34,12 +41,16 @@ export function parseArgs(argv, config = {}) {
         continue;
       }
 
-      if (valueOptions.has(key)) {
+      if (valueOptions.has(key) || repeatableOptions.has(key)) {
         const nextValue = inlineValue ?? argv[index + 1];
         if (nextValue === undefined) {
           throw new Error(`Missing value for --${rawKey}`);
         }
-        options[key] = nextValue;
+        if (repeatableOptions.has(key)) {
+          (options[key] ??= []).push(nextValue);
+        } else {
+          options[key] = nextValue;
+        }
         if (inlineValue === undefined) {
           index += 1;
         }
@@ -51,6 +62,9 @@ export function parseArgs(argv, config = {}) {
       }
 
       positionals.push(token);
+      if (stopAtFirstPositional) {
+        passthrough = true;
+      }
       continue;
     }
 
@@ -62,12 +76,16 @@ export function parseArgs(argv, config = {}) {
       continue;
     }
 
-    if (valueOptions.has(key)) {
+    if (valueOptions.has(key) || repeatableOptions.has(key)) {
       const nextValue = argv[index + 1];
       if (nextValue === undefined) {
         throw new Error(`Missing value for -${shortKey}`);
       }
-      options[key] = nextValue;
+      if (repeatableOptions.has(key)) {
+        (options[key] ??= []).push(nextValue);
+      } else {
+        options[key] = nextValue;
+      }
       index += 1;
       continue;
     }
@@ -77,6 +95,9 @@ export function parseArgs(argv, config = {}) {
     }
 
     positionals.push(token);
+    if (stopAtFirstPositional) {
+      passthrough = true;
+    }
   }
 
   return { options, positionals };

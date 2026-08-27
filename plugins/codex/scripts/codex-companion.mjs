@@ -78,7 +78,13 @@ const VALID_REASONING_EFFORTS = new Set([
   "max",
   "ultra"
 ]);
-const MODEL_ALIASES = new Map([["spark", "gpt-5.3-codex-spark"]]);
+const MODEL_ALIASES = new Map([
+  ["spark", "gpt-5.3-codex-spark"],
+  ["sol", "gpt-5.6-sol"],
+  ["luna", "gpt-5.6-luna"],
+  ["terra", "gpt-5.6-terra"],
+  ["mini", "gpt-5.4-mini"]
+]);
 const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
 
 function printUsage() {
@@ -86,9 +92,9 @@ function printUsage() {
     [
       "Usage:",
       "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
-      "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
-      "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
-      "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [prompt]",
+      "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model|spark|sol|luna|terra|mini>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [--config key=value]...",
+      "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model|spark|sol|luna|terra|mini>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [--config key=value]... [focus text]",
+      "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark|sol|luna|terra|mini>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [--config key=value]... [prompt]",
       "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
@@ -134,6 +140,18 @@ function normalizeReasoningEffort(effort) {
     );
   }
   return normalized;
+}
+
+function parseConfigOverrides(list = []) {
+  const config = {};
+  for (const pair of list) {
+    const eq = pair.indexOf("=");
+    if (eq <= 0) {
+      throw new Error(`--config expects key=value, got "${pair}".`);
+    }
+    config[pair.slice(0, eq)] = pair.slice(eq + 1);
+  }
+  return config;
 }
 
 function normalizeArgv(argv) {
@@ -393,6 +411,8 @@ async function executeReviewRun(request) {
     const result = await runAppServerReview(request.cwd, {
       target: reviewTarget,
       model: request.model,
+      effort: request.effort,
+      config: request.config,
       onProgress: request.onProgress
     });
     const payload = {
@@ -435,6 +455,8 @@ async function executeReviewRun(request) {
   const result = await runAppServerTurn(context.repoRoot, {
     prompt,
     model: request.model,
+    effort: request.effort,
+    config: request.config,
     sandbox: "read-only",
     outputSchema: readOutputSchema(REVIEW_SCHEMA),
     onProgress: request.onProgress
@@ -513,6 +535,7 @@ async function executeTaskRun(request) {
     defaultPrompt: resumeThreadId ? DEFAULT_CONTINUE_PROMPT : "",
     model: request.model,
     effort: request.effort,
+    config: request.config,
     approvalPolicy: request.write ? "on-request" : "never",
     sandbox: request.write ? "workspace-write" : "read-only",
     onProgress: request.onProgress,
@@ -628,11 +651,12 @@ function buildTaskJob(workspaceRoot, taskMetadata, write) {
   });
 }
 
-function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, jobId }) {
+function buildTaskRequest({ cwd, model, effort, config, prompt, write, resumeLast, jobId }) {
   return {
     cwd,
     model,
     effort,
+    config,
     prompt,
     write,
     resumeLast,
@@ -738,8 +762,12 @@ function enqueueBackgroundTask(cwd, job, request) {
 
 async function handleReviewCommand(argv, config) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["base", "scope", "model", "cwd"],
+    valueOptions: ["base", "scope", "model", "effort", "cwd"],
     booleanOptions: ["json", "background", "wait"],
+    repeatableOptions: ["config"],
+    // Only the adversarial variant takes free-form focus text; stop option
+    // parsing there so option-looking prompt words survive (#547).
+    stopAtFirstPositional: Boolean(config.acceptsFocusText),
     aliasMap: {
       m: "model"
     }
@@ -751,6 +779,8 @@ async function handleReviewCommand(argv, config) {
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
   const model = normalizeRequestedModel(options.model);
+  const effort = normalizeReasoningEffort(options.effort);
+  const configOverrides = parseConfigOverrides(options.config);
   const focusText = positionals.join(" ").trim();
   const target = resolveReviewTarget(cwd, {
     base: options.base,
@@ -775,6 +805,8 @@ async function handleReviewCommand(argv, config) {
         base: options.base,
         scope: options.scope,
         model,
+        effort,
+        config: configOverrides,
         focusText,
         reviewName: config.reviewName,
         onProgress: progress
@@ -794,6 +826,8 @@ async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["model", "effort", "cwd", "prompt-file"],
     booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background"],
+    repeatableOptions: ["config"],
+    stopAtFirstPositional: true,
     aliasMap: {
       m: "model"
     }
@@ -806,6 +840,7 @@ async function handleTask(argv) {
   const workspaceRoot = resolveCommandWorkspace(options);
   const model = normalizeRequestedModel(options.model);
   const effort = normalizeReasoningEffort(options.effort);
+  const configOverrides = parseConfigOverrides(options.config);
   const prompt = readTaskPrompt(cwd, options, positionals);
 
   const resumeLast = Boolean(options["resume-last"] || options.resume);
@@ -828,6 +863,7 @@ async function handleTask(argv) {
       cwd,
       model,
       effort,
+      config: configOverrides,
       prompt,
       write,
       resumeLast,
@@ -846,6 +882,7 @@ async function handleTask(argv) {
         cwd,
         model,
         effort,
+        config: configOverrides,
         prompt,
         write,
         resumeLast,
@@ -1086,7 +1123,8 @@ async function main() {
       break;
     case "adversarial-review":
       await handleReviewCommand(argv, {
-        reviewName: "Adversarial Review"
+        reviewName: "Adversarial Review",
+        acceptsFocusText: true
       });
       break;
     case "task":

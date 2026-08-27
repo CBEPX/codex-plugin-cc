@@ -880,10 +880,12 @@ test("task preserves resolved settings when turn/start fails", () => {
   assert.match(result.stderr, /turn\/start failed after thread resolution/);
   const storedJob = readPersistedJob(repo);
   assert.equal(storedJob.status, "failed");
-  assert.deepEqual(storedJob.resolved, FAKE_RESOLVED_SETTINGS);
+  // `--effort` is applied via thread/start.config, so the resolved settings echo it back.
+  const resolvedWithEffort = { ...FAKE_RESOLVED_SETTINGS, reasoningEffort: "xhigh" };
+  assert.deepEqual(storedJob.resolved, resolvedWithEffort);
   const stateDir = resolveStateDir(repo);
   const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
-  assert.deepEqual(state.jobs[0].resolved, FAKE_RESOLVED_SETTINGS);
+  assert.deepEqual(state.jobs[0].resolved, resolvedWithEffort);
 });
 
 for (const effort of ["max", "ultra"]) {
@@ -2469,4 +2471,108 @@ test("setup and status honor --cwd when reading shared session runtime", () => {
   const payload = JSON.parse(setup.stdout);
   assert.equal(payload.sessionRuntime.mode, "shared");
   assert.equal(payload.sessionRuntime.endpoint, "unix:/tmp/fake-broker.sock");
+});
+
+function seededRepo() {
+  const repo = makeTempDir();
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  return repo;
+}
+
+test("review forwards model, review_model, effort and config overrides into thread/start config", () => {
+  const repo = seededRepo();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello world\n");
+
+  const result = run(
+    "node",
+    [SCRIPT, "review", "--wait", "--model", "sol", "--effort", "max", "--config", "model_provider=ollama", "--config", "foo.bar=3"],
+    { cwd: repo, env: buildEnv(binDir) }
+  );
+
+  assert.equal(result.status, 0, result.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.deepEqual(fakeState.lastThreadStart.config, {
+    model_provider: "ollama",
+    "foo.bar": 3,
+    model: "gpt-5.6-sol",
+    review_model: "gpt-5.6-sol",
+    model_reasoning_effort: "max"
+  });
+});
+
+test("review accepts slash-command style single-string arguments", () => {
+  const repo = seededRepo();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello world\n");
+
+  const result = run("node", [SCRIPT, "review", "--wait --effort xhigh --config model_provider=ollama"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.deepEqual(fakeState.lastThreadStart.config, { model_provider: "ollama", model_reasoning_effort: "xhigh" });
+});
+
+test("task forwards config overrides and keeps option-looking prompt words", () => {
+  const repo = seededRepo();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+
+  const result = run("node", [SCRIPT, "task", "--effort", "max", "--config", "model_provider=ollama", "investigate", "ls", "-R", "usage"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.deepEqual(fakeState.lastThreadStart.config, { model_provider: "ollama", model_reasoning_effort: "max" });
+  assert.match(fakeState.lastTurnStart.prompt, /investigate ls -R usage/);
+});
+
+test("task --resume-last never puts model or effort into thread/resume config", () => {
+  const repo = seededRepo();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+
+  const first = run("node", [SCRIPT, "task", "--model", "sol", "--effort", "high", "first"], { cwd: repo, env: buildEnv(binDir) });
+  assert.equal(first.status, 0, first.stderr);
+  const second = run("node", [SCRIPT, "task", "--resume-last", "--effort", "max", "--config", "model_provider=ollama", "again"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(second.status, 0, second.stderr);
+
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.deepEqual(fakeState.lastThreadResume.config, { model_provider: "ollama" });
+  assert.equal(fakeState.lastTurnStart.effort, "max");
+});
+
+test("task --background stores config overrides in the job request", () => {
+  const repo = seededRepo();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+
+  const result = run("node", [SCRIPT, "task", "--background", "--json", "--config", "model_provider=ollama", "bg"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const jobId = JSON.parse(result.stdout).jobId;
+  const done = run("node", [SCRIPT, "status", jobId, "--wait", "--timeout-ms", "20000", "--json"], { cwd: repo, env: buildEnv(binDir) });
+  assert.equal(done.status, 0, done.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.deepEqual(fakeState.lastThreadStart.config, { model_provider: "ollama" });
 });

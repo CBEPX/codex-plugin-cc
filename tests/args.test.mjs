@@ -84,3 +84,27 @@ test("task unknown --flag errors without dispatching a Codex thread", () => {
     assert.equal((state.threads ?? []).length, 0);
   }
 });
+
+test("parseArgs collects repeatable options and honours -- and --opt=value", () => {
+  const { options, positionals } = parseArgs(
+    ["--config", "a=1", "--config=b=x=y", "--model", "sol", "--", "--not-an-option", "tail"],
+    { valueOptions: ["model"], repeatableOptions: ["config"] }
+  );
+  assert.deepEqual(options.config, ["a=1", "b=x=y"]);
+  assert.equal(options.model, "sol");
+  assert.deepEqual(positionals, ["--not-an-option", "tail"]);
+});
+
+test("parseArgs with stopAtFirstPositional keeps option-looking prompt words", () => {
+  const { options, positionals } = parseArgs(
+    ["--effort", "max", "investigate", "ls", "-R", "usage", "--model", "x"],
+    { valueOptions: ["effort", "model"], stopAtFirstPositional: true }
+  );
+  assert.equal(options.effort, "max");
+  assert.equal(options.model, undefined);
+  assert.deepEqual(positionals, ["investigate", "ls", "-R", "usage", "--model", "x"]);
+});
+
+test("parseArgs rejects a repeatable option without a value", () => {
+  assert.throws(() => parseArgs(["--config"], { repeatableOptions: ["config"] }), /--config/);
+});
