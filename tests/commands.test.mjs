@@ -256,3 +256,13 @@ test("stop gate script timeout is shorter than the Stop hook timeout and its mes
   assert.match(source, /killSignal: "SIGKILL"/);
   assert.match(source, /maxBuffer: 16 \* 1024 \* 1024/);
 });
+
+test("marketplace is published under cbepx while the plugin keeps the codex name", () => {
+  const marketplace = JSON.parse(fs.readFileSync(path.join(ROOT, ".claude-plugin", "marketplace.json"), "utf8"));
+  const plugin = JSON.parse(fs.readFileSync(path.join(PLUGIN_ROOT, ".claude-plugin", "plugin.json"), "utf8"));
+  assert.equal(marketplace.name, "cbepx");
+  assert.equal(marketplace.owner.name, "CBEPX");
+  assert.equal(plugin.name, "codex");
+  assert.equal(marketplace.plugins[0].name, "codex");
+  assert.equal(marketplace.plugins[0].version, plugin.version);
+});
