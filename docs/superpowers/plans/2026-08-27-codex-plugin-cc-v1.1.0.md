@@ -18,7 +18,8 @@
 - Node `>=18.18.0` in `package.json` engines — no Node-22-only APIs.
 - Commit messages: conventional (`feat:`, `fix:`, `chore:`, `merge:`), trailer `Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>`.
 - Merge mechanics for upstream PRs (same every time): `git fetch upstream pull/N/head:pr/N && git merge --no-ff --no-edit pr/N`; on conflict, keep BOTH sides for test-file insertions (they add independent `test(...)` blocks at the same anchor), then `npm test`.
-- Test gate command (never mask the exit status behind a pipe): `npm test > /tmp/npm-test.log 2>&1; status=$?; grep -E 'ℹ (tests|pass|fail)|^not ok' /tmp/npm-test.log; test "$status" -eq 0` — the `test` at the end is the gate. Same for smoke commands: capture `status=$?` before formatting output.
+- Test gate command (never mask the exit status behind a pipe): `npm test > /tmp/npm-test.log 2>&1; status=$?; rg -e 'ℹ (tests|pass|fail)' -e '^not ok' /tmp/npm-test.log; test "$status" -eq 0` — the `test` at the end is the gate. Same for smoke commands: capture `status=$?` before formatting output.
+- Tooling rule (user): never use `grep`/`egrep`/`fgrep` — use ripgrep `rg` (or an equivalent) in every command, script, test and brief; e.g. `rg -n 'pattern' file`, `... | rg -e 'ℹ (tests|pass|fail)' -e '^not ok'`.
 - Amended 2026-08-27 14:30 after a Codex adversarial review of this plan (13 findings; rulings in the SDD ledger). Tasks 5–8 carry the amendments.
 - Not in scope (backlog v1.2+): lifecycle/broker leak (#540/#543/#425/#376/#457), structured `--json` (#593), sandbox from config.toml (#646), `--profile` flag (covered by `--config`), Windows.
 
@@ -42,7 +43,7 @@ cd /Users/g.mehrenin/project/personal/codex-plugin-cc && git checkout -b release
 
 - [ ] **Step 2: Reproduce the failure (inside Claude Code the env leaks)**
 
-Run: `CLAUDE_PLUGIN_DATA=/tmp/leak npm test 2>&1 | grep -E 'ℹ (pass|fail)'`
+Run: `CLAUDE_PLUGIN_DATA=/tmp/leak npm test > /tmp/npm-test.log 2>&1; status=$?; rg -e 'ℹ (pass|fail)' /tmp/npm-test.log; echo status=$status`
 Expected: `ℹ fail 4` (state.test.mjs `resolveStateDir uses a temp-backed per-workspace directory` and 3 siblings).
 
 - [ ] **Step 3: Write `tests/test-env.mjs`**
@@ -70,7 +71,7 @@ Replace `"test": "node --test tests/*.test.mjs"` with `"test": "node --import ./
 
 - [ ] **Step 5: Verify**
 
-Run: `CLAUDE_PLUGIN_DATA=/tmp/leak npm test 2>&1 | grep -E 'ℹ (tests|pass|fail)'`
+Run: `CLAUDE_PLUGIN_DATA=/tmp/leak npm test > /tmp/npm-test.log 2>&1; status=$?; rg -e 'ℹ (tests|pass|fail)' /tmp/npm-test.log; echo status=$status`
 Expected: `ℹ tests 91`, `ℹ pass 91`, `ℹ fail 0`.
 
 - [ ] **Step 6: CI also on push to main/release branches**
@@ -113,7 +114,7 @@ Expected: clean merge (PR is MERGEABLE against main).
 
 - [ ] **Step 2: Test**
 
-Run: `npm test 2>&1 | grep -E 'ℹ (tests|pass|fail)|^not ok'`
+Run: `npm test > /tmp/npm-test.log 2>&1; status=$?; rg -e 'ℹ (tests|pass|fail)' -e '^not ok' /tmp/npm-test.log; test "$status" -eq 0`
 Expected: `ℹ fail 0`, tests ≥ 94 (adds `task forwards max/ultra reasoning effort…` ×2 and `task rejects an unknown reasoning effort`).
 
 - [ ] **Step 3: Smoke the real error path**
@@ -188,7 +189,7 @@ Possible conflict in `tests/commands.test.mjs` (both #616 and #608 edit the `res
 
 - [ ] **Step 2: Verify the command bodies no longer use inline `` !` `` **
 
-Run: `grep -l '^!`' plugins/codex/commands/*.md`
+Run: `rg -l '^!`' plugins/codex/commands/`
 Expected: no output.
 
 - [ ] **Step 3: Test** → `fail 0`.
@@ -207,7 +208,7 @@ for n in 547 644 645; do git fetch upstream pull/$n/head:pr/$n && git merge --no
 Expected conflicts (all keep-both): `codex-companion.mjs` `handleReviewCommand` (547 adds a guard at the top, 688 changed the model line — keep both), `tests/runtime.test.mjs` test insertions, `tests/fake-codex-fixture.mjs` line ~313/347 (approval + lastThreadStart + 645's resolved-settings echo).
 
 **Semantic conflict checklist for #645 (Git may auto-merge these silently — verify by reading, not by trusting a clean merge):**
-- `plugins/codex/scripts/lib/codex.mjs` `runAppServerTurn`: #645 rewrites the `const response = await startThread(...)` / `resumeThread(...)` hunks from a base that has no `approvalPolicy`; #426 added `approvalPolicy: options.approvalPolicy` to BOTH calls. After the merge both calls must still pass `approvalPolicy` (`grep -n approvalPolicy plugins/codex/scripts/lib/codex.mjs` must show it inside `runAppServerTurn` for start AND resume).
+- `plugins/codex/scripts/lib/codex.mjs` `runAppServerTurn`: #645 rewrites the `const response = await startThread(...)` / `resumeThread(...)` hunks from a base that has no `approvalPolicy`; #426 added `approvalPolicy: options.approvalPolicy` to BOTH calls. After the merge both calls must still pass `approvalPolicy` (`rg -n approvalPolicy plugins/codex/scripts/lib/codex.mjs` must show it inside `runAppServerTurn` for start AND resume).
 - `tests/fake-codex-fixture.mjs`: the `thread/start` / `thread/resume` handlers must simultaneously keep `lastThreadStart`/`lastThreadResume` (#688), the approval bookkeeping (#426), and #645's resolved-settings response.
 - Run the PR-specific tests by name after the merge, not only the suite total: `node --import ./tests/test-env.mjs --test --test-name-pattern 'approval|on-request|alias|resolved|model selection' tests/runtime.test.mjs` → all pass.
 
@@ -646,7 +647,7 @@ Do not call `Skill(codex:rescue)` from here (it re-enters this command). If any 
 
 - [ ] **Step 5: Edit `skills/codex-cli-runtime/SKILL.md`** — (a) after the line `Map \`spark\` to \`--model gpt-5.3-codex-spark\`…` add `- Map \`sol\` to \`--model gpt-5.6-sol\`, \`luna\` to \`--model gpt-5.6-luna\`, \`terra\` to \`--model gpt-5.6-terra\`, \`mini\` to \`--model gpt-5.4-mini\`.`; (b) replace the "return nothing" failure rule with the same visible-failure sentence as the agent; (c) add under "Command selection": `- If the request names an uncommon domain (private infra runbooks, vendor-specific tooling), prepend to the task text: "If a matching skill is not already loaded, run \`$agent-compat:skill-router\` to find a reviewed playbook before starting." (Codex has the agent-compat plugin installed; it routes to reviewed route-only skills offline.)`
 
-- [ ] **Step 6: Test** → `fail 0` (gate command). Also `grep -n 'return nothing' plugins/codex -r` → no output.
+- [ ] **Step 6: Test** → `fail 0` (gate command). Also `rg -n 'return nothing' plugins/codex` → no output.
 
 - [ ] **Step 7: Commit**
 
