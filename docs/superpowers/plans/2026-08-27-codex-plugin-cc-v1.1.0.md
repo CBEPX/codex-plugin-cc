@@ -137,7 +137,7 @@ git fetch upstream pull/688/head:pr/688 && git merge --no-ff --no-edit pr/688
 ```
 Likely conflict: `tests/runtime.test.mjs` around the anchor `test("task forwards model selection and reasoning effort to app-server turn/start"` — both #616 and #688 append tests after it. Resolution: keep both blocks in either order, remove markers.
 
-- [ ] **Step 2: Test** — `npm test … | grep ℹ` → `fail 0`.
+- [ ] **Step 2: Test** — gate command from Global Constraints → `fail 0`.
 
 - [ ] **Step 3: Commit if you resolved a conflict**
 
@@ -171,7 +171,7 @@ git fetch upstream pull/501/head:pr/501 && git merge --no-ff --no-edit pr/501
 
 - [ ] **Step 4: Test**
 
-Run: `npm test … | grep -E 'ℹ|^not ok'` → `fail 0`; `tests/app-server.test.mjs` present and passing.
+Run: gate command from Global Constraints → `fail 0`; `tests/app-server.test.mjs` present and passing.
 
 ---
 
@@ -285,7 +285,7 @@ git commit -m "fix(stop-gate): keep script timeout below the Stop hook timeout" 
 
 Why: `ReviewStartParams` has no model/effort (#476/#651), `thread/start.model` is not reliably honoured (#408), but `ThreadStartParams.config` / `ThreadResumeParams.config` are. One place (`buildThreadParams`) fixes review + adversarial + task, and `--config` replaces the 555-line `CODEX_PLUGIN_CC_ARGS` PR (#419) for the per-run case.
 
-Codex-review rulings baked in (ledger 2026-08-27): (a) **resume never mirrors `--effort` into `thread/resume.config`** — on a cold resume `config.model_reasoning_effort` counts as a model override and cancels the persisted `model`/`model_provider` (app-server `has_model_resume_override`), so `task --resume-last --effort max` would silently switch models; effort on resume goes only through the existing `turn/start.effort`. Explicit `--config` pairs DO pass on resume (user asked for them). (b) **precedence**: generic `--config` first, dedicated `--model`/`--effort` override it, so `review` and `task` behave identically. (c) **native review sets `review_model` too**: Codex's `/review` honours a separate `review_model` override, so `--model` on `review` must set both `config.model` and `config.review_model`. (d) **parsing happens once, after `normalizeArgv`**, inside `parseArgs` (slash commands deliver `"$ARGUMENTS"` as ONE argv element; #547 makes unknown options errors) — a pre-pass collector cannot see `--config` and would then be rejected. (e) **prompt-taking commands stop option parsing at the first positional** (`task`, `adversarial-review` focus text): `task --effort max investigate grep -R usage` must keep `-R` in the prompt (#547 regression).
+Codex-review rulings baked in (ledger 2026-08-27): (a) **resume never mirrors `--effort` into `thread/resume.config`** — on a cold resume `config.model_reasoning_effort` counts as a model override and cancels the persisted `model`/`model_provider` (app-server `has_model_resume_override`), so `task --resume-last --effort max` would silently switch models; effort on resume goes only through the existing `turn/start.effort`. Explicit `--config` pairs DO pass on resume (user asked for them). (b) **precedence**: generic `--config` first, dedicated `--model`/`--effort` override it, so `review` and `task` behave identically. (c) **native review sets `review_model` too**: Codex's `/review` honours a separate `review_model` override, so `--model` on `review` must set both `config.model` and `config.review_model`. (d) **parsing happens once, after `normalizeArgv`**, inside `parseArgs` (slash commands deliver `"$ARGUMENTS"` as ONE argv element; #547 makes unknown options errors) — a pre-pass collector cannot see `--config` and would then be rejected. (e) **prompt-taking commands stop option parsing at the first positional** (`task`, `adversarial-review` focus text): `task --effort max investigate ls -R usage` must keep `-R` in the prompt (#547 regression).
 
 **Files:**
 - Modify: `plugins/codex/scripts/lib/args.mjs` — `parseArgs` gains `repeatableOptions` and `stopAtFirstPositional`.
@@ -408,12 +408,12 @@ test("parseArgs collects repeatable options and honours -- and --opt=value", () 
 
 test("parseArgs with stopAtFirstPositional keeps option-looking prompt words", () => {
   const { options, positionals } = parseArgs(
-    ["--effort", "max", "investigate", "grep", "-R", "usage", "--model", "x"],
+    ["--effort", "max", "investigate", "ls", "-R", "usage", "--model", "x"],
     { valueOptions: ["effort", "model"], stopAtFirstPositional: true }
   );
   assert.equal(options.effort, "max");
   assert.equal(options.model, undefined);
-  assert.deepEqual(positionals, ["investigate", "grep", "-R", "usage", "--model", "x"]);
+  assert.deepEqual(positionals, ["investigate", "ls", "-R", "usage", "--model", "x"]);
 });
 
 test("parseArgs rejects a repeatable option without a value", () => {
@@ -486,7 +486,7 @@ test("task forwards config overrides and keeps option-looking prompt words", () 
   const statePath = path.join(binDir, "fake-codex-state.json");
   installFakeCodex(binDir);
 
-  const result = run("node", [SCRIPT, "task", "--effort", "max", "--config", "model_provider=ollama", "investigate", "grep", "-R", "usage"], {
+  const result = run("node", [SCRIPT, "task", "--effort", "max", "--config", "model_provider=ollama", "investigate", "ls", "-R", "usage"], {
     cwd: repo,
     env: buildEnv(binDir)
   });
@@ -494,7 +494,7 @@ test("task forwards config overrides and keeps option-looking prompt words", () 
   assert.equal(result.status, 0, result.stderr);
   const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
   assert.deepEqual(fakeState.lastThreadStart.config, { model_provider: "ollama", model_reasoning_effort: "max" });
-  assert.match(JSON.stringify(fakeState.lastTurnStart.input), /investigate grep -R usage/);
+  assert.match(JSON.stringify(fakeState.lastTurnStart.input), /investigate ls -R usage/);
 });
 
 test("task --resume-last never puts model or effort into thread/resume config", () => {
@@ -771,6 +771,6 @@ Then in `~/.claude/settings.json` confirm `enabledPlugins["codex@cbepx"] === tru
 2. `/codex:rescue --model sol --effort max Strictly read-only: summarize the last commit` — the answer arrives **in the same turn** (inline companion path, no `Agent`); `/codex:status --all` shows the job with `model: gpt-5.6-sol`, `effort: max` (resolved fields from #645).
 3. `node ~/.claude/plugins/cache/cbepx/codex/1.1.0/scripts/codex-companion.mjs review --wait --model sol --effort xhigh --json` → the job record's resolved model is `gpt-5.6-sol` and effort `xhigh` even with a conflicting `review_model` set in `~/.codex/config.toml` for the test (set it temporarily, then remove).
 4. Cold resume: `task --model sol --effort high "first"` then `task --resume-last --effort max "again"` → `status --json` of the second job still reports model `gpt-5.6-sol` (not the config default) and effort `max`.
-5. `node … task --effort supreme x` → `Unsupported reasoning effort "supreme". Use one of: … max, ultra.`; `task --effort max investigate grep -R usage` → prompt reaches Codex intact (no `Unknown option: -R`).
+5. `node … task --effort supreme x` → `Unsupported reasoning effort "supreme". Use one of: … max, ultra.`; `task --effort max investigate ls -R usage` → prompt reaches Codex intact (no `Unknown option: -R`).
 6. `/codex:setup --enable-review-gate` in a scratch repo, make an edit, stop → gate runs and finishes < 13 min or reports its own "13 minutes" timeout message.
-7. `npm test` inside the Claude session → `fail 0` (status-checked, not grep-checked).
+7. `npm test` inside the Claude session → `fail 0` (exit-status-checked, never via a pipe).
