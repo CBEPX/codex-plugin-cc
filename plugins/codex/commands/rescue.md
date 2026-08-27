@@ -13,14 +13,28 @@ If the request contains `--background`, skip directly to step 3 — steps 1 and 
 
 1. Strip `--wait` if present (it is the default). If the request contains `--resume`, use `task --resume-last`; if `--fresh`, use a fresh `task`; otherwise run `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task-resume-candidate --json` and follow its recommendation. Pass `--model`, `--effort` and every `--config key=value` through unchanged. Never add `--write` unless the user explicitly asked Codex to modify files.
 
-2. Start the job and wait for it, in ≤9-minute slices so the Bash tool's 10-minute cap never kills a long run:
+2. Launch the job, then wait for it — two separate Bash calls, in ≤9-minute wait slices so the Bash tool's 10-minute cap never kills a long run. Bash calls share no variables — always set `JOB=<id>` literally at the top of every later call; never rely on a `$JOB` left over from a previous call.
+
+2a. Launch (one Bash call):
 
 ```bash
-JOB=$(node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task --background --json <flags> "<request text>" | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>process.stdout.write(JSON.parse(d).jobId))')
-until node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" status "$JOB" --wait --timeout-ms 540000 --json | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{const s=JSON.parse(d).job.status;process.exit(s==="queued"||s==="running"?1:0)})'; do :; done
+ERR=$(mktemp)
+JOB=$(node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task --background --json <flags> "<request text>" 2>"$ERR" | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{process.stdout.write(JSON.parse(d).jobId||"")}catch(e){}})')
+[ -n "$JOB" ] || { cat "$ERR"; exit 1; }
+echo "JOB=$JOB"
+```
+If this call exits non-zero, its output is the launch failure (Codex missing, unauthenticated, a bad flag, etc.) — show it to the user verbatim and stop; never report "no result". Otherwise its last line is `JOB=<id>`; read `<id>` from it.
+
+2b. Wait and fetch the result (one Bash call, tool `timeout: 600000`). Set `JOB=<id>` literally as the first line, using the id you just read from 2a:
+
+```bash
+JOB=<id>
+OUT=$(mktemp); ERR=$(mktemp)
+while node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" status "$JOB" --wait --timeout-ms 540000 --json >"$OUT" 2>"$ERR"; node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{const s=(JSON.parse(d).job||{}).status;process.exit(s==="queued"||s==="running"?3:(s?0:2))}catch(e){process.exit(2)}})' < "$OUT"; rc=$?; [ "$rc" -eq 3 ]; do sleep 1; done
+[ "$rc" -eq 0 ] || { cat "$OUT" "$ERR"; exit "$rc"; }
 node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" result "$JOB"
 ```
-Run the `until` loop as one Bash call with `timeout: 600000`; if it returns because Bash timed out, run the same `until … done` line again — the job keeps running in the background. `status --wait --json` exits 0 regardless of whether the job finished or the wait itself timed out (see `handleStatus`/`waitForSingleJobSnapshot` in `codex-companion.mjs`), so the loop parses `job.status` from the JSON instead of the exit code — `"queued"`/`"running"` means keep looping, anything else is terminal. Show the `result` output to the user verbatim, then add your own assessment.
+The status check exits 3 while the job is still `queued`/`running` (loop — `sleep 1` keeps a fast exit-3 from spinning hot), 0 once the job reaches a terminal status, or 2 if the status output was empty or unparseable; either non-3 outcome ends the loop. If this Bash call is itself cut off by the tool's own timeout before the loop finishes, the job keeps running server-side — run 2b again with the same literal `JOB=<id>` line. If it exits non-zero, show its output verbatim and stop; never report "no result". Otherwise show the `result` output to the user verbatim, then add your own assessment.
 
 3. Only when the request contains `--background`: invoke the `codex:codex-rescue` subagent via the `Agent` tool (`subagent_type: "codex:codex-rescue"`, prompt = the raw request minus `--background`) and tell the user the job id will arrive as a completion notification; they can also run `/codex:status` and `/codex:result <job-id>`.
 

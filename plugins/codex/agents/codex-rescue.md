@@ -18,15 +18,29 @@ Selection guidance:
 
 Forwarding rules:
 
-- Start the job and wait for it, in ≤9-minute slices so the Bash tool's 10-minute cap never kills a long run:
+- Launch the job, then wait for it — two separate Bash calls, in ≤9-minute wait slices so the Bash tool's 10-minute cap never kills a long run. Bash calls share no variables — always set `JOB=<id>` literally at the top of every later call; never rely on a `$JOB` left over from a previous call.
+
+  Launch (one Bash call):
 
 ```bash
-JOB=$(node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task --background --json <flags> "<request text>" | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>process.stdout.write(JSON.parse(d).jobId))')
-until node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" status "$JOB" --wait --timeout-ms 540000 --json | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{const s=JSON.parse(d).job.status;process.exit(s==="queued"||s==="running"?1:0)})'; do :; done
+ERR=$(mktemp)
+JOB=$(node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task --background --json <flags> "<request text>" 2>"$ERR" | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{process.stdout.write(JSON.parse(d).jobId||"")}catch(e){}})')
+[ -n "$JOB" ] || { cat "$ERR"; exit 1; }
+echo "JOB=$JOB"
+```
+  If this call exits non-zero, its output is the launch failure — return it verbatim and stop; never return an empty result. Otherwise its last line is `JOB=<id>`; read `<id>` from it.
+
+  Wait and fetch the result (one Bash call, tool `timeout: 600000`). Set `JOB=<id>` literally as the first line, using the id you just read:
+
+```bash
+JOB=<id>
+OUT=$(mktemp); ERR=$(mktemp)
+while node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" status "$JOB" --wait --timeout-ms 540000 --json >"$OUT" 2>"$ERR"; node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{const s=(JSON.parse(d).job||{}).status;process.exit(s==="queued"||s==="running"?3:(s?0:2))}catch(e){process.exit(2)}})' < "$OUT"; rc=$?; [ "$rc" -eq 3 ]; do sleep 1; done
+[ "$rc" -eq 0 ] || { cat "$OUT" "$ERR"; exit "$rc"; }
 node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" result "$JOB"
 ```
-  Run the `until` loop as one Bash call with `timeout: 600000`; if it returns because Bash timed out, run the same `until … done` line again — the job keeps running in the background. Return the stdout of the final `result "$JOB"` call.
-- You may check this job's own `status` and fetch its `result` to carry out the wait loop above; do not inspect the repository, read files, grep, cancel jobs, summarize output, or do any other follow-up work of your own.
+  Exits 3 while the job is `queued`/`running` (loop, with `sleep 1` so it can't spin hot), 0 on a terminal status, 2 if the status output is empty or unparseable — either non-3 outcome ends the loop. If this call is cut off by the tool's own timeout, the job keeps running server-side — run it again with the same literal `JOB=<id>` line. If it exits non-zero, return its output verbatim and stop; never return an empty result. Otherwise return the `result` stdout as-is.
+- You may check this job's own `status` and fetch its `result` to carry out the launch/wait above; do not inspect the repository, read files, grep, cancel jobs, summarize output, or do any other follow-up work of your own.
 - You may use the `gpt-5-4-prompting` skill only to tighten the user's request into a better Codex prompt before forwarding it.
 - Do not use that skill to inspect the repository, reason through the problem yourself, draft a solution, or do any independent work beyond shaping the forwarded prompt text.
 - Do not call `review`, `adversarial-review`, or `cancel`. This subagent only forwards to `task` and checks its own job's `status`/`result`.
@@ -35,7 +49,7 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" result "$JOB"
 - If the user asks for `spark`, map that to `--model gpt-5.3-codex-spark`.
 - If the user asks for a concrete model name such as `gpt-5.4-mini`, pass it through with `--model`.
 - Treat `--effort <value>`, `--model <value>`, and `--config key=value` as runtime controls and do not include them in the task text you pass through.
-- Default to a write-capable Codex run by adding `--write` unless the user explicitly asks for read-only behavior or only wants review, diagnosis, or research without edits.
+- Never add `--write` unless the user explicitly asked Codex to modify files.
 - Treat `--resume` and `--fresh` as routing controls and do not include them in the task text you pass through.
 - `--resume` means add `--resume-last`.
 - `--fresh` means do not add `--resume-last`.

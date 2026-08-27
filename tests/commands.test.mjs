@@ -116,7 +116,7 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(agent, /thin forwarding wrapper/i);
   assert.match(agent, /result "\$JOB"/);
   assert.doesNotMatch(agent, /prefer background execution/i);
-  assert.match(runtimeSkill, /always run that Bash call in the foreground/i);
+  assert.match(runtimeSkill, /Launch exactly one job per rescue handoff with `task --background --json`/i);
   assert.match(agent, /Bash tool's 10-minute cap/i);
   assert.match(agent, /do not inspect the repository, read files, grep, cancel jobs, summarize output, or do any other follow-up work of your own/i);
   assert.match(agent, /Do not call `review`, `adversarial-review`, or `cancel`/i);
@@ -129,8 +129,9 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(agent, /gpt-5-4-prompting/);
   assert.match(agent, /only to tighten the user's request into a better Codex prompt/i);
   assert.match(agent, /Do not use that skill to inspect the repository, reason through the problem yourself, draft a solution, or do any independent work/i);
-  assert.match(runtimeSkill, /only job is to invoke `task` once and return that stdout unchanged/i);
-  assert.match(runtimeSkill, /Do not call `setup`, `review`, `adversarial-review`, `status`, `result`, or `cancel`/i);
+  assert.match(runtimeSkill, /launches once with `task --background --json`, polls only that job's own `status`, then returns the `result` stdout unchanged/i);
+  assert.match(runtimeSkill, /Do not call `setup`, `review`, `adversarial-review`, or `cancel` from `codex:codex-rescue`/i);
+  assert.match(runtimeSkill, /`status` and `result` are allowed, but only for the job you just launched/i);
   assert.match(runtimeSkill, /use the `gpt-5-4-prompting` skill to rewrite the user's request into a tighter Codex prompt/i);
   assert.match(runtimeSkill, /That prompt drafting is the only Claude-side work allowed/i);
   assert.match(runtimeSkill, /Leave `--effort` unset unless the user explicitly requests a specific effort/i);
@@ -139,7 +140,7 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(runtimeSkill, /If the forwarded request includes `--background` or `--wait`, treat that as Claude-side execution control only/i);
   assert.match(runtimeSkill, /Strip it before calling `task`/i);
   assert.match(runtimeSkill, /`--effort`: accepted values are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra`/i);
-  assert.match(runtimeSkill, /Do not inspect the repository, read files, grep, monitor progress, poll status, fetch results, cancel jobs, summarize output, or do any follow-up work of your own/i);
+  assert.match(runtimeSkill, /Do not inspect the repository, read files, grep, cancel jobs, summarize output, or do any other follow-up work of your own beyond launching and polling your own job/i);
   assert.match(runtimeSkill, /If the Bash call fails or Codex cannot be invoked, return the command's exit status and stderr verbatim/i);
   assert.match(readme, /`codex:codex-rescue` subagent/i);
   assert.match(readme, /if you do not pass `--model` or `--effort`, Codex chooses its own defaults/i);
@@ -177,6 +178,8 @@ test("rescue runs synchronously through the companion and uses Agent only for --
   assert.doesNotMatch(runtimeSkill, /return nothing/i);
   assert.match(runtimeSkill, /Map `sol` to `--model gpt-5\.6-sol`/i);
   assert.match(runtimeSkill, /\$agent-compat:skill-router/);
+  assert.doesNotMatch(agent, /adding `--write` unless/i);
+  assert.doesNotMatch(runtimeSkill, /adding `--write` unless/i);
 });
 
 test("transfer, result, and cancel commands are exposed as deterministic runtime entrypoints", () => {
