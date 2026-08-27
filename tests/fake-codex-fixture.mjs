@@ -671,7 +671,7 @@ export function buildEnv(binDir, overrides = {}) {
     // Keep test brokers short-lived so a run that leaves one behind (crash,
     // interrupted test, etc.) doesn't linger as an orphaned process for the
     // default 30-minute idle timeout. See PR #457.
-    CODEX_COMPANION_BROKER_IDLE_TIMEOUT_MS: "2000",
+    CODEX_COMPANION_BROKER_IDLE_TIMEOUT_MS: "5000",
     ...overrides
   };
 }

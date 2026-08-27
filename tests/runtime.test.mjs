@@ -2367,7 +2367,7 @@ test("commands lazily start and reuse one shared app-server after first use", as
 
   const brokerPid = brokerSession.pid;
   assert.ok(brokerPid > 0);
-  const deadline = Date.now() + 6000;
+  const deadline = Date.now() + 12000;
   let alive = true;
   while (alive && Date.now() < deadline) {
     try {
@@ -2377,7 +2377,7 @@ test("commands lazily start and reuse one shared app-server after first use", as
       alive = false;
     }
   }
-  assert.equal(alive, false, `broker ${brokerPid} should exit within the 2 s test idle timeout`);
+  assert.equal(alive, false, `broker ${brokerPid} should exit within the 5 s test idle timeout`);
 
   const cleanup = run("node", [SESSION_HOOK, "SessionEnd"], {
     cwd: repo,
