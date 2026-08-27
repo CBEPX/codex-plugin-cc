@@ -19,8 +19,12 @@ If the request contains `--background`, skip directly to step 3 — steps 1 and 
 
 ```bash
 ERR=$(mktemp)
-JOB=$(node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task --background --json <flags> "<request text>" 2>"$ERR" | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{process.stdout.write(JSON.parse(d).jobId||"")}catch(e){}})')
+JOB=$(node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task --background --json --args-stdin <<'CODEX_ARGS' 2>"$ERR" | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{process.stdout.write(JSON.parse(d).jobId||"")}catch(e){}})'
+<flags> <request text>
+CODEX_ARGS
+)
 [ -n "$JOB" ] || { cat "$ERR"; exit 1; }
+[[ "$JOB" =~ ^[A-Za-z0-9_-]+$ ]] || { echo "invalid job id"; exit 1; }
 echo "JOB=$JOB"
 ```
 If this call exits non-zero, its output is the launch failure (Codex missing, unauthenticated, a bad flag, etc.) — show it to the user verbatim and stop; never report "no result". Otherwise its last line is `JOB=<id>`; read `<id>` from it.
@@ -29,6 +33,7 @@ If this call exits non-zero, its output is the launch failure (Codex missing, un
 
 ```bash
 JOB=<id>
+[[ "$JOB" =~ ^[A-Za-z0-9_-]+$ ]] || { echo "invalid job id"; exit 1; }
 OUT=$(mktemp); ERR=$(mktemp)
 while node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" status "$JOB" --wait --timeout-ms 540000 --json >"$OUT" 2>"$ERR"; node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{const s=(JSON.parse(d).job||{}).status;process.exit(s==="queued"||s==="running"?3:(s?0:2))}catch(e){process.exit(2)}})' < "$OUT"; rc=$?; [ "$rc" -eq 3 ]; do sleep 1; done
 [ "$rc" -eq 0 ] || { cat "$OUT" "$ERR"; exit "$rc"; }

@@ -8,5 +8,7 @@ allowed-tools: Bash(node:*)
 Cancel the requested background Codex job by running the Bash command below.
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" cancel "$ARGUMENTS"
+node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" cancel --args-stdin <<'CODEX_ARGS'
+$ARGUMENTS
+CODEX_ARGS
 ```

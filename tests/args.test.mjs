@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 
-import { parseArgs } from "../plugins/codex/scripts/lib/args.mjs";
+import { parseArgs, splitRawArgumentString } from "../plugins/codex/scripts/lib/args.mjs";
 import { makeTempDir, run, initGitRepo } from "./helpers.mjs";
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import fs from "node:fs";
@@ -107,4 +107,20 @@ test("parseArgs with stopAtFirstPositional keeps option-looking prompt words", (
 
 test("parseArgs rejects a repeatable option without a value", () => {
   assert.throws(() => parseArgs(["--config"], { repeatableOptions: ["config"] }), /--config/);
+});
+
+test("splitRawArgumentString keeps shell metacharacters as literal token content", () => {
+  assert.deepEqual(splitRawArgumentString("investigate $(id) `whoami` ${HOME} a|b;c&d"), [
+    "investigate",
+    "$(id)",
+    "`whoami`",
+    "${HOME}",
+    "a|b;c&d"
+  ]);
+});
+
+test("splitRawArgumentString groups quoted runs and keeps quoted newlines inside one token", () => {
+  assert.deepEqual(splitRawArgumentString("--config 'a b=c d' \"e f\""), ["--config", "a b=c d", "e f"]);
+  assert.deepEqual(splitRawArgumentString("'line one\nline two'"), ["line one\nline two"]);
+  assert.deepEqual(splitRawArgumentString("--all\n--json"), ["--all", "--json"]);
 });

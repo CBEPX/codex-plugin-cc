@@ -98,7 +98,10 @@ function printUsage() {
       "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
-      "  node scripts/codex-companion.mjs cancel [job-id] [--json]"
+      "  node scripts/codex-companion.mjs cancel [job-id] [--json]",
+      "",
+      "Any subcommand also accepts --args-stdin: the whole argument string is read",
+      "from stdin and tokenized here, so no shell ever sees the caller's text."
     ].join("\n")
   );
 }
@@ -154,8 +157,30 @@ function parseConfigOverrides(list = []) {
   return config;
 }
 
+// Claude Code substitutes `$ARGUMENTS` (and a rescue request's text) into the
+// command body *before* bash runs it, so any `$(...)`/backtick the user typed
+// would execute on the host shell, outside Codex's sandbox. Command bodies feed
+// the raw argument string in through a quoted heredoc on stdin instead, and
+// `--args-stdin` tokenizes it here with the same shell-like splitter
+// `normalizeArgv` already uses — never through a shell.
+const ARGS_STDIN_FLAG = "--args-stdin";
+let argvTokenizedFromStdin = false;
+
+function applyArgsStdin(argv) {
+  const flagIndex = argv.indexOf(ARGS_STDIN_FLAG);
+  if (flagIndex === -1) {
+    return argv;
+  }
+  argvTokenizedFromStdin = true;
+  return [
+    ...argv.slice(0, flagIndex),
+    ...splitRawArgumentString(readStdinIfPiped()),
+    ...argv.slice(flagIndex + 1)
+  ];
+}
+
 function normalizeArgv(argv) {
-  if (argv.length === 1) {
+  if (!argvTokenizedFromStdin && argv.length === 1) {
     const [raw] = argv;
     if (!raw || !raw.trim()) {
       return [];
@@ -1108,11 +1133,13 @@ async function handleCancel(argv) {
 }
 
 async function main() {
-  const [subcommand, ...argv] = process.argv.slice(2);
+  const [subcommand, ...rawArgv] = process.argv.slice(2);
   if (!subcommand || subcommand === "help" || subcommand === "--help") {
     printUsage();
     return;
   }
+
+  const argv = applyArgsStdin(rawArgv);
 
   switch (subcommand) {
     case "setup":

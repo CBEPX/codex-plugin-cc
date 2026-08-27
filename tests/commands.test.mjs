@@ -20,10 +20,10 @@ test("review command uses AskUserQuestion and background Bash while staying revi
   assert.match(source, /return Codex's output verbatim to the user/i);
   assert.match(source, /```bash/);
   assert.match(source, /```typescript/);
-  assert.match(source, /review "\$ARGUMENTS"/);
+  assert.match(source, /review --args-stdin <<'CODEX_ARGS'/);
   assert.match(source, /\[--scope auto\|working-tree\|branch\]/);
   assert.match(source, /run_in_background:\s*true/);
-  assert.match(source, /command:\s*`node "\$\{CLAUDE_PLUGIN_ROOT\}\/scripts\/codex-companion\.mjs" review "\$ARGUMENTS"`/);
+  assert.match(source, /command:\s*`node "\$\{CLAUDE_PLUGIN_ROOT\}\/scripts\/codex-companion\.mjs" review --args-stdin <<'CODEX_ARGS'\n\$ARGUMENTS\nCODEX_ARGS`/);
   assert.match(source, /description:\s*"Codex review"/);
   assert.match(source, /Do not call `BashOutput`/);
   assert.match(source, /Return the command stdout verbatim, exactly as-is/i);
@@ -48,10 +48,10 @@ test("adversarial review command uses AskUserQuestion and background Bash while 
   assert.match(source, /return Codex's output verbatim to the user/i);
   assert.match(source, /```bash/);
   assert.match(source, /```typescript/);
-  assert.match(source, /adversarial-review "\$ARGUMENTS"/);
+  assert.match(source, /adversarial-review --args-stdin <<'CODEX_ARGS'/);
   assert.match(source, /\[--scope auto\|working-tree\|branch\].*\[focus \.\.\.\]/);
   assert.match(source, /run_in_background:\s*true/);
-  assert.match(source, /command:\s*`node "\$\{CLAUDE_PLUGIN_ROOT\}\/scripts\/codex-companion\.mjs" adversarial-review "\$ARGUMENTS"`/);
+  assert.match(source, /command:\s*`node "\$\{CLAUDE_PLUGIN_ROOT\}\/scripts\/codex-companion\.mjs" adversarial-review --args-stdin <<'CODEX_ARGS'\n\$ARGUMENTS\nCODEX_ARGS`/);
   assert.match(source, /description:\s*"Codex adversarial review"/);
   assert.match(source, /Do not call `BashOutput`/);
   assert.match(source, /Return the command stdout verbatim, exactly as-is/i);
@@ -189,12 +189,12 @@ test("transfer, result, and cancel commands are exposed as deterministic runtime
   const resultHandling = read("skills/codex-result-handling/SKILL.md");
 
   assert.match(transfer, /disable-model-invocation:\s*true/);
-  assert.match(transfer, /codex-companion\.mjs" transfer "\$ARGUMENTS"/);
+  assert.match(transfer, /codex-companion\.mjs" transfer --args-stdin <<'CODEX_ARGS'/);
   assert.match(transfer, /codex resume <session-id>/);
   assert.match(result, /disable-model-invocation:\s*true/);
-  assert.match(result, /codex-companion\.mjs" result "\$ARGUMENTS"/);
+  assert.match(result, /codex-companion\.mjs" result --args-stdin <<'CODEX_ARGS'/);
   assert.match(cancel, /disable-model-invocation:\s*true/);
-  assert.match(cancel, /codex-companion\.mjs" cancel "\$ARGUMENTS"/);
+  assert.match(cancel, /codex-companion\.mjs" cancel --args-stdin <<'CODEX_ARGS'/);
   assert.match(resultHandling, /do not turn a failed or incomplete Codex run into a Claude-side implementation attempt/i);
   assert.match(resultHandling, /if Codex was never successfully invoked, do not generate a substitute answer at all/i);
 });
@@ -236,7 +236,7 @@ test("setup command can offer Codex install and still points users to codex logi
   assert.match(setup, /argument-hint:\s*'\[--enable-review-gate\|--disable-review-gate\]'/);
   assert.match(setup, /AskUserQuestion/);
   assert.match(setup, /npm install -g @openai\/codex/);
-  assert.match(setup, /codex-companion\.mjs" setup --json \$ARGUMENTS/);
+  assert.match(setup, /codex-companion\.mjs" setup --json --args-stdin <<'CODEX_ARGS'/);
   assert.match(readme, /!codex login/);
   assert.match(readme, /offer to install Codex for you/i);
   assert.match(readme, /\/codex:setup --enable-review-gate/);
@@ -265,4 +265,42 @@ test("marketplace is published under cbepx while the plugin keeps the codex name
   assert.equal(plugin.name, "codex");
   assert.equal(marketplace.plugins[0].name, "codex");
   assert.equal(marketplace.plugins[0].version, plugin.version);
+});
+
+function assertArgumentsNeverReachTheShell(label, body) {
+  body.split("\n").forEach((line, index) => {
+    if (!line.includes("$ARGUMENTS")) {
+      return;
+    }
+    const trimmed = line.trim();
+    assert.ok(
+      trimmed === "$ARGUMENTS" || trimmed === "`$ARGUMENTS`",
+      `${label}:${index + 1} exposes $ARGUMENTS to the shell: ${line}`
+    );
+  });
+}
+
+test("command bodies hand arguments to the companion via a quoted heredoc, never inside a shell string", () => {
+  const commandFiles = fs.readdirSync(path.join(PLUGIN_ROOT, "commands")).sort();
+  for (const file of commandFiles) {
+    const body = read(path.join("commands", file));
+    assert.doesNotMatch(body, /"\$ARGUMENTS"/, `${file} still interpolates $ARGUMENTS inside a shell string`);
+    // $ARGUMENTS may only appear as inline-code prose (`$ARGUMENTS`) or as the
+    // whole body line of a quoted heredoc. Anywhere else the shell expands what
+    // Claude Code substituted before bash ever ran.
+    assertArgumentsNeverReachTheShell(file, body);
+    assert.match(body, /--args-stdin <<'CODEX_ARGS'/, `${file} must pass arguments through a quoted heredoc`);
+  }
+
+  const rescue = read("commands/rescue.md");
+  const agent = read("agents/codex-rescue.md");
+  for (const [label, body] of [["rescue.md", rescue], ["codex-rescue.md", agent]]) {
+    assert.doesNotMatch(body, /"<request text>"/, `${label} still interpolates the request text inside a shell string`);
+    assert.match(body, /task --background --json --args-stdin <<'CODEX_ARGS'/, `${label} must launch through a quoted heredoc`);
+    assert.match(
+      body,
+      /\[\[ "\$JOB" =~ \^\[A-Za-z0-9_-\]\+\$ \]\] \|\| \{ echo "invalid job id"; exit 1; \}/,
+      `${label} must validate the job id before using it`
+    );
+  }
 });

@@ -2606,3 +2606,49 @@ test("task --background stores config overrides in the job request", () => {
   const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
   assert.deepEqual(fakeState.lastThreadStart.config, { model_provider: "ollama" });
 });
+
+test("status --args-stdin tokenizes the raw argument string from stdin", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+
+  const viaStdin = run("node", [SCRIPT, "status", "--args-stdin"], {
+    cwd: repo,
+    env: buildEnv(binDir),
+    input: "--all --json\n"
+  });
+  const viaArgv = run("node", [SCRIPT, "status", "--all", "--json"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(viaStdin.status, 0, viaStdin.stderr);
+  assert.equal(viaArgv.status, 0, viaArgv.stderr);
+  assert.deepEqual(JSON.parse(viaStdin.stdout), JSON.parse(viaArgv.stdout));
+});
+
+test("task --args-stdin keeps shell metacharacters inside the prompt instead of executing them", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  const sentinel = path.join(makeTempDir(), "pwned");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const rawArguments = `--effort max investigate $(touch ${sentinel}) \`id\``;
+  const result = run("node", [SCRIPT, "task", "--args-stdin"], {
+    cwd: repo,
+    env: buildEnv(binDir),
+    input: `${rawArguments}\n`
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(fakeState.lastTurnStart.effort, "max");
+  assert.equal(fakeState.lastTurnStart.prompt, `investigate $(touch ${sentinel}) \`id\``);
+  assert.equal(fs.existsSync(sentinel), false);
+});

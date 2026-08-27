@@ -8,7 +8,9 @@ allowed-tools: Bash(node:*)
 Transfer the current Claude Code session into a resumable Codex thread by running the Bash command below, then present the output to the user.
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" transfer "$ARGUMENTS"
+node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" transfer --args-stdin <<'CODEX_ARGS'
+$ARGUMENTS
+CODEX_ARGS
 ```
 
 Present the command output to the user exactly as returned. Preserve the Codex session ID and the `codex resume <session-id>` command.

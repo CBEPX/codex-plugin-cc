@@ -8,7 +8,9 @@ allowed-tools: Bash(node:*)
 Run the Codex status command with the Bash tool (the `allowed-tools` frontmatter above permits it), then format the output as described below:
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" status "$ARGUMENTS"
+node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" status --args-stdin <<'CODEX_ARGS'
+$ARGUMENTS
+CODEX_ARGS
 ```
 
 If the user did not pass a job ID:
