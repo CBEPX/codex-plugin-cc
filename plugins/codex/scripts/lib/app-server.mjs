@@ -183,22 +183,16 @@ export class AppServerClientBase {
         this.sendMessage({ id: message.id, result: { permissions: {}, scope: "turn" } });
         return;
 
-      // MCP servers (e.g. ChatGPT connectors surfaced as `codex_apps`) request
-      // the operator's consent via an elicitation. Form-mode elicitations expect
-      // structured content back, so a blanket accept with `content: null`
-      // violates the contract; decline those and accept the rest.
-      case "mcpServer/elicitation/request": {
-        const mode = message.params?.mode;
-        if (mode === "form" || mode === "openai/form") {
-          this.sendMessage({ id: message.id, result: { action: "decline" } });
-          return;
-        }
-        this.sendMessage({
-          id: message.id,
-          result: { action: "accept", content: null, _meta: null }
-        });
+      // MCP servers (e.g. ChatGPT connectors surfaced as `codex_apps`) ask for
+      // the operator's consent via an elicitation. Accepting one fabricates that
+      // consent: a url-mode accept tells the MCP server an out-of-band
+      // authorization succeeded when nobody completed it, and a form-mode accept
+      // with `content: null` lets the tool call proceed without the values it
+      // asked for. Decline every mode — url/form flows must be completed in an
+      // interactive Codex session.
+      case "mcpServer/elicitation/request":
+        this.sendMessage({ id: message.id, result: { action: "decline" } });
         return;
-      }
 
       default:
         this.sendMessage({

@@ -14,16 +14,14 @@ class CapturingClient extends AppServerClientBase {
   }
 }
 
-test("handleServerRequest accepts MCP elicitation requests instead of rejecting them", () => {
+test("handleServerRequest answers MCP elicitation requests instead of rejecting them", () => {
   const client = new CapturingClient();
   client.handleServerRequest({
     id: 7,
     method: "mcpServer/elicitation/request",
     params: { threadId: "t1" }
   });
-  assert.deepEqual(client.sent, [
-    { id: 7, result: { action: "accept", content: null, _meta: null } }
-  ]);
+  assert.deepEqual(client.sent, [{ id: 7, result: { action: "decline" } }]);
 });
 
 test("handleServerRequest still rejects unknown server requests with -32601", () => {
@@ -35,24 +33,19 @@ test("handleServerRequest still rejects unknown server requests with -32601", ()
   assert.equal(client.sent[0].error.code, -32601);
 });
 
-test("form-mode elicitation requests are declined instead of accepted with empty content", () => {
-  for (const mode of ["form", "openai/form"]) {
+test("every elicitation mode is declined, so consent is never fabricated", () => {
+  // Accepting a url-mode elicitation tells the MCP server that an out-of-band
+  // authorization succeeded when nobody completed it. There is no operator here,
+  // so no mode may be accepted.
+  for (const mode of ["form", "openai/form", "url", undefined, "something-new"]) {
     const client = new CapturingClient();
     client.handleServerRequest({
       id: 9,
       method: "mcpServer/elicitation/request",
-      params: { threadId: "t1", mode }
+      params: { threadId: "t1", ...(mode === undefined ? {} : { mode }) }
     });
-    assert.deepEqual(client.sent, [{ id: 9, result: { action: "decline" } }]);
+    assert.deepEqual(client.sent, [{ id: 9, result: { action: "decline" } }], `mode ${mode} must be declined`);
   }
-
-  const urlClient = new CapturingClient();
-  urlClient.handleServerRequest({
-    id: 10,
-    method: "mcpServer/elicitation/request",
-    params: { threadId: "t1", mode: "url" }
-  });
-  assert.deepEqual(urlClient.sent, [{ id: 10, result: { action: "accept", content: null, _meta: null } }]);
 });
 
 // The non-interactive runner has no operator, so every approval request must be
