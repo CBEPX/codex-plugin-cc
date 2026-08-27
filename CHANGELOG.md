@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1.1 — 2026-08-28
+
+- Broker idle self-terminate (upstream #457): the shared Codex runtime exits after 30 minutes without a connected client (`CODEX_COMPANION_BROKER_IDLE_TIMEOUT_MS` / `--idle-timeout`), so idle brokers and their app-server children no longer accumulate (#543).
+- Test suite no longer leaks fake `codex app-server`/broker processes (5 s idle timeout in the test environment; CI fails if any `codex-plugin-test-*` process survives).
+- Rescue shell blocks use `command rm -f --` in their cleanup trap (no noise from `rm` aliases such as `trash`).
+
 ## 1.1.0 — 2026-08-27
 
 Fork of [openai/codex-plugin-cc](https://github.com/openai/codex-plugin-cc) 1.0.6 (`db52e28`). Marketplace `cbepx`, plugin name unchanged (`codex`).
