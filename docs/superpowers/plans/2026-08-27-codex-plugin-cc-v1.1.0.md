@@ -571,6 +571,16 @@ function parseConfigOverrides(list = []) {
 7. `executeTaskRun(request)` (~line 485): pass `config: request.config` into `runAppServerTurn`.
 8. `printUsage()`: add `[--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [--config key=value]...` to the review/adversarial-review lines, `[--config key=value]...` to the task line, and `sol|luna|terra|mini` next to `spark` in every `--model <model|spark>` hint.
 
+- [ ] **Step 12b: Decline form-mode MCP elicitations (Codex merge-review finding)** — #501 auto-accepts every `mcpServer/elicitation/request` with `content: null`; for `params.mode === "form"` or `"openai/form"` the app-server contract requires structured content, so the tool call fails or proceeds without the requested values. First append to `tests/app-server.test.mjs` (it already exercises `handleServerRequest` for the URL case — copy its mechanics):
+
+```js
+test("form-mode elicitation requests are declined instead of accepted with empty content", () => {
+  // Arrange exactly like the existing accept test, but with params.mode = "form".
+  // Assert the reply is { action: "decline" } (no content), and that mode "url" still gets { action: "accept", content: null, _meta: null }.
+});
+```
+Fill the body by mirroring the existing test's setup for the request/response capture. Then in `plugins/codex/scripts/lib/app-server.mjs` `handleServerRequest`: when `message.params?.mode === "form" || message.params?.mode === "openai/form"` respond with `{ action: "decline" }`; keep the accept path for every other mode. Run: `node --import ./tests/test-env.mjs --test tests/app-server.test.mjs` → all pass.
+
 - [ ] **Step 13: Fixture** — in `tests/fake-codex-fixture.mjs`: `thread/start` stores the full params as `state.lastThreadStart = params` (keep whatever #688/#426/#645 already record alongside), `thread/resume` stores `state.lastThreadResume = params`; the `ThreadStartResponse`/`ThreadResumeResponse` it fabricates derive `model` from `params.model ?? params.config?.model ?? <its current default>` and `reasoningEffort` from `params.config?.model_reasoning_effort ?? <current default>` so #645's `resolved` reflects config precedence.
 
 - [ ] **Step 14: Test** → `fail 0` (gate command).
@@ -643,7 +653,7 @@ Run the `until` loop as one Bash call with `timeout: 600000`; if it returns beca
 Do not call `Skill(codex:rescue)` from here (it re-enters this command). If any Bash step exits non-zero, show its stderr to the user — never report "no result".
 ````
 
-- [ ] **Step 4: Edit `agents/codex-rescue.md`** — delete the `model: sonnet` line entirely. Replace the sentence that says to return nothing when the Bash call fails with: "If the Bash call fails or Codex cannot be invoked, return the command's exit status and stderr verbatim so the failure is visible; never return an empty result."
+- [ ] **Step 4: Edit `agents/codex-rescue.md`** — delete the `model: sonnet` line entirely. Replace the sentence that says to return nothing when the Bash call fails with: "If the Bash call fails or Codex cannot be invoked, return the command's exit status and stderr verbatim so the failure is visible; never return an empty result." Also (Codex merge-review P1): the agent's single foreground `task` Bash call dies at the Bash tool's 10-minute cap even when the agent itself runs in the background, losing long results and leaving stale jobs. Replace the "exactly one foreground Bash call" instruction with the same detached pattern the slash command uses — `task --background --json` to get `jobId`, then `status "$JOB" --wait --timeout-ms 540000 --json` in a loop until it exits 0, then `result "$JOB"` — and delete the rule that forbids the agent from polling `status`/`result` (it may poll its own job only). Update the corresponding `tests/commands.test.mjs` assertions (the #608 regexes about the foreground inner Bash call) to the new contract. Add to the Step 1 test: `assert.match(agent, /task --background --json/); assert.match(agent, /status "\$JOB" --wait --timeout-ms 540000/); assert.doesNotMatch(agent, /Do not .*poll status/i);`
 
 - [ ] **Step 5: Edit `skills/codex-cli-runtime/SKILL.md`** — (a) after the line `Map \`spark\` to \`--model gpt-5.3-codex-spark\`…` add `- Map \`sol\` to \`--model gpt-5.6-sol\`, \`luna\` to \`--model gpt-5.6-luna\`, \`terra\` to \`--model gpt-5.6-terra\`, \`mini\` to \`--model gpt-5.4-mini\`.`; (b) replace the "return nothing" failure rule with the same visible-failure sentence as the agent; (c) add under "Command selection": `- If the request names an uncommon domain (private infra runbooks, vendor-specific tooling), prepend to the task text: "If a matching skill is not already loaded, run \`$agent-compat:skill-router\` to find a reviewed playbook before starting." (Codex has the agent-compat plugin installed; it routes to reviewed route-only skills offline.)`
 
