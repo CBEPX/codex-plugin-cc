@@ -90,15 +90,16 @@ test("rescue command absorbs continue semantics", () => {
   const readme = fs.readFileSync(path.join(ROOT, "README.md"), "utf8");
   const runtimeSkill = read("skills/codex-cli-runtime/SKILL.md");
 
-  assert.match(rescue, /Show the `result` output to the user verbatim/i);
-  assert.match(rescue, /allowed-tools:\s*Bash,\s*AskUserQuestion,\s*Agent/);
+  assert.match(rescue, /show the output verbatim, then your assessment/i);
+  assert.match(rescue, /allowed-tools:\s*Bash\(node:\*\),\s*AskUserQuestion,\s*Agent/);
   // Regression for #234: `Skill(codex:rescue)` from the main agent recursed
   // because rescue.md named the routing with ambiguous prose ("Route this
   // request to the `codex:codex-rescue` subagent") while running under
   // `context: fork` — forked general-purpose subagents do not expose the
   // `Agent` tool, so the fork fell back to `Skill` and re-entered this
-  // command. Pin the explicit transport and the inline (no-fork) execution.
-  assert.match(rescue, /subagent_type: "codex:codex-rescue"/);
+  // command. Pin the explicit `Agent` tool invocation naming `codex:codex-rescue`
+  // and the inline (no-fork) execution.
+  assert.match(rescue, /invoke the `Agent` tool with `codex:codex-rescue`/);
   assert.match(rescue, /do not call `Skill\(codex:rescue\)`/i);
   assert.doesNotMatch(rescue, /^context:\s*fork\b/m);
   assert.match(rescue, /--background\|--wait/);
@@ -109,21 +110,15 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(rescue, /AskUserQuestion.*Continue current Codex thread/s);
   assert.match(rescue, /Start a new Codex thread/);
   assert.match(rescue, /Default is synchronous/i);
-  assert.match(rescue, /Strip `--wait` if present/i);
-  assert.match(rescue, /Pass `--model`, `--effort` and every `--config key=value` through unchanged/i);
+  assert.match(rescue, /Strip `--background`, `--wait`, `--resume`, and `--fresh` out of `<flags>`/i);
+  assert.match(rescue, /Pass `--model`, `--effort`, `--config key=value` through/i);
   assert.match(rescue, /Delegate the request to Codex through the shared companion runtime/i);
   assert.match(agent, /--resume/);
   assert.match(agent, /--fresh/);
   assert.match(agent, /thin forwarding wrapper/i);
-  assert.match(agent, /result "\$JOB"/);
+  assert.match(agent, /result <id> --wait --timeout-ms 540000/);
   assert.doesNotMatch(agent, /prefer background execution/i);
-  // The rescue shell traps must use `command rm -f --` so a shadowing/aliased
-  // `rm` (or a filename starting with `-`) can't hijack cleanup on EXIT.
-  assert.match(rescue, /trap 'command rm -f -- /);
-  assert.match(agent, /trap 'command rm -f -- /);
-  assert.doesNotMatch(rescue, /trap 'rm -f/);
-  assert.doesNotMatch(agent, /trap 'rm -f/);
-  assert.match(runtimeSkill, /Launch exactly one job per rescue handoff with `task --background --json`/i);
+  assert.match(runtimeSkill, /Launch exactly one job per rescue handoff with `task --await --prompt-stdin`/i);
   assert.match(agent, /Bash tool's 10-minute cap/i);
   assert.match(agent, /do not inspect the repository, read files, grep, cancel jobs, summarize output, or do any other follow-up work of your own/i);
   assert.match(agent, /Do not call `review`, `adversarial-review`, or `cancel`/i);
@@ -136,9 +131,9 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(agent, /gpt-5-4-prompting/);
   assert.match(agent, /only to tighten the user's request into a better Codex prompt/i);
   assert.match(agent, /Do not use that skill to inspect the repository, reason through the problem yourself, draft a solution, or do any independent work/i);
-  assert.match(runtimeSkill, /launches once with `task --background --json`, polls only that job's own `status`, then returns the `result` stdout unchanged/i);
+  assert.match(runtimeSkill, /launches once with `task --await --prompt-stdin`, and on exit 3 re-runs only its own job's printed `result <id> --wait` hint/i);
   assert.match(runtimeSkill, /Do not call `setup`, `review`, `adversarial-review`, or `cancel` from `codex:codex-rescue`/i);
-  assert.match(runtimeSkill, /`status` and `result` are allowed, but only for the job you just launched/i);
+  assert.match(runtimeSkill, /Re-running the printed `result <id> --wait` hint for the job you just launched is the only follow-up call allowed/i);
   assert.match(runtimeSkill, /use the `gpt-5-4-prompting` skill to rewrite the user's request into a tighter Codex prompt/i);
   assert.match(runtimeSkill, /That prompt drafting is the only Claude-side work allowed/i);
   assert.match(runtimeSkill, /Leave `--effort` unset unless the user explicitly requests a specific effort/i);
@@ -170,17 +165,16 @@ test("rescue runs synchronously through the companion and uses Agent only for --
   const rescue = fs.readFileSync(path.join(PLUGIN_ROOT, "commands", "rescue.md"), "utf8");
   const agent = fs.readFileSync(path.join(PLUGIN_ROOT, "agents", "codex-rescue.md"), "utf8");
   const runtimeSkill = fs.readFileSync(path.join(PLUGIN_ROOT, "skills", "codex-cli-runtime", "SKILL.md"), "utf8");
-  assert.match(rescue, /task --background --json/);
-  assert.match(rescue, /status "\$JOB" --wait --timeout-ms 540000/);
-  assert.match(rescue, /result "\$JOB"/);
-  assert.match(rescue, /Only when the request contains `--background`.*Agent/s);
+  assert.match(rescue, /task --await --prompt-stdin/);
+  assert.match(rescue, /result <id> --wait --timeout-ms 540000/);
+  assert.match(rescue, /`--background`: invoke the `Agent` tool with `codex:codex-rescue`/);
   assert.match(rescue, /--config/);
   assert.doesNotMatch(agent, /^model:/m);
   assert.doesNotMatch(agent, /return nothing/i);
   assert.match(agent, /exit status and stderr/i);
-  assert.match(agent, /task --background --json/);
-  assert.match(agent, /status "\$JOB" --wait --timeout-ms 540000/);
-  assert.doesNotMatch(agent, /Do not .*poll status/i);
+  assert.match(agent, /task --await --prompt-stdin/);
+  assert.match(agent, /result <id> --wait --timeout-ms 540000/);
+  assert.doesNotMatch(agent, /task-resume-candidate --json/);
   assert.match(agent, /--config/);
   assert.doesNotMatch(runtimeSkill, /return nothing/i);
   assert.match(runtimeSkill, /Map `sol` to `--model gpt-5\.6-sol`/i);
@@ -296,8 +290,10 @@ test("command bodies hand arguments to the companion via a quoted heredoc, never
     // whole body line of a quoted heredoc. Anywhere else the shell expands what
     // Claude Code substituted before bash ever ran.
     assertArgumentsNeverReachTheShell(file, body);
-    // rescue.md randomizes its delimiter suffix per call; the flag-only bodies keep the fixed one.
-    const expectedDelimiter = file === "rescue.md" ? /--args-stdin <<'CODEX_ARGS_/ : /--args-stdin <<'CODEX_ARGS'/;
+    // rescue.md sends only the request prose through a randomized --prompt-stdin
+    // heredoc (flags travel on the command line); the other seven command bodies
+    // keep the fixed `--args-stdin <<'CODEX_ARGS'` delimiter for their flag-only payload.
+    const expectedDelimiter = file === "rescue.md" ? /--prompt-stdin <flags> <<'CODEX_PROMPT_/ : /--args-stdin <<'CODEX_ARGS'/;
     assert.match(body, expectedDelimiter, `${file} must pass arguments through a quoted heredoc`);
   }
 
@@ -307,47 +303,79 @@ test("command bodies hand arguments to the companion via a quoted heredoc, never
     assert.doesNotMatch(body, /"<request text>"/, `${label} still interpolates the request text inside a shell string`);
     assert.match(
       body,
-      /task --background --json --prompt-file "\$PROMPT" --args-stdin <<'CODEX_ARGS/,
+      /task --await --prompt-stdin <flags> <<'CODEX_PROMPT_/,
       `${label} must launch through a quoted heredoc`
-    );
-    assert.match(
-      body,
-      /\[\[ "\$JOB" =~ \^\[A-Za-z0-9_-\]\+\$ \]\] \|\| \{ echo "invalid job id"; exit 1; \}/,
-      `${label} must validate the job id before using it`
     );
   }
 });
 
-// The request prose and the runtime flags travel in separate channels: the prose
-// via --prompt-file (byte-exact) and only the flags through the tokenizer.
-function readArgsHeredocBody(body) {
-  const lines = body.split("\n");
-  const start = lines.findIndex((line) => line.includes("--args-stdin <<'CODEX_ARGS"));
-  assert.notEqual(start, -1, "no --args-stdin heredoc found");
-  const end = lines.findIndex((line, index) => index > start && line.trim().startsWith("CODEX_ARGS"));
-  assert.notEqual(end, -1, "unterminated --args-stdin heredoc");
-  return lines.slice(start + 1, end).join("\n");
-}
-
-test("rescue sends the request prose through --prompt-file, never through the argument tokenizer", () => {
+test("rescue sends the request prose through --prompt-stdin, never through the argument tokenizer", () => {
   for (const [label, body] of [
     ["rescue.md", read("commands/rescue.md")],
     ["codex-rescue.md", read("agents/codex-rescue.md")]
   ]) {
-    assert.match(body, /cat > "\$PROMPT" <<'CODEX_PROMPT_/, `${label} must write the request prose with its own quoted heredoc`);
-    assert.match(body, /--prompt-file "\$PROMPT"/, `${label} must pass the prose file to the companion`);
-    assert.doesNotMatch(
-      readArgsHeredocBody(body),
-      /<request text>/,
-      `${label} still routes the request text through the argument tokenizer`
-    );
-    assert.match(body, /command rm -f -- "\$ERR" "\$OUT" "\$PROMPT"/, `${label} must clean up the prose file`);
+    assert.match(body, /--prompt-stdin <flags> <<'CODEX_PROMPT_/, `${label} must pass the request prose via --prompt-stdin`);
+    assert.doesNotMatch(body, /--prompt-file/, `${label} must not use the old --prompt-file channel`);
+    assert.doesNotMatch(body, /--args-stdin/, `${label} must not use the old --args-stdin channel`);
+    assert.doesNotMatch(body, /\$PROMPT\b/, `${label} must not carry the prompt through a shell variable`);
 
     // A payload line equal to a fixed delimiter would close the heredoc early and
     // run the rest on the host shell.
-    assert.match(body, /fresh random suffix on every call/, `${label} must require per-call heredoc delimiters`);
-    assert.match(body, /`CODEX_PROMPT_<random>` \/ `CODEX_ARGS_<random>`/, `${label} must name both randomized delimiters`);
+    assert.match(body, /8 fresh random hex/i, `${label} must require a fresh random heredoc delimiter`);
+    assert.match(body, /CODEX_PROMPT_<random>/, `${label} must name the randomized delimiter placeholder`);
+    assert.match(
+      body,
+      /a payload line equal to it would end the heredoc early and run the rest on the host shell/i,
+      `${label} must explain why the delimiter must not collide with request text`
+    );
   }
+});
+
+function extractFirstBashBlock(body, label) {
+  const match = body.match(/```bash\n([\s\S]*?)```/);
+  assert.ok(match, `${label} must contain a fenced bash block`);
+  return match[1];
+}
+
+test("rescue and agent payload blocks are a single node call with no leftover shell scaffolding", () => {
+  for (const [label, body] of [
+    ["rescue.md", read("commands/rescue.md")],
+    ["codex-rescue.md", read("agents/codex-rescue.md")]
+  ]) {
+    const block = extractFirstBashBlock(body, label);
+    const invocations = block.match(/codex-companion\.mjs/g) || [];
+    assert.equal(invocations.length, 1, `${label} payload block must invoke codex-companion.mjs exactly once`);
+    assert.match(block, /task --await --prompt-stdin/, `${label} payload block must call task --await --prompt-stdin`);
+    for (const banned of [/mktemp/, /cat >/, /\bwhile\b/, /sleep/, /\$JOB=/]) {
+      assert.doesNotMatch(block, banned, `${label} payload block must not contain ${banned}`);
+    }
+  }
+});
+
+test("rescue resolves the resume decision before the --background branch", () => {
+  const rescue = read("commands/rescue.md");
+  const resumeDecisionIndex = rescue.indexOf("ask ONCE with `AskUserQuestion`");
+  const backgroundBranchIndex = rescue.indexOf("`--background`: invoke the `Agent` tool with `codex:codex-rescue`");
+  assert.notEqual(resumeDecisionIndex, -1, "resume-decision AskUserQuestion step must be present");
+  assert.notEqual(backgroundBranchIndex, -1, "--background branch must be present");
+  assert.ok(resumeDecisionIndex < backgroundBranchIndex, "resume decision must precede the --background branch");
+});
+
+test("agent never decides the resume choice itself", () => {
+  const agent = read("agents/codex-rescue.md");
+  assert.doesNotMatch(agent, /task-resume-candidate --json/);
+  assert.doesNotMatch(agent, /clearly asking to continue/i);
+  assert.match(agent, /You have no `AskUserQuestion` tool to ask with/i);
+  assert.match(agent, /never call `task-resume-candidate`/i);
+  assert.match(agent, /if neither flag is present, run fresh/i);
+});
+
+test("SKILL.md execution rules describe the single-call flow, not the old two-step poll loop", () => {
+  const runtimeSkill = read("skills/codex-cli-runtime/SKILL.md");
+  assert.doesNotMatch(runtimeSkill, /task --background --json/);
+  assert.doesNotMatch(runtimeSkill, /polls only that job's own `status`/);
+  assert.match(runtimeSkill, /task --await --prompt-stdin/);
+  assert.match(runtimeSkill, /result <id> --wait --timeout-ms 540000/);
 });
 
 test("README documents the fork's own install commands", () => {
