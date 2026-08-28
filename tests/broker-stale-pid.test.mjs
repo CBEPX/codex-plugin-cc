@@ -461,3 +461,57 @@ test("session end reaps a SIGKILLed background worker instead of keeping its bro
   assert.equal(job.status, "failed", "the dead worker's job must be reaped");
   assert.equal(job.requestFile, null, "the reaped job must not keep its private payload path");
 });
+
+// The failure this reproduces: a background worker SIGKILLed while it was taking
+// the workspace state lock left the lock directory behind with nothing inside to
+// identify its holder. The dead-PID takeover had no PID to check, so the bounded
+// wait expired and the SessionEnd hook died with "Timed out … waiting for the
+// Codex state lock" — leaving the broker and its app-server child running.
+test("session end recovers a lock a killed worker left without holder info", async () => {
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const workspace = makeTempDir();
+  const sessionDir = makeTempDir("cxc-");
+  const endpoint = createBrokerEndpoint(sessionDir);
+  const child = spawnOwnedBroker(workspace, { binDir, sessionDir, endpoint });
+
+  try {
+    assert.equal(await waitForBrokerEndpoint(endpoint, 3000), true);
+
+    const stateDir = resolveStateDir(workspace);
+    fs.mkdirSync(path.join(stateDir, "jobs"), { recursive: true });
+    fs.writeFileSync(
+      path.join(stateDir, "state.json"),
+      `${JSON.stringify(
+        {
+          version: 1,
+          config: { stopReviewGate: false },
+          jobs: [
+            {
+              id: "task-finished",
+              status: "completed",
+              phase: "done",
+              sessionId: "sess-current",
+              updatedAt: "2026-03-24T20:05:00.000Z"
+            }
+          ]
+        },
+        null,
+        2
+      )}\n`,
+      "utf8"
+    );
+    fs.mkdirSync(path.join(stateDir, "state.lock"), { recursive: true });
+
+    const cleanup = runSessionEndHook(workspace, { env: buildEnv(binDir), sessionId: "sess-current" });
+    assert.equal(cleanup.status, 0, cleanup.stderr);
+
+    const exited = await waitForExit(child, { timeoutMs: 5000 });
+    assert.equal(exited.code, 0, "an abandoned lock must not keep the broker alive");
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) {
+      child.kill("SIGKILL");
+    }
+    clearBrokerSession(workspace);
+  }
+});

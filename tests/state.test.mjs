@@ -265,20 +265,51 @@ test("a job created during another process's read-modify-write survives it", asy
 });
 
 // A holder that dies with the lock held (SIGKILL, OOM, host reboot) must not
-// wedge the workspace: the next writer proves the owner is gone and takes over.
-test("a state lock whose owner is gone is taken over", () => {
+// wedge the workspace: the next writer proves the holder is gone and takes over
+// on the spot.
+test("a state lock whose holder is gone is taken over", () => {
   const workspace = makeTempDir();
   saveState(workspace, { jobs: [] });
   const dead = run(process.execPath, ["-e", "process.exit(0)"], { env: process.env });
   const lockDir = path.join(resolveStateDir(workspace), "state.lock");
   fs.mkdirSync(lockDir, { recursive: true });
-  fs.writeFileSync(path.join(lockDir, "owner.json"), JSON.stringify({ pid: dead.pid, at: new Date().toISOString() }), "utf8");
+  fs.writeFileSync(
+    path.join(lockDir, "holder.json"),
+    JSON.stringify({ pid: dead.pid, startedAt: new Date().toISOString() }),
+    "utf8"
+  );
 
   const started = Date.now();
   upsertJob(workspace, { id: "job-after-crash", status: "queued" });
 
-  assert.ok(Date.now() - started < 3000, "a dead holder must not cost the full lock wait");
+  assert.ok(Date.now() - started < 1000, `a dead holder must be taken over at once, took ${Date.now() - started} ms`);
   assert.deepEqual(listJobs(workspace).map((job) => job.id), ["job-after-crash"]);
+});
+
+// The lock that actually wedged a SessionEnd: a worker killed mid-acquire left a
+// directory nothing could attribute to a process, so the dead-holder rule had
+// nothing to read and only the 30 s age rule was left — long past the bounded
+// wait. Acquisition is atomic now, and a lock without usable holder info is
+// treated as abandoned after a couple of seconds.
+test("a state lock with no usable holder info does not outlast the bounded wait", () => {
+  const lockDirFor = (workspace) => path.join(resolveStateDir(workspace), "state.lock");
+
+  const emptyLock = makeTempDir();
+  saveState(emptyLock, { jobs: [] });
+  fs.mkdirSync(lockDirFor(emptyLock), { recursive: true });
+  let started = Date.now();
+  upsertJob(emptyLock, { id: "job-after-empty-lock", status: "queued" });
+  assert.ok(Date.now() - started < 3000, "a lock left half-taken must not block a writer");
+  assert.deepEqual(listJobs(emptyLock).map((job) => job.id), ["job-after-empty-lock"]);
+
+  const junkLock = makeTempDir();
+  saveState(junkLock, { jobs: [] });
+  fs.mkdirSync(lockDirFor(junkLock), { recursive: true });
+  fs.writeFileSync(path.join(lockDirFor(junkLock), "holder.json"), "{not json", "utf8");
+  started = Date.now();
+  upsertJob(junkLock, { id: "job-after-junk-lock", status: "queued" });
+  assert.ok(Date.now() - started < 3000, "an unreadable holder file must not block a writer");
+  assert.deepEqual(listJobs(junkLock).map((job) => job.id), ["job-after-junk-lock"]);
 });
 
 // The bounded wait is what keeps a wedged holder from hanging every command in

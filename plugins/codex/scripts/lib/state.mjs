@@ -173,17 +173,29 @@ function removeFileIfExists(filePath) {
 // `saveState` deletes the artifacts of every job that was in the file it read but
 // is not in the snapshot it writes. Unserialized, a process whose snapshot went
 // stale therefore does not merely lose another process's job from the index — it
-// deletes that job's file, private payload, PID sidecar and log. `mkdir` is the
-// one filesystem primitive that is atomic on every platform we run on, so the
-// lock is a directory; the owner file inside it is what makes a crashed holder
-// recognisable.
+// deletes that job's file, private payload, PID sidecar and log. The lock is a
+// directory, claimed by renaming a staged one onto it: a directory rename fails
+// against a non-empty target, so the claim and the holder info inside it land in
+// one atomic step. That matters more than the atomicity of `mkdir` — a holder
+// killed between `mkdir` and writing its own PID would leave a lock nothing can
+// attribute to a process, which is exactly how a SessionEnd hook once sat out
+// the whole bounded wait and left a broker running.
 // ponytail: one lock per workspace, no reader/writer split — every mutation is a
 // few file writes, so a shared-read lock would only add ways to get it wrong.
 const LOCK_DIR_NAME = "state.lock";
-const LOCK_OWNER_FILE = "owner.json";
+const LOCK_STAGING_PREFIX = ".state.lock-";
+const LOCK_HOLDER_FILE = "holder.json";
 const LOCK_WAIT_MS = 5000;
 const LOCK_POLL_MS = 25;
 const LOCK_STALE_MS = 30000;
+// A lock with no readable holder can only be a leftover: acquisition never
+// publishes one without holder info, so nobody is coming back for it. Age is all
+// there is to go on, and it has to expire well inside the bounded wait.
+const LOCK_ORPHAN_MS = 2000;
+// Renaming a directory onto a non-empty one fails; the code depends on the
+// platform (POSIX ENOTEMPTY/EEXIST, Windows EPERM/EACCES). Anything else is a
+// real filesystem error and is rethrown.
+const LOCK_CONTENDED_CODES = new Set(["EEXIST", "ENOTEMPTY", "EPERM", "EACCES"]);
 
 // Locks this process already holds: a locked section may call another one
 // (`updateState` → `saveState`) and must not deadlock against itself.
@@ -193,23 +205,24 @@ function sleepSync(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
-function readLockOwner(lockDir) {
+function readLockHolder(lockDir) {
   try {
-    return JSON.parse(fs.readFileSync(path.join(lockDir, LOCK_OWNER_FILE), "utf8"));
+    return JSON.parse(fs.readFileSync(path.join(lockDir, LOCK_HOLDER_FILE), "utf8"));
   } catch {
-    // Either the holder died between the mkdir and the owner file, or it is
-    // writing that file right now — only the lock's age can tell those apart.
     return null;
   }
 }
 
 function isLockStale(lockDir) {
-  const owner = readLockOwner(lockDir);
-  if (isPidAlive(owner?.pid) === false) {
+  const holder = readLockHolder(lockDir);
+  if (!holder) {
+    return !(Date.now() - statMtimeMs(lockDir) <= LOCK_ORPHAN_MS);
+  }
+  if (isPidAlive(holder.pid) === false) {
     return true;
   }
-  const claimedAt = Date.parse(owner?.at ?? "");
-  const heldSince = Number.isFinite(claimedAt) ? claimedAt : statMtimeMs(lockDir);
+  const startedAt = Date.parse(holder.startedAt ?? "");
+  const heldSince = Number.isFinite(startedAt) ? startedAt : statMtimeMs(lockDir);
   return Number.isFinite(heldSince) ? Date.now() - heldSince > LOCK_STALE_MS : true;
 }
 
@@ -223,21 +236,52 @@ function statMtimeMs(target) {
 
 function releaseLock(lockDir) {
   try {
-    fs.rmSync(lockDir, { recursive: true, force: true });
+    // Only ever remove a lock that is still ours: if it was taken over while we
+    // held it (a stall past the stale window), the directory now belongs to
+    // whoever claimed it next.
+    if (readLockHolder(lockDir)?.pid === process.pid) {
+      fs.rmSync(lockDir, { recursive: true, force: true });
+    }
   } catch {
     // A lock we cannot remove is taken over by the next writer once it goes stale.
+  }
+}
+
+// Claim it before deleting it: two writers can judge the same lock stale at the
+// same moment, and a plain delete lets the slower one remove the lock the faster
+// one has already re-acquired. A rename can only succeed once, so exactly one
+// breaker wins and the loser simply retries.
+function breakStaleLock(lockDir) {
+  const doomed = `${lockDir}.stale-${process.pid}-${Date.now()}`;
+  try {
+    fs.renameSync(lockDir, doomed);
+  } catch {
+    return;
+  }
+  try {
+    fs.rmSync(doomed, { recursive: true, force: true });
+  } catch {
+    // Leftover directory, not a lock: nothing ever looks at it again.
   }
 }
 
 function acquireLock(lockDir, waitMs) {
   const deadline = Date.now() + waitMs;
   for (;;) {
+    // Stage the lock with its holder info, then publish it with one rename, so
+    // the lock never exists in a state where its holder is unknown.
+    const staging = fs.mkdtempSync(path.join(path.dirname(lockDir), LOCK_STAGING_PREFIX));
+    fs.writeFileSync(
+      path.join(staging, LOCK_HOLDER_FILE),
+      `${JSON.stringify({ pid: process.pid, startedAt: nowIso() })}\n`,
+      "utf8"
+    );
     try {
-      fs.mkdirSync(lockDir);
-      fs.writeFileSync(path.join(lockDir, LOCK_OWNER_FILE), `${JSON.stringify({ pid: process.pid, at: nowIso() })}\n`, "utf8");
+      fs.renameSync(staging, lockDir);
       return;
     } catch (error) {
-      if (error.code !== "EEXIST") {
+      fs.rmSync(staging, { recursive: true, force: true });
+      if (!LOCK_CONTENDED_CODES.has(error.code)) {
         throw error;
       }
     }
@@ -248,7 +292,7 @@ function acquireLock(lockDir, waitMs) {
       );
     }
     if (isLockStale(lockDir)) {
-      releaseLock(lockDir);
+      breakStaleLock(lockDir);
     } else {
       sleepSync(LOCK_POLL_MS);
     }
