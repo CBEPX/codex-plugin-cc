@@ -173,10 +173,17 @@ async function handleSessionEnd(input) {
   // step below would be wrong: the endpoint, pid file and record all still belong
   // to a broker somebody is talking to. Leave it to the next SessionEnd or to its
   // own idle timeout.
+  // Only a broker that answered "not busy" (or is provably gone) may be torn
+  // down. An unanswered or unreadable handshake is not evidence of an idle
+  // broker, and every step below assumes there is nothing left to talk to.
   if (brokerEndpoint) {
     const shutdown = await sendBrokerShutdown(brokerEndpoint);
-    if (shutdown.busy) {
-      process.stderr.write("[codex] Shared broker is still serving another session; leaving it running.\n");
+    if (shutdown.busy !== false) {
+      process.stderr.write(
+        shutdown.busy === true
+          ? "[codex] Shared broker is still serving another session; leaving it running.\n"
+          : "[codex] Shared broker did not confirm it is idle; leaving it running.\n"
+      );
       return;
     }
   }

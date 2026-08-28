@@ -41,31 +41,63 @@ export async function waitForBrokerEndpoint(endpoint, timeoutMs = 2000) {
   return false;
 }
 
-// Returns `{ busy: true }` only when the broker explicitly refused because
-// another client is still using it. Everything else — a connection error, a
-// closed socket, an unparsable reply — reports not busy: a broker that cannot
-// answer is a broker the caller must still clean up after.
+const SHUTDOWN_REQUEST_ID = 1;
+// A broker that has not answered by now is not going to: the handshake is one
+// round trip to a local socket. Without this bound a peer that connects and
+// stays silent blocks the SessionEnd hook forever.
+const SHUTDOWN_HANDSHAKE_MS = 5000;
+
+// Three answers, not two:
+//   `false` — the broker said it is idle, or it is gone (connection error, or the
+//             socket closed without answering): the caller must clean up after it.
+//   `true`  — the broker refused because another client is still using it.
+//   `null`  — nothing usable came back before the deadline, or the reply was not
+//             parsable JSONL. The caller cannot prove the broker is idle, so it
+//             must leave it alone.
+// The reply is framed by newline and matched by request id: a socket is a byte
+// stream, and parsing whatever a single `data` event happened to carry turned a
+// split `{"busy":true}` into "not busy" — a broker destroyed under a live turn.
 export async function sendBrokerShutdown(endpoint) {
   return await new Promise((resolve) => {
     const socket = connectToEndpoint(endpoint);
     socket.setEncoding("utf8");
+    let buffer = "";
     const finish = (busy) => {
-      socket.end();
+      clearTimeout(deadline);
+      socket.destroy();
       resolve({ busy });
     };
+    const deadline = setTimeout(() => finish(null), SHUTDOWN_HANDSHAKE_MS);
+
     socket.on("connect", () => {
-      socket.write(`${JSON.stringify({ id: 1, method: "broker/shutdown", params: {} })}\n`);
+      socket.write(`${JSON.stringify({ id: SHUTDOWN_REQUEST_ID, method: "broker/shutdown", params: {} })}\n`);
     });
     socket.on("data", (chunk) => {
-      const line = String(chunk).split("\n").find((candidate) => candidate.trim());
-      try {
-        finish(JSON.parse(line).result?.busy === true);
-      } catch {
-        finish(false);
+      buffer += chunk;
+      let newlineIndex = buffer.indexOf("\n");
+      while (newlineIndex !== -1) {
+        const line = buffer.slice(0, newlineIndex);
+        buffer = buffer.slice(newlineIndex + 1);
+        newlineIndex = buffer.indexOf("\n");
+        if (!line.trim()) {
+          continue;
+        }
+        let message;
+        try {
+          message = JSON.parse(line);
+        } catch {
+          finish(null);
+          return;
+        }
+        if (message.id !== SHUTDOWN_REQUEST_ID) {
+          continue;
+        }
+        finish(message.result?.busy === true);
+        return;
       }
     });
-    socket.on("error", () => resolve({ busy: false }));
-    socket.on("close", () => resolve({ busy: false }));
+    socket.on("error", () => finish(false));
+    socket.on("close", () => finish(false));
   });
 }
 

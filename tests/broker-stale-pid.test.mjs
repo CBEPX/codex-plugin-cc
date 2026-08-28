@@ -13,6 +13,7 @@ import {
   clearBrokerSession,
   loadBrokerSession,
   saveBrokerSession,
+  sendBrokerShutdown,
   waitForBrokerEndpoint
 } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
 import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
@@ -512,6 +513,89 @@ test("session end recovers a lock a killed worker left without holder info", asy
     if (child.exitCode === null && child.signalCode === null) {
       child.kill("SIGKILL");
     }
+    clearBrokerSession(workspace);
+  }
+});
+
+function listenStub(endpoint, onConnection) {
+  const stub = net.createServer(onConnection);
+  return new Promise((resolve, reject) => {
+    stub.once("error", reject);
+    stub.listen(parseBrokerEndpoint(endpoint).path, () => resolve(stub));
+  });
+}
+
+// A socket is a byte stream, not a message stream: the reply can arrive in as
+// many chunks as the kernel feels like. Parsing each chunk on its own turned a
+// split `{"busy":true}` into a parse error — read as "not busy", which is how a
+// SessionEnd would tear down a broker in the middle of another session's turn.
+test("sendBrokerShutdown reads a busy reply that arrives in fragments", async () => {
+  const sessionDir = makeTempDir("cxc-");
+  const endpoint = createBrokerEndpoint(sessionDir);
+  const sockets = [];
+  const stub = await listenStub(endpoint, (socket) => {
+    sockets.push(socket);
+    socket.once("data", () => {
+      socket.write('{"id":1,"result":{"bu');
+      setTimeout(() => socket.write('sy":true}}\n'), 50);
+    });
+  });
+
+  try {
+    assert.deepEqual(await sendBrokerShutdown(endpoint), { busy: true });
+  } finally {
+    for (const socket of sockets) {
+      socket.destroy();
+    }
+    stub.close();
+  }
+});
+
+// A peer that accepts the connection and never answers used to block the hook
+// forever. It is also not proof of anything: an unanswered handshake must not be
+// read as "idle, safe to destroy".
+test("a broker that never answers is bounded and never assumed idle", { timeout: 20000 }, async () => {
+  const sessionDir = makeTempDir("cxc-");
+  const endpoint = createBrokerEndpoint(sessionDir);
+  const sockets = [];
+  const stub = await listenStub(endpoint, (socket) => sockets.push(socket));
+
+  try {
+    const started = Date.now();
+    const outcome = await sendBrokerShutdown(endpoint);
+    const elapsed = Date.now() - started;
+
+    assert.equal(outcome.busy, null, "an unanswered handshake must report unknown, not idle");
+    assert.ok(elapsed < 9000, `the handshake must be bounded, took ${elapsed} ms`);
+  } finally {
+    for (const socket of sockets) {
+      socket.destroy();
+    }
+    stub.close();
+  }
+});
+
+test("session end leaves everything alone when the broker never answers", { timeout: 20000 }, async () => {
+  const workspace = makeTempDir();
+  const sessionDir = makeTempDir("cxc-");
+  const endpoint = createBrokerEndpoint(sessionDir);
+  const pidFile = path.join(sessionDir, "broker.pid");
+  fs.writeFileSync(pidFile, "999999\n", "utf8");
+  saveBrokerSession(workspace, { endpoint, pidFile, logFile: path.join(sessionDir, "broker.log"), sessionDir, pid: null });
+
+  const sockets = [];
+  const stub = await listenStub(endpoint, (socket) => sockets.push(socket));
+
+  try {
+    const cleanup = runSessionEndHook(workspace);
+    assert.equal(cleanup.status, 0, cleanup.stderr);
+    assert.equal(loadBrokerSession(workspace)?.endpoint, endpoint, "an unconfirmed broker must keep its record");
+    assert.equal(fs.existsSync(pidFile), true, "an unconfirmed broker must not be torn down");
+  } finally {
+    for (const socket of sockets) {
+      socket.destroy();
+    }
+    stub.close();
     clearBrokerSession(workspace);
   }
 });
