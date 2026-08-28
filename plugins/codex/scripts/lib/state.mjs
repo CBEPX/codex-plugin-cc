@@ -473,23 +473,31 @@ export function readJobFile(jobFile) {
     return record;
   }
 
-  // Same one-shot migration as the index, with one exception the ruling for this
-  // fix names: an active job whose private payload file is gone has this record
-  // as the only copy of its request, so the file is left alone — the values still
-  // never leave this function.
+  // Same one-shot migration as the index, plus the move that makes it safe for an
+  // active job: 1.1.1 wrote no private payload, so its record is the only copy of
+  // the request — and that record is exactly what `handleTaskWorker` falls back to.
+  // Redacting it in place would hand the worker "[redacted]" as its Codex config,
+  // so the raw request goes to the 0600 payload file the worker consumes first,
+  // and only then leaves the record.
   const requestFile = jobFile.replace(/\.json$/, ".request.json");
-  const active = record.status === "queued" || record.status === "running";
-  if (!active || fs.existsSync(requestFile)) {
-    try {
-      withLockDir(path.join(path.dirname(path.dirname(jobFile)), LOCK_DIR_NAME), () => {
-        const current = readJsonOrNull(jobFile);
-        if (current) {
-          writeFileAtomic(jobFile, `${JSON.stringify(withRedactedRequest(current), null, 2)}\n`);
-        }
-      });
-    } catch {
-      // Best effort: the record this returns is redacted either way.
-    }
+  try {
+    withLockDir(path.join(path.dirname(path.dirname(jobFile)), LOCK_DIR_NAME), () => {
+      const current = readJsonOrNull(jobFile);
+      if (!current || !hasStoredConfigValues(current)) {
+        return;
+      }
+      const active = current.status === "queued" || current.status === "running";
+      const migrated = withRedactedRequest(current);
+      if (active && !fs.existsSync(requestFile)) {
+        // Same shape and mode as `writeJobRequestFile`: the temp file carries the
+        // 0600 through the rename, so the payload is never world-readable.
+        writeFileAtomic(requestFile, `${JSON.stringify(current.request, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+        migrated.requestFile = requestFile;
+      }
+      writeFileAtomic(jobFile, `${JSON.stringify(migrated, null, 2)}\n`);
+    });
+  } catch {
+    // Best effort: the record this returns is redacted either way.
   }
 
   return withRedactedRequest(record);

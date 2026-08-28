@@ -8,7 +8,13 @@ import { fileURLToPath } from "node:url";
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 import { loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
-import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
+import {
+  consumeJobRequestFile,
+  readJobFile,
+  resolveJobFile,
+  resolveJobRequestFile,
+  resolveStateDir
+} from "../plugins/codex/scripts/lib/state.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PLUGIN_ROOT = path.join(ROOT, "plugins", "codex");
@@ -3022,6 +3028,66 @@ test("a v1.1.1 record's --config values never reach status/result and are redact
       `${label} should still record which config keys were set`
     );
   }
+});
+
+// The record of an ACTIVE 1.1.1 job is the only copy of its request — 1.1.1 wrote
+// no private payload file — and `handleTaskWorker` falls back to exactly that
+// record when there is none. Redacting it in place would hand the worker
+// "[redacted]" as its Codex config (auth headers included), so the raw request is
+// moved into a fresh 0600 payload file first and only then dropped from the record.
+test("an active v1.1.1 record keeps its real --config for the worker while output stays redacted", () => {
+  const repo = seededRepo();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const env = buildEnv(binDir);
+
+  const seeded = run("node", [SCRIPT, "task", "seed the state dir"], { cwd: repo, env });
+  assert.equal(seeded.status, 0, seeded.stderr);
+
+  const stateDir = resolveStateDir(repo);
+  const statePath = path.join(stateDir, "state.json");
+  const now = new Date().toISOString();
+  const legacyRequest = {
+    cwd: repo,
+    prompt: "legacy queued prompt",
+    config: { "model_providers.x.http_headers.Cookie": "SESSION_SECRET_FROM_1_1_1" }
+  };
+  const legacyJob = {
+    id: "task-legacy-queued",
+    status: "queued",
+    phase: "queued",
+    jobClass: "task",
+    kind: "task",
+    title: "Codex Task",
+    summary: "Legacy queued job written by 1.1.1",
+    createdAt: now,
+    updatedAt: now,
+    request: legacyRequest
+  };
+  const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  state.jobs.push(legacyJob);
+  fs.writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+  const legacyJobFile = resolveJobFile(repo, "task-legacy-queued");
+  fs.writeFileSync(legacyJobFile, `${JSON.stringify(legacyJob, null, 2)}\n`, "utf8");
+
+  const status = run("node", [SCRIPT, "status", "task-legacy-queued", "--json"], { cwd: repo, env });
+  assert.equal(status.status, 0, status.stderr);
+  assert.equal(status.stdout.includes("SESSION_SECRET_FROM_1_1_1"), false, "status --json leaked a legacy --config value");
+  assert.equal(status.stdout.includes("[redacted]"), true);
+
+  // The worker's own read path (`readStoredJob` → `readJobFile`).
+  const workerView = readJobFile(legacyJobFile);
+  assert.equal(workerView.request.config["model_providers.x.http_headers.Cookie"], "[redacted]");
+
+  const requestFile = resolveJobRequestFile(repo, "task-legacy-queued");
+  assert.equal(fs.existsSync(requestFile), true, "the raw request must be moved into the private payload file");
+  assert.equal(fs.statSync(requestFile).mode & 0o777, 0o600, "the payload file must be owner-only");
+  assert.equal(fs.readFileSync(legacyJobFile, "utf8").includes("SESSION_SECRET_FROM_1_1_1"), false, "the record must be redacted on disk");
+
+  // What the worker actually runs with.
+  const consumed = consumeJobRequestFile(repo, "task-legacy-queued");
+  assert.equal(consumed.config["model_providers.x.http_headers.Cookie"], "SESSION_SECRET_FROM_1_1_1");
+  assert.equal(consumed.prompt, "legacy queued prompt");
 });
 
 test("a resume refuses to start a second turn on a thread another job is still using", () => {
