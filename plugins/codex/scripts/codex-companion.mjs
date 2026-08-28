@@ -1210,6 +1210,9 @@ async function handleResult(argv) {
   }
 
   const cwd = resolveCommandCwd(options);
+  if (options["timeout-ms"] != null && !options.wait) {
+    throw new Error("--timeout-ms requires --wait.");
+  }
   let reference = positionals[0] ?? "";
   if (options.wait) {
     if (!reference) {

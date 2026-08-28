@@ -21,6 +21,7 @@
 - `--turn-timeout-ms <ms>` (or `CODEX_TURN_TIMEOUT_MS`) on `task`, `review`, and `adversarial-review` bounds a single Codex turn: on expiry it sends `turn/interrupt` and returns a structured failed result ("turn timed out after `<ms>` ms") instead of hanging or throwing; default is `0` (unbounded, unchanged behavior); the budget is persisted into `--background`/`--await` job requests so detached workers run under the same limit.
 - Documented: with `CODEX_COMPANION_BROKER_IDLE_TIMEOUT_MS=0`, a broker kept alive by an active background job across `SessionEnd` never exits on its own — the idle self-terminate safety net from #457 is disabled in that configuration.
 - Known limitations: `kill(pid, 0)` reads a zombie process as alive and cannot detect PID reuse, so the reaper can occasionally misjudge a dead worker's liveness (documented in `lib/tracked-jobs.mjs`); a `turn/start` call that never answers is still unbounded — `--turn-timeout-ms` only covers the window after `turn/start` resolves.
+- `task --await` jobs are recorded as background jobs (they survive SessionEnd and keep the broker while active, bounded by the reaper and the idle timeout).
 
 ## 1.1.1 — 2026-08-28
 

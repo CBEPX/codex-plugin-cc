@@ -20,6 +20,7 @@ Forwarding rules:
 
 - You receive the resume decision already made: an explicit `--resume-last` or `--fresh` in the prompt. Pass it straight through in `<flags>`. Never call `task-resume-candidate`, never infer resume from prose (no "continue"/"keep going"/"apply the top fix" heuristics), and never guess — if neither flag is present, run fresh. You have no `AskUserQuestion` tool to ask with.
 - ONE Bash call (tool `timeout: 600000`); flags on the command line, the request prose in a quoted heredoc whose delimiter is `CODEX_PROMPT_` + 8 fresh random hex characters that do not appear as an exact line in the request. Never reuse a delimiter suffix that appears as an exact line in the request: a payload line equal to it would end the heredoc early and run the rest on the host shell.
+- `<flags>` may contain only bare tokens — `--model <name>`, `--effort <level>`, `--turn-timeout-ms <ms>`, `--config key=value` with a literal value, `--resume-last`/`--fresh`, `--write`. If any flag value contains `$`, a backtick, a quote, `;`, `&`, `|`, or a newline, drop it and mention it in the prose instead; never place it on the command line.
 
 ```bash
 node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task --await --prompt-stdin <flags> <<'CODEX_PROMPT_<random>'

@@ -1,6 +1,6 @@
 ---
 description: Delegate investigation, an explicit fix request, or follow-up rescue work to the Codex rescue subagent
-argument-hint: "[--background|--wait] [--resume|--fresh] [--model <model|spark|sol|luna|terra|mini>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [--turn-timeout-ms <ms>] [--config key=value]... [what Codex should investigate, solve, or continue]"
+argument-hint: "[--background] [--resume|--fresh] [--model <model|spark|sol|luna|terra|mini>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [--turn-timeout-ms <ms>] [--config key=value]... [what Codex should investigate, solve, or continue]"
 allowed-tools: Bash(node:*), AskUserQuestion, Agent
 ---
 
@@ -22,5 +22,7 @@ Exit 0 → show the output verbatim, then your assessment. Exit 3 → the output
 3. `--background`: invoke the `Agent` tool with `codex:codex-rescue`, passing the request minus `--background` PLUS the explicit `--resume-last` or `--fresh` decided in step 1; tell the user the result arrives as a completion notification and via `/codex:status` / `/codex:result <id>`.
 
 Never reuse a delimiter suffix that appears as an exact line in the request: a payload line equal to it would end the heredoc early and run the rest on the host shell.
+
+`<flags>` may contain only bare tokens — `--model <name>`, `--effort <level>`, `--turn-timeout-ms <ms>`, `--config key=value` with a literal value, `--resume-last`/`--fresh`, `--write`. If any flag value contains `$`, a backtick, a quote, `;`, `&`, `|`, or a newline, drop it and mention it in the prose instead; never place it on the command line.
 
 Do not call `Skill(codex:rescue)` from here (it re-enters this command). If any Bash step exits non-zero, show its stderr to the user — never report "no result".

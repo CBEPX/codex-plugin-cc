@@ -107,7 +107,7 @@ test("rescue command absorbs continue semantics", () => {
   // part of the payload block, so it needs its own non-zero-exit fallback.
   assert.match(rescue, /If any Bash step exits non-zero, show its stderr to the user — never report "no result"/i);
   assert.doesNotMatch(rescue, /^context:\s*fork\b/m);
-  assert.match(rescue, /--background\|--wait/);
+  assert.match(rescue, /\[--background\]/);
   assert.match(rescue, /--resume\|--fresh/);
   assert.match(rescue, /--model <model\|spark\|sol\|luna\|terra\|mini>/);
   assert.match(rescue, /--effort <none\|minimal\|low\|medium\|high\|xhigh\|max\|ultra>/);
@@ -216,7 +216,7 @@ test("internal docs use task terminology for rescue runs", () => {
   const promptingSkill = read("skills/gpt-5-4-prompting/SKILL.md");
   const promptRecipes = read("skills/gpt-5-4-prompting/references/codex-prompt-recipes.md");
 
-  assert.match(runtimeSkill, /codex-companion\.mjs" task "<raw arguments>"/);
+  assert.match(runtimeSkill, /codex-companion\.mjs" task --await --prompt-stdin/);
   assert.match(runtimeSkill, /Use `task` for every rescue request/i);
   assert.match(runtimeSkill, /task --resume-last/i);
   assert.match(promptingSkill, /Use `task` when the task is diagnosis/i);
@@ -360,6 +360,19 @@ test("rescue and agent payload blocks are a single node call with no leftover sh
     for (const banned of [/mktemp/, /cat >/, /\bwhile\b/, /sleep/, /\$JOB=/]) {
       assert.doesNotMatch(block, banned, `${label} payload block must not contain ${banned}`);
     }
+    // <flags> sit on the host command line unconstrained; the payload block
+    // itself must never carry command substitution or a literal backtick.
+    assert.doesNotMatch(block, /\$\(|`/, `${label} payload block must not contain $() or backticks`);
+    assert.match(
+      body,
+      /may contain only bare tokens/i,
+      `${label} must document the <flags> hygiene rule`
+    );
+    assert.match(
+      body,
+      /never place it on the command line/i,
+      `${label} hygiene rule must tell the caller to drop unsafe flag values instead of using them`
+    );
   }
 });
 
@@ -387,6 +400,7 @@ test("SKILL.md execution rules describe the single-call flow, not the old two-st
   assert.doesNotMatch(runtimeSkill, /polls only that job's own `status`/);
   assert.match(runtimeSkill, /task --await --prompt-stdin/);
   assert.match(runtimeSkill, /result <id> --wait --timeout-ms 540000/);
+  assert.doesNotMatch(runtimeSkill, /task "<raw arguments>"/);
 });
 
 test("README documents the fork's own install commands", () => {

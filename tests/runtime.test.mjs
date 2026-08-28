@@ -3151,6 +3151,12 @@ test("task rejects contradictory await and prompt flag combinations", () => {
   });
   assert.notEqual(badResultTimeout.status, 0);
   assert.match(badResultTimeout.stderr, /--timeout-ms expects a positive integer/);
+
+  const missingWaitTimeout = run("node", [SCRIPT, "result", "task-x", "--timeout-ms", "1000"], {
+    cwd: repo, env: buildEnv(binDir)
+  });
+  assert.notEqual(missingWaitTimeout.status, 0);
+  assert.match(missingWaitTimeout.stderr, /--timeout-ms requires --wait/);
 });
 
 test("task --await reports a failed job with exit 1 while result stays exit 0", () => {

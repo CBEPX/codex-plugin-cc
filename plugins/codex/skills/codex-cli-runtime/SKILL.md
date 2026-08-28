@@ -9,7 +9,11 @@ user-invocable: false
 Use this skill only inside the `codex:codex-rescue` subagent.
 
 Primary helper:
-- `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task "<raw arguments>"`
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task --await --prompt-stdin <flags> <<'CODEX_PROMPT_<random>'
+<request text>
+CODEX_PROMPT_<random>
+```
 
 Execution rules:
 - The rescue subagent is a forwarder, not an orchestrator. It launches once with `task --await --prompt-stdin`, and on exit 3 re-runs only its own job's printed `result <id> --wait` hint until it reaches a terminal status, then returns the output unchanged.

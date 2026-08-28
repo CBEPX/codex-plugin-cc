@@ -72,7 +72,7 @@ test("reapDeadJobs leaves a running job with a live pid untouched", () => {
   assert.equal(readJobFile(resolveJobFile(workspace, "job-live")).status, "running");
 });
 
-test("reapDeadJobs leaves jobs without a recorded pid untouched", () => {
+test("reapDeadJobs leaves a pid-less queued job untouched inside the grace window", () => {
   const workspace = makeTempDir();
   seedJob(workspace, { id: "job-no-pid", status: "queued", phase: "queued", pid: null, logFile: null });
 
