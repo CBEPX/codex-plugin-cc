@@ -1,7 +1,19 @@
 import fs from "node:fs";
 import process from "node:process";
 
-import { readJobFile, resolveJobFile, resolveJobLogFile, upsertJob, writeJobFile } from "./state.mjs";
+import { isPidAlive } from "./process.mjs";
+
+import {
+  readJobFile,
+  removeJobPidFile,
+  removeJobRequestFile,
+  resolveJobFile,
+  resolveJobLogFile,
+  resolveJobPid,
+  upsertJob,
+  withStateLock,
+  writeJobFile
+} from "./state.mjs";
 
 export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
 
@@ -164,9 +176,13 @@ export async function runTrackedJob(job, runner, options = {}) {
     const execution = await runner();
     const completionStatus = execution.exitStatus === 0 ? "completed" : "failed";
     const completedAt = nowIso();
+    // A run that fails without throwing (a timed-out or interrupted turn) still
+    // has to say why: `status`/`result` read the reason off the record.
+    const errorMessage = completionStatus === "failed" ? execution.errorMessage ?? null : null;
     writeJobFile(job.workspaceRoot, job.id, {
       ...runningRecord,
       status: completionStatus,
+      errorMessage,
       threadId: execution.threadId ?? null,
       turnId: execution.turnId ?? null,
       resolved: execution.resolved ?? null,
@@ -179,6 +195,7 @@ export async function runTrackedJob(job, runner, options = {}) {
     upsertJob(job.workspaceRoot, {
       id: job.id,
       status: completionStatus,
+      errorMessage,
       threadId: execution.threadId ?? null,
       turnId: execution.turnId ?? null,
       resolved: execution.resolved ?? null,
@@ -187,6 +204,11 @@ export async function runTrackedJob(job, runner, options = {}) {
       pid: null,
       completedAt
     });
+    removeJobPidFile(job.workspaceRoot, job.id);
+    // Nothing revisits a terminal job, so this is the last chance to release a
+    // payload the worker never consumed (a crash before the read, or one staged
+    // by the legacy-record migration).
+    removeJobRequestFile(job.workspaceRoot, job.id);
     appendLogBlock(options.logFile ?? job.logFile ?? null, "Final output", execution.rendered);
     return execution;
   } catch (error) {
@@ -210,6 +232,183 @@ export async function runTrackedJob(job, runner, options = {}) {
       errorMessage,
       completedAt
     });
+    removeJobPidFile(job.workspaceRoot, job.id);
+    // Nothing revisits a terminal job, so this is the last chance to release a
+    // payload the worker never consumed (a crash before the read, or one staged
+    // by the legacy-record migration).
+    removeJobRequestFile(job.workspaceRoot, job.id);
     throw error;
   }
+}
+
+// Reconciles a job the caller believes is dead. Everything here — the job file
+// it trusts, the index entry it rewrites, the artifacts it deletes — has to move
+// as one step, or a concurrent writer's prune can delete the files this just
+// wrote (or resurrect the ones it deleted).
+function markJobDead(workspaceRoot, jobSummary, errorMessage, lockWaitMs = undefined) {
+  return withStateLock(workspaceRoot, () => markJobDeadLocked(workspaceRoot, jobSummary, errorMessage), {
+    waitMs: lockWaitMs
+  });
+}
+
+function markJobDeadLocked(workspaceRoot, jobSummary, errorMessage) {
+  const jobFile = resolveJobFile(workspaceRoot, jobSummary.id);
+  const stored = fs.existsSync(jobFile) ? readJobFile(jobFile) : null;
+  const base = stored ?? jobSummary;
+  if (base.status !== "running" && base.status !== "queued") {
+    // The job finished between the caller's read and now — keep the real result,
+    // and put it in the index too: a worker that died between its terminal
+    // `writeJobFile` and its `upsertJob` leaves an active index entry that
+    // `assertThreadIsFree` reads as a phantom running job, blocking every later
+    // resume of that thread.
+    upsertJob(workspaceRoot, {
+      id: jobSummary.id,
+      status: base.status,
+      phase: base.phase ?? null,
+      errorMessage: base.errorMessage ?? null,
+      threadId: base.threadId ?? null,
+      turnId: base.turnId ?? null,
+      resolved: base.resolved ?? null,
+      requestFile: base.requestFile ?? null,
+      pid: null,
+      completedAt: base.completedAt ?? null
+    });
+    return base;
+  }
+  const completedAt = nowIso();
+  // Nothing will ever read the private payload now, so it must not stay on disk
+  // (0600, possibly holding `--config` secrets) until the job is pruned. Only
+  // its path is cleared on the record: the values themselves are never lifted
+  // into the record or the state index, which `status`/`result` echo back.
+  removeJobRequestFile(workspaceRoot, jobSummary.id);
+  removeJobPidFile(workspaceRoot, jobSummary.id);
+  const record = {
+    ...base,
+    status: "failed",
+    phase: "failed",
+    errorMessage,
+    pid: null,
+    requestFile: null,
+    completedAt,
+    // Keep updatedAt current so the reaped job sorts newest-first in the same
+    // read that recorded it — otherwise a stale updatedAt can page it out of
+    // the first /codex:status report.
+    updatedAt: completedAt
+  };
+  writeJobFile(workspaceRoot, jobSummary.id, record);
+  upsertJob(workspaceRoot, {
+    id: jobSummary.id,
+    status: "failed",
+    phase: "failed",
+    pid: null,
+    requestFile: null,
+    errorMessage,
+    completedAt
+  });
+  appendLogLine(base.logFile ?? null, `Marked failed: ${errorMessage}`);
+  return record;
+}
+
+const DEAD_WORKER_MESSAGE = "worker exited before completing";
+
+// How long a queued job may sit without a recorded pid before it counts as dead.
+// `enqueueBackgroundTask` patches the pid in immediately after the spawn, so the
+// window is milliseconds wide in practice; the grace period only has to outlast
+// a heavily loaded machine.
+const QUEUED_WITHOUT_PID_GRACE_MS = 30000;
+
+// A worker killed between the spawn and `updateJobPid` leaves a queued record
+// with no pid at all — not in the record and not in the sidecar. `isPidAlive(null)`
+// cannot tell that apart from a record that was written microseconds ago, so age
+// decides it.
+function isQueuedWithoutWorker(job, pid) {
+  if (job.status !== "queued" || pid != null) {
+    return false;
+  }
+  const createdAt = Date.parse(job.createdAt ?? "");
+  return Number.isFinite(createdAt) && Date.now() - createdAt > QUEUED_WITHOUT_PID_GRACE_MS;
+}
+
+// A worker that dies without throwing (SIGKILL, OOM, native crash) never
+// reaches runTrackedJob's catch, so its job stays "running" — or, if it died
+// before taking the record over, "queued" — forever. Rewrite any active job
+// whose worker is gone as failed.
+//
+// The job file is read first, for every active entry: it is the authoritative
+// record, and a worker that died between writing it and updating the index
+// leaves an index entry PID liveness cannot correct — `kill(pid, 0)` reads a
+// zombie as alive and cannot see a recycled pid, so that phantom `running` entry
+// would block resume on its thread for as long as anything held that pid. Pid
+// liveness is only consulted for jobs whose own file still says they are active.
+// Below this there is no point starting another lock wait.
+const REAP_MIN_STEP_MS = 100;
+
+/**
+ * @param {{ lockWaitMs?: number, remainingMs?: () => number }} [options] Bounds the
+ * reaper's own state-lock waits. Each dead job costs one acquisition, so a caller
+ * working to a deadline passes `remainingMs` and every wait is clamped to what is
+ * left of it; once that is spent the remaining jobs are left for the next run
+ * rather than reaped past the caller's budget.
+ */
+export function reapDeadJobs(workspaceRoot, jobs, options = {}) {
+  const { lockWaitMs, remainingMs } = options;
+  const waitFor = () => {
+    if (!remainingMs) {
+      return lockWaitMs;
+    }
+    const left = Math.max(0, remainingMs());
+    return lockWaitMs === undefined ? left : Math.min(lockWaitMs, left);
+  };
+  const deferred = [];
+  const reaped = jobs.map((job) => {
+    if (remainingMs && remainingMs() < REAP_MIN_STEP_MS) {
+      // Left as-is for the next run — say so, or a job that is dead but still
+      // listed as running looks like a live one to whoever reads the decision.
+      deferred.push(job.id);
+      return job;
+    }
+    if (job.status !== "running" && job.status !== "queued") {
+      return job;
+    }
+    const stored = readStoredJobOrNull(workspaceRoot, job.id);
+    if (stored && stored.status !== "running" && stored.status !== "queued") {
+      // Terminal on disk: markJobDead keeps the real result and reconciles it
+      // into the index rather than failing the job.
+      return markJobDead(workspaceRoot, job, DEAD_WORKER_MESSAGE, waitFor());
+    }
+    // The queued record carries no pid of its own — the parent records it in an
+    // atomic sidecar instead of rewriting the worker's job file.
+    const pid = resolveJobPid(workspaceRoot, job);
+    if (isPidAlive(pid) === false || isQueuedWithoutWorker(job, pid)) {
+      return markJobDead(workspaceRoot, job, DEAD_WORKER_MESSAGE, waitFor());
+    }
+    return job;
+  });
+  if (deferred.length > 0) {
+    process.stderr.write(`[codex] Reaper ran out of budget; not judged this run: ${deferred.join(", ")}.\n`);
+  }
+  return reaped;
+}
+
+// Guards only against in-process crashes (uncaughtException / unhandledRejection)
+// where a precise error is available and no other command is writing the job.
+// Signal-based deaths (SIGTERM/SIGINT/SIGHUP/SIGKILL) are intentionally NOT
+// caught here: SIGKILL is uncatchable so the reader-side reapDeadJobs must cover
+// it regardless, and /codex:cancel delivers SIGTERM as its teardown signal after
+// writing the job "cancelled" — catching it here would race that terminal state
+// back to "failed". reapDeadJobs handles every signal death and never rewrites a
+// job that already reached a terminal status.
+export function registerWorkerCrashGuard(workspaceRoot, jobId, logFile = null) {
+  const mark = (label) => (reason) => {
+    try {
+      const detail = reason instanceof Error ? reason.stack ?? reason.message : String(reason ?? "");
+      appendLogLine(logFile, `Worker ${label}: ${detail}`);
+      markJobDead(workspaceRoot, { id: jobId, status: "running", logFile }, `worker ${label}: ${detail.split("\n")[0]}`);
+    } catch {
+      // Never let the guard itself throw during teardown.
+    }
+    process.exit(1);
+  };
+  process.on("uncaughtException", mark("uncaughtException"));
+  process.on("unhandledRejection", mark("unhandledRejection"));
 }

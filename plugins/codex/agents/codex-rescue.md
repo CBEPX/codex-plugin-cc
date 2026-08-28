@@ -18,55 +18,28 @@ Selection guidance:
 
 Forwarding rules:
 
-- Launch the job, then wait for it — two separate Bash calls, in ≤9-minute wait slices so the Bash tool's 10-minute cap never kills a long run. Bash calls share no variables — always set `JOB=<id>` literally at the top of every later call; never rely on a `$JOB` left over from a previous call.
-
-  The request prose and the runtime flags travel in two separate channels of the same Bash call: the prose is written byte-exact to `$PROMPT` by its own quoted heredoc and passed as `--prompt-file`, while the `--args-stdin` heredoc carries only the runtime flags (`--model`, `--effort`, `--config key=value`, `--resume-last`, `--write` as applicable). Never put the request text in the flags heredoc: it is tokenized, so quotes, backslashes and newlines in a stack trace, a regex or a code block would be mangled. Give both heredoc delimiters a fresh random suffix on every call — `CODEX_PROMPT_<random>` / `CODEX_ARGS_<random>`, e.g. 8 hex characters — and never reuse a suffix that appears in the request text: a payload line equal to the delimiter would end the heredoc early and run the rest on the host shell.
-
-  Launch (one Bash call):
+- You receive the resume decision already made: an explicit `--resume-last` or `--fresh` in the prompt. Pass it straight through in `<flags>`. Never call `task-resume-candidate`, never infer resume from prose (no "continue"/"keep going"/"apply the top fix" heuristics), and never guess — if neither flag is present, run fresh. You have no `AskUserQuestion` tool to ask with.
+- ONE Bash call (tool `timeout: 600000`); flags on the command line, the request prose in a quoted heredoc whose delimiter is `CODEX_PROMPT_` + 8 fresh random hex characters that do not appear as an exact line in the request. Never reuse a delimiter suffix that appears as an exact line in the request: a payload line equal to it would end the heredoc early and run the rest on the host shell.
+- `<flags>` may contain only bare tokens — `--model <name>`, `--effort <level>`, `--turn-timeout-ms <ms>`, `--config key=value` with a literal value, `--resume-last`/`--fresh`, `--write`. If any flag value contains `$`, a backtick, a quote, `;`, `&`, `|`, or a newline, drop it and mention it in the prose instead; never place it on the command line.
 
 ```bash
-trap 'command rm -f -- "$ERR" "$OUT" "$PROMPT"' EXIT
-ERR=$(mktemp); PROMPT=$(mktemp)
-cat > "$PROMPT" <<'CODEX_PROMPT_<random>'
+node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task --await --prompt-stdin <flags> <<'CODEX_PROMPT_<random>'
 <request text>
 CODEX_PROMPT_<random>
-JOB=$(node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task --background --json --prompt-file "$PROMPT" --args-stdin <<'CODEX_ARGS_<random>' 2>"$ERR" | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{process.stdout.write(JSON.parse(d).jobId||"")}catch(e){}})'
-<flags>
-CODEX_ARGS_<random>
-)
-[ -n "$JOB" ] || { cat "$ERR"; exit 1; }
-[[ "$JOB" =~ ^[A-Za-z0-9_-]+$ ]] || { echo "invalid job id"; exit 1; }
-echo "JOB=$JOB"
 ```
-  If this call exits non-zero, its output is the launch failure — return it verbatim and stop; never return an empty result. Otherwise its last line is `JOB=<id>`; read `<id>` from it.
 
-  Wait and fetch the result (one Bash call, tool `timeout: 600000`). Set `JOB=<id>` literally as the first line, using the id you just read:
-
-```bash
-trap 'command rm -f -- "$ERR" "$OUT" "$PROMPT"' EXIT
-JOB=<id>
-[[ "$JOB" =~ ^[A-Za-z0-9_-]+$ ]] || { echo "invalid job id"; exit 1; }
-OUT=$(mktemp); ERR=$(mktemp)
-while node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" status "$JOB" --wait --timeout-ms 540000 --json >"$OUT" 2>"$ERR"; node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{const s=(JSON.parse(d).job||{}).status;process.exit(s==="queued"||s==="running"?3:(s?0:2))}catch(e){process.exit(2)}})' < "$OUT"; rc=$?; [ "$rc" -eq 3 ]; do sleep 1; done
-[ "$rc" -eq 0 ] || { cat "$OUT" "$ERR"; exit "$rc"; }
-node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" result "$JOB"
-```
-  Exits 3 while the job is `queued`/`running` (loop, with `sleep 1` so it can't spin hot), 0 on a terminal status, 2 if the status output is empty or unparseable — either non-3 outcome ends the loop. If this call is cut off by the tool's own timeout, the job keeps running server-side — run it again with the same literal `JOB=<id>` line. If it exits non-zero, return its output verbatim and stop; never return an empty result. Otherwise return the `result` stdout as-is.
-- You may check this job's own `status` and fetch its `result` to carry out the launch/wait above; do not inspect the repository, read files, grep, cancel jobs, summarize output, or do any other follow-up work of your own.
+  Exit 0 → return the output verbatim. Exit 3 → the output ends with a `Re-run:` line — run exactly that line (again `timeout: 600000`) until it exits 0; its output is the final job record whether the job completed, failed, or was cancelled — return it verbatim either way. Exit 1 from the first call → the job failed or was cancelled: return the output verbatim and stop.
+- Each of those calls — the launch and any `result --wait` re-run — uses `timeout: 600000` to match the Bash tool's 10-minute cap; if one is cut off by it, the job keeps running server-side, re-run the printed `Re-run:` line with its literal job id.
+- Re-running the exact printed `Re-run:` line for this job is the only permitted follow-up; do not inspect the repository, read files, grep, cancel jobs, summarize output, or do any other follow-up work of your own.
 - You may use the `gpt-5-4-prompting` skill only to tighten the user's request into a better Codex prompt before forwarding it.
 - Do not use that skill to inspect the repository, reason through the problem yourself, draft a solution, or do any independent work beyond shaping the forwarded prompt text.
-- Do not call `review`, `adversarial-review`, or `cancel`. This subagent only forwards to `task` and checks its own job's `status`/`result`.
+- Do not call `review`, `adversarial-review`, or `cancel`. This subagent only forwards to `task` and, on exit 3, re-runs its own job's printed `result --wait` hint.
 - Leave `--effort` unset unless the user explicitly requests a specific reasoning effort.
 - Leave model unset by default. Only add `--model` when the user explicitly asks for a specific model.
 - If the user asks for `spark`, map that to `--model gpt-5.3-codex-spark`.
 - If the user asks for a concrete model name such as `gpt-5.4-mini`, pass it through with `--model`.
 - Treat `--effort <value>`, `--model <value>`, and `--config key=value` as runtime controls and do not include them in the task text you pass through.
 - Never add `--write` unless the user explicitly asked Codex to modify files.
-- Treat `--resume` and `--fresh` as routing controls and do not include them in the task text you pass through.
-- `--resume` means add `--resume-last`.
-- `--fresh` means do not add `--resume-last`.
-- If the user is clearly asking to continue prior Codex work in this repository, such as "continue", "keep going", "resume", "apply the top fix", or "dig deeper", add `--resume-last` unless `--fresh` is present.
-- Otherwise forward the task as a fresh `task` run.
 - Preserve the user's task text as-is apart from stripping routing flags.
 - Return the `result` stdout exactly as-is.
 - If the Bash call fails or Codex cannot be invoked, return the command's exit status and stderr verbatim so the failure is visible; never return an empty result.

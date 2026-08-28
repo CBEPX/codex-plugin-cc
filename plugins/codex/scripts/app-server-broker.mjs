@@ -21,6 +21,13 @@ const STREAMING_METHODS = new Set(["turn/start", "review/start", "thread/compact
 // and needs no PID/liveness signal, so it covers the abnormal-exit orphan, the
 // dead-co-owner orphan, and the lock-contention skip in one mechanism. See #108,
 // #380, and #450.
+// How long a client is given to close its side once the broker has said goodbye.
+// `socket.end()` is a graceful half-close, so a peer that never answers the FIN —
+// one that is wedged, or one whose process is gone but whose close event has not
+// been processed yet — leaves the connection open. Anything still open after this
+// is closed outright.
+const SHUTDOWN_SOCKET_GRACE_MS = 1000;
+
 const IDLE_TIMEOUT_ENV = "CODEX_COMPANION_BROKER_IDLE_TIMEOUT_MS";
 const DEFAULT_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
 
@@ -102,7 +109,11 @@ async function main() {
   let activeStreamThreadIds = null;
   const sockets = new Set();
   let idleTimer = null;
-  let shuttingDown = false;
+  // One shutdown, one exit. Both are memoized: every trigger — either signal, the
+  // `broker/shutdown` RPC, the idle timeout — joins the same teardown and the
+  // process leaves only when that teardown is done.
+  let shutdownPromise = null;
+  let exitPromise = null;
 
   function disarmIdleTimer() {
     if (idleTimer) {
@@ -122,9 +133,7 @@ async function main() {
     }
     idleTimer = setTimeout(() => {
       idleTimer = null;
-      shutdown(server)
-        .catch(() => {})
-        .finally(() => process.exit(0));
+      void shutdownAndExit(server);
     }, idleTimeoutMs);
   }
 
@@ -177,19 +186,52 @@ async function main() {
   // first await instead of after it: a client accepted in that window would be
   // served the broker-local `initialize` and then fail its first real RPC with
   // "codex app-server client is closed", which callers do not retry.
-  async function shutdown(server) {
-    if (shuttingDown) {
-      return;
+  function shutdown(server) {
+    if (!shutdownPromise) {
+      shutdownPromise = runShutdown(server);
     }
-    shuttingDown = true;
+    return shutdownPromise;
+  }
+
+  // The one place the process is allowed to leave from. A trigger that arrives
+  // while the teardown is running joins it instead of exiting out from under it —
+  // which used to orphan the app-server child and leave the endpoint, the pid file
+  // and the ownership record behind.
+  function shutdownAndExit(server) {
+    if (!exitPromise) {
+      exitPromise = shutdown(server)
+        .catch((error) => {
+          process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+        })
+        .then(() => process.exit(0));
+    }
+    return exitPromise;
+  }
+
+  async function runShutdown(server) {
     disarmIdleTimer();
-    clearOwnSessionRecord();
     const serverClosed = new Promise((resolve) => server.close(resolve));
     for (const socket of sockets) {
       socket.end();
     }
     await appClient.close().catch(() => {});
-    await serverClosed;
+    // Never wait on a client indefinitely. SIGTERM is handled here, so a shutdown
+    // that does not return is a broker that ignores SIGTERM — a SessionEnd could
+    // signal it, get on with its teardown, and leave the process running forever.
+    let graceTimer = null;
+    await Promise.race([
+      serverClosed,
+      new Promise((resolve) => {
+        graceTimer = setTimeout(resolve, SHUTDOWN_SOCKET_GRACE_MS);
+      })
+    ]);
+    clearTimeout(graceTimer);
+    for (const socket of sockets) {
+      socket.destroy();
+    }
+    // Last: stop advertising this broker. Doing it first would leave the record
+    // gone while the process is still serving its own teardown.
+    clearOwnSessionRecord();
     if (listenTarget.kind === "unix" && fs.existsSync(listenTarget.path)) {
       fs.unlinkSync(listenTarget.path);
     }
@@ -201,7 +243,7 @@ async function main() {
   appClient.setNotificationHandler(routeNotification);
 
   const server = net.createServer((socket) => {
-    if (shuttingDown) {
+    if (shutdownPromise) {
       // Already accepted before the listener finished closing: reset it so the
       // client retries or reports a connection error instead of half-working.
       socket.destroy();
@@ -250,9 +292,26 @@ async function main() {
         }
 
         if (message.id !== undefined && message.method === "broker/shutdown") {
+          // The caller (a SessionEnd hook) decides to shut the broker down from a
+          // snapshot of the job index, and another session can enqueue a job and
+          // connect in the gap between that snapshot and this request. Only the
+          // broker knows whether it is actually idle, so it refuses while anyone
+          // else is connected at all: a client is a client from the moment it is
+          // accepted, and `CodexAppServerClient` connects before it writes its
+          // first line. The requester's own connection is the one that does not
+          // count. Refusing is fail-safe and costs nothing that the idle timer
+          // does not already cost — that timer is likewise held off by any open
+          // socket, so a client that hangs up lets both mechanisms proceed.
+          const busy =
+            (activeRequestSocket && activeRequestSocket !== socket) ||
+            (activeStreamSocket && activeStreamSocket !== socket) ||
+            [...sockets].some((other) => other !== socket);
+          if (busy) {
+            send(socket, { id: message.id, result: { busy: true } });
+            continue;
+          }
           send(socket, { id: message.id, result: {} });
-          await shutdown(server);
-          process.exit(0);
+          await shutdownAndExit(server);
         }
 
         if (message.id === undefined) {
@@ -327,14 +386,12 @@ async function main() {
     });
   });
 
-  process.on("SIGTERM", async () => {
-    await shutdown(server);
-    process.exit(0);
+  process.on("SIGTERM", () => {
+    void shutdownAndExit(server);
   });
 
-  process.on("SIGINT", async () => {
-    await shutdown(server);
-    process.exit(0);
+  process.on("SIGINT", () => {
+    void shutdownAndExit(server);
   });
 
   server.listen(listenTarget.path, () => {

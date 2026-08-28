@@ -9,6 +9,7 @@ export function runCommand(command, args = [], options = {}) {
     input: options.input,
     maxBuffer: options.maxBuffer,
     stdio: options.stdio ?? "pipe",
+    timeout: options.timeoutMs,
     shell: options.shell ?? (process.platform === "win32" ? (process.env.SHELL || true) : false),
     windowsHide: true
   });
@@ -68,11 +69,27 @@ export function processCommandLine(pid, options = {}) {
   }
 
   const runCommandImpl = options.runCommandImpl ?? runCommand;
-  const result = runCommandImpl("ps", ["-o", "command=", "-p", String(pid)]);
+  const result = runCommandImpl("ps", ["-o", "command=", "-p", String(pid)], { timeoutMs: options.timeoutMs });
   if (result.error || result.status !== 0) {
     return null;
   }
   return result.stdout.trim() || null;
+}
+
+// True when the PID is running, false when it is provably gone (ESRCH), null
+// when the question does not apply (no PID) — EPERM means it exists but belongs
+// to someone else. Known limitation: a zombie reads as alive, and a recycled PID
+// reads as the process that inherited it.
+export function isPidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return null;
+  }
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "ESRCH" ? false : true;
+  }
 }
 
 export function terminateProcessTree(pid, options = {}) {

@@ -222,6 +222,15 @@ export class AppServerClientBase {
   }
 }
 
+// Closing a direct app-server is a teardown step, not a negotiation: the turn
+// timeout calls it precisely because the child is misbehaving. Ask (stdin EOF),
+// then tell (SIGTERM), then insist (SIGKILL), and in the worst case return to the
+// caller anyway — a leaked child process is a smaller problem than a companion
+// that never finishes writing the job record.
+const CLOSE_TERM_MS = 50;
+const CLOSE_KILL_MS = 2000;
+const CLOSE_DEADLINE_MS = 5000;
+
 class SpawnedCodexAppServerClient extends AppServerClientBase {
   constructor(cwd, options = {}) {
     super(cwd, options);
@@ -271,40 +280,63 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
     this.notify("initialized", {});
   }
 
-  async close() {
-    if (this.closed) {
-      await this.exitPromise;
+  // On Windows with shell: true the direct child is cmd.exe, so the whole tree
+  // has to go — `taskkill /T /F` is the only escalation available there.
+  terminateChild(signal) {
+    if (!this.proc || this.proc.exitCode !== null || this.proc.signalCode !== null) {
       return;
     }
+    try {
+      if (process.platform === "win32") {
+        terminateProcessTree(this.proc.pid);
+      } else {
+        this.proc.kill(signal);
+      }
+    } catch {
+      // Best-effort teardown: never throw on the way out.
+    }
+  }
 
+  // One bounded close per client, memoized: a second call must return the first
+  // call's outcome, never fall through to an unbounded wait on a process that may
+  // have outlived the deadline. The timeout path closes twice by design.
+  close() {
+    if (!this.closePromise) {
+      this.closePromise = this.closeOnce();
+    }
+    return this.closePromise;
+  }
+
+  async closeOnce() {
     this.closed = true;
 
     if (this.readline) {
       this.readline.close();
     }
 
-    if (this.proc && !this.proc.killed) {
+    const timers = [];
+    if (this.proc && this.proc.exitCode === null && this.proc.signalCode === null) {
       this.proc.stdin.end();
-      setTimeout(() => {
-        if (this.proc && !this.proc.killed && this.proc.exitCode === null) {
-          // On Windows with shell: true, the direct child is cmd.exe.
-          // Use terminateProcessTree to kill the entire tree including
-          // the grandchild node process.
-          if (process.platform === "win32") {
-            try {
-              terminateProcessTree(this.proc.pid);
-            } catch {
-              // Best-effort cleanup inside an unref'd timer — swallow errors
-              // to avoid crashing the host process during shutdown.
-            }
-          } else {
-            this.proc.kill("SIGTERM");
-          }
-        }
-      }, 50).unref?.();
+      timers.push(setTimeout(() => this.terminateChild("SIGTERM"), CLOSE_TERM_MS));
+      timers.push(setTimeout(() => this.terminateChild("SIGKILL"), CLOSE_KILL_MS));
     }
 
-    await this.exitPromise;
+    let deadlineTimer = null;
+    try {
+      await Promise.race([
+        this.exitPromise,
+        new Promise((resolve) => {
+          deadlineTimer = setTimeout(resolve, CLOSE_DEADLINE_MS);
+        })
+      ]);
+    } finally {
+      for (const timer of timers) {
+        clearTimeout(timer);
+      }
+      if (deadlineTimer) {
+        clearTimeout(deadlineTimer);
+      }
+    }
   }
 
   sendMessage(message) {
@@ -374,6 +406,15 @@ class BrokerCodexAppServerClient extends AppServerClientBase {
   }
 }
 
+// The connection went away underneath us: reset by the peer, a write to a closed
+// pipe, or our own "connection closed" error, which carries no errno at all.
+function isConnectionDropped(error) {
+  if (error?.code) {
+    return error.code === "ECONNRESET" || error.code === "EPIPE";
+  }
+  return /connection closed/i.test(error?.message ?? "");
+}
+
 export class CodexAppServerClient {
   static async connect(cwd, options = {}) {
     let brokerEndpoint = null;
@@ -387,10 +428,27 @@ export class CodexAppServerClient {
         brokerEndpoint = brokerSession?.endpoint ?? null;
       }
     }
-    const client = brokerEndpoint
-      ? new BrokerCodexAppServerClient(cwd, { ...options, brokerEndpoint })
-      : new SpawnedCodexAppServerClient(cwd, options);
-    await client.initialize();
-    return client;
+    if (!brokerEndpoint) {
+      const direct = new SpawnedCodexAppServerClient(cwd, options);
+      await direct.initialize();
+      return direct;
+    }
+
+    const client = new BrokerCodexAppServerClient(cwd, { ...options, brokerEndpoint });
+    try {
+      await client.initialize();
+      return client;
+    } catch (error) {
+      // A broker that is shutting down accepts the connection and drops it before
+      // answering `initialize`. That is a race with someone else's SessionEnd, not
+      // a reason to fail a background job — run on our own app-server instead.
+      if (!isConnectionDropped(error)) {
+        throw error;
+      }
+      await client.close().catch(() => {});
+      const direct = new SpawnedCodexAppServerClient(cwd, options);
+      await direct.initialize();
+      return direct;
+    }
   }
 }

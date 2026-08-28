@@ -8,7 +8,13 @@ import { fileURLToPath } from "node:url";
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 import { loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
-import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
+import {
+  consumeJobRequestFile,
+  readJobFile,
+  resolveJobFile,
+  resolveJobRequestFile,
+  resolveStateDir
+} from "../plugins/codex/scripts/lib/state.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PLUGIN_ROOT = path.join(ROOT, "plugins", "codex");
@@ -588,6 +594,48 @@ test("task-resume-candidate returns the latest rescue thread from the current se
   assert.equal(payload.sessionId, "sess-current");
   assert.equal(payload.candidate.id, "task-current");
   assert.equal(payload.candidate.threadId, "thr_current");
+});
+
+test("task-resume-candidate reaps a crashed running task so it becomes resumable", () => {
+  const workspace = makeTempDir();
+  const stateDir = resolveStateDir(workspace);
+  const jobsDir = path.join(stateDir, "jobs");
+  fs.mkdirSync(jobsDir, { recursive: true });
+
+  // A pid that has already exited: process.kill(pid, 0) will throw ESRCH.
+  const deadPid = run(process.execPath, ["-e", ""]).pid;
+  const crashedJob = {
+    id: "task-crashed",
+    status: "running",
+    phase: "delegating",
+    title: "Codex Task",
+    jobClass: "task",
+    sessionId: "sess-current",
+    threadId: "thr_crashed",
+    summary: "Investigate the crash",
+    pid: deadPid,
+    updatedAt: "2026-03-24T20:00:00.000Z"
+  };
+  fs.writeFileSync(path.join(jobsDir, "task-crashed.json"), `${JSON.stringify(crashedJob, null, 2)}\n`, "utf8");
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    `${JSON.stringify({ version: 1, config: { stopReviewGate: false }, jobs: [crashedJob] }, null, 2)}\n`,
+    "utf8"
+  );
+
+  const result = run("node", [SCRIPT, "task-resume-candidate", "--json"], {
+    cwd: workspace,
+    env: { ...process.env, CODEX_COMPANION_SESSION_ID: "sess-current" }
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  // Without the reaper the job would still read as "running" and be skipped,
+  // leaving the resume probe with no candidate.
+  assert.equal(payload.available, true);
+  assert.equal(payload.candidate.id, "task-crashed");
+  assert.equal(payload.candidate.status, "failed");
+  assert.equal(payload.candidate.threadId, "thr_crashed");
 });
 
 test("task --resume-last does not resume a task from another Claude session", () => {
@@ -2125,6 +2173,170 @@ test("session end fully cleans up jobs for the ending session", async (t) => {
   assert.equal(otherJob.logFile, otherSessionLog);
 });
 
+test("session end preserves background jobs and their broker so workers survive their dispatching session", async (t) => {
+  const repo = makeTempDir();
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const stateDir = resolveStateDir(repo);
+  const jobsDir = path.join(stateDir, "jobs");
+  fs.mkdirSync(jobsDir, { recursive: true });
+
+  const backgroundLog = path.join(jobsDir, "background.log");
+  const foregroundLog = path.join(jobsDir, "foreground.log");
+  const backgroundJobFile = path.join(jobsDir, "task-background.json");
+  const foregroundJobFile = path.join(jobsDir, "review-foreground.json");
+  fs.writeFileSync(backgroundLog, "background\n", "utf8");
+  fs.writeFileSync(foregroundLog, "foreground\n", "utf8");
+  fs.writeFileSync(backgroundJobFile, JSON.stringify({ id: "task-background" }, null, 2), "utf8");
+  fs.writeFileSync(foregroundJobFile, JSON.stringify({ id: "review-foreground" }, null, 2), "utf8");
+
+  const backgroundSleeper = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+    cwd: repo,
+    detached: true,
+    stdio: "ignore"
+  });
+  backgroundSleeper.unref();
+  const foregroundSleeper = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+    cwd: repo,
+    detached: true,
+    stdio: "ignore"
+  });
+  foregroundSleeper.unref();
+
+  t.after(() => {
+    for (const proc of [backgroundSleeper, foregroundSleeper]) {
+      try {
+        process.kill(-proc.pid, "SIGTERM");
+      } catch {
+        try {
+          process.kill(proc.pid, "SIGTERM");
+        } catch {
+          // Ignore missing process.
+        }
+      }
+    }
+  });
+
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    `${JSON.stringify(
+      {
+        version: 1,
+        config: { stopReviewGate: false },
+        jobs: [
+          {
+            id: "task-background",
+            status: "running",
+            title: "Codex Task",
+            sessionId: "sess-current",
+            background: true,
+            pid: backgroundSleeper.pid,
+            logFile: backgroundLog,
+            createdAt: "2026-03-18T15:30:00.000Z",
+            updatedAt: "2026-03-18T15:31:00.000Z"
+          },
+          {
+            id: "review-foreground",
+            status: "running",
+            title: "Codex Review",
+            sessionId: "sess-current",
+            pid: foregroundSleeper.pid,
+            logFile: foregroundLog,
+            createdAt: "2026-03-18T15:32:00.000Z",
+            updatedAt: "2026-03-18T15:33:00.000Z"
+          }
+        ]
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+
+  const result = run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: repo,
+    env: {
+      ...process.env,
+      CODEX_COMPANION_SESSION_ID: "sess-current"
+    },
+    input: JSON.stringify({
+      hook_event_name: "SessionEnd",
+      session_id: "sess-current",
+      cwd: repo
+    })
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+
+  // Foreground job killed + pruned from state.
+  await waitFor(() => {
+    try {
+      process.kill(foregroundSleeper.pid, 0);
+      return false;
+    } catch (error) {
+      return error?.code === "ESRCH";
+    }
+  });
+
+  // Background job still alive — its worker outlives the session that started it.
+  assert.equal(
+    (() => {
+      try {
+        process.kill(backgroundSleeper.pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    })(),
+    true,
+    "background job worker should not be terminated by SessionEnd"
+  );
+
+  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  assert.deepEqual(
+    state.jobs.map((job) => job.id),
+    ["task-background"],
+    "background job stays in state so later sessions can poll it"
+  );
+  assert.equal(fs.existsSync(backgroundJobFile), true, "background job file preserved");
+  assert.equal(fs.existsSync(backgroundLog), true, "background log preserved");
+});
+
+// `--background` on a review means what it means on a task: the job is
+// dispatched to outlive the session that started it. The flag was parsed and
+// then dropped, so SessionEnd pruned the review's record — and with it the
+// only way to read the review back with `/codex:result`.
+test("an adversarial review dispatched with --background survives its own session's SessionEnd", () => {
+  const repo = seededRepo();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello world\n");
+  const env = { ...buildEnv(binDir), CODEX_COMPANION_SESSION_ID: "sess-current" };
+
+  const review = run("node", [SCRIPT, "adversarial-review", "--background"], { cwd: repo, env });
+  assert.equal(review.status, 0, review.stderr);
+
+  const stateFile = path.join(resolveStateDir(repo), "state.json");
+  const recorded = JSON.parse(fs.readFileSync(stateFile, "utf8")).jobs[0];
+  assert.equal(recorded.background, true, "a --background review must be recorded as a background job");
+
+  const cleanup = run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: repo,
+    env,
+    input: JSON.stringify({ hook_event_name: "SessionEnd", session_id: "sess-current", cwd: repo })
+  });
+  assert.equal(cleanup.status, 0, cleanup.stderr);
+
+  assert.deepEqual(
+    JSON.parse(fs.readFileSync(stateFile, "utf8")).jobs.map((job) => job.id),
+    [recorded.id],
+    "the background review record must survive the dispatching session's SessionEnd"
+  );
+});
+
 test("stop hook runs a stop-time review task and blocks on findings when the review gate is enabled", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
@@ -2695,6 +2907,9 @@ test("task --background persists the job record before spawning the worker", () 
   assert.equal(JSON.parse(waited.stdout).job.status, "completed");
 });
 
+// Classifying secrets by key name always misses one: a session cookie header is
+// every bit a credential and matches no denylist. Every `--config` value stays
+// out of the public record; only the keys are kept.
 test("task --background keeps secret --config values out of every job record", () => {
   const repo = seededRepo();
   const binDir = makeTempDir();
@@ -2709,7 +2924,7 @@ test("task --background keeps secret --config values out of every job record", (
       "--background",
       "--json",
       "--config",
-      "model_providers.x.http_headers.Authorization=SECRET_SENTINEL_42",
+      "model_providers.x.http_headers.Cookie=SECRET_SENTINEL_42",
       "--config",
       "model_provider=ollama",
       "x"
@@ -2738,7 +2953,8 @@ test("task --background keeps secret --config values out of every job record", (
   for (const [label, text] of Object.entries(exposures)) {
     assert.equal(text.includes("SECRET_SENTINEL_42"), false, `${label} leaked the secret --config value`);
     assert.equal(text.includes("[redacted]"), true, `${label} should keep the redacted placeholder`);
-    assert.equal(text.includes("ollama"), true, `${label} should keep non-secret config values readable`);
+    assert.equal(text.includes("model_provider"), true, `${label} should still record which config keys were set`);
+    assert.equal(text.includes("ollama"), false, `${label} stored a --config value; keys are recorded, values never are`);
   }
 
   // The one-shot payload file is deleted by the worker once it has read it.
@@ -2746,8 +2962,132 @@ test("task --background keeps secret --config values out of every job record", (
 
   // The worker still forwarded the real value to Codex.
   const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
-  assert.equal(fakeState.lastThreadStart.config["model_providers.x.http_headers.Authorization"], "SECRET_SENTINEL_42");
+  assert.equal(fakeState.lastThreadStart.config["model_providers.x.http_headers.Cookie"], "SECRET_SENTINEL_42");
   assert.equal(fakeState.lastThreadStart.config.model_provider, "ollama");
+});
+
+// Redaction was added when the job is created, which does nothing for records
+// v1.1.1 already wrote: same `STATE_VERSION`, raw `--config` values, and every
+// `status`/`result --json` still echoing them back after the upgrade.
+test("a v1.1.1 record's --config values never reach status/result and are redacted on disk", () => {
+  const repo = seededRepo();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const env = buildEnv(binDir);
+
+  const seeded = run("node", [SCRIPT, "task", "seed the state dir"], { cwd: repo, env });
+  assert.equal(seeded.status, 0, seeded.stderr);
+
+  const stateDir = resolveStateDir(repo);
+  const statePath = path.join(stateDir, "state.json");
+  const legacyRequest = {
+    cwd: repo,
+    prompt: "legacy prompt",
+    config: { "model_providers.x.http_headers.Cookie": "SESSION_SECRET_FROM_1_1_1" }
+  };
+  const legacyJob = {
+    id: "task-legacy",
+    status: "completed",
+    phase: "done",
+    jobClass: "task",
+    kind: "task",
+    title: "Codex Task",
+    summary: "Legacy job written by 1.1.1",
+    threadId: "thr_legacy",
+    updatedAt: "2026-03-24T20:05:00.000Z",
+    completedAt: "2026-03-24T20:06:00.000Z",
+    request: legacyRequest
+  };
+  const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  state.jobs.push(legacyJob);
+  fs.writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+  const legacyJobFile = path.join(stateDir, "jobs", "task-legacy.json");
+  fs.writeFileSync(
+    legacyJobFile,
+    `${JSON.stringify({ ...legacyJob, result: { status: 0, finalMessage: "legacy output" }, rendered: "legacy output\n" }, null, 2)}\n`,
+    "utf8"
+  );
+
+  const status = run("node", [SCRIPT, "status", "task-legacy", "--json"], { cwd: repo, env });
+  assert.equal(status.status, 0, status.stderr);
+  const result = run("node", [SCRIPT, "result", "task-legacy", "--json"], { cwd: repo, env });
+  assert.equal(result.status, 0, result.stderr);
+
+  const exposures = {
+    "status --json stdout": status.stdout,
+    "result --json stdout": result.stdout,
+    "state index": fs.readFileSync(statePath, "utf8"),
+    "job file": fs.readFileSync(legacyJobFile, "utf8")
+  };
+  for (const [label, text] of Object.entries(exposures)) {
+    assert.equal(text.includes("SESSION_SECRET_FROM_1_1_1"), false, `${label} leaked a legacy --config value`);
+    assert.equal(text.includes("[redacted]"), true, `${label} should carry the redacted placeholder`);
+    assert.equal(
+      text.includes("model_providers.x.http_headers.Cookie"),
+      true,
+      `${label} should still record which config keys were set`
+    );
+  }
+});
+
+// The record of an ACTIVE 1.1.1 job is the only copy of its request — 1.1.1 wrote
+// no private payload file — and `handleTaskWorker` falls back to exactly that
+// record when there is none. Redacting it in place would hand the worker
+// "[redacted]" as its Codex config (auth headers included), so the raw request is
+// moved into a fresh 0600 payload file first and only then dropped from the record.
+test("an active v1.1.1 record keeps its real --config for the worker while output stays redacted", () => {
+  const repo = seededRepo();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const env = buildEnv(binDir);
+
+  const seeded = run("node", [SCRIPT, "task", "seed the state dir"], { cwd: repo, env });
+  assert.equal(seeded.status, 0, seeded.stderr);
+
+  const stateDir = resolveStateDir(repo);
+  const statePath = path.join(stateDir, "state.json");
+  const now = new Date().toISOString();
+  const legacyRequest = {
+    cwd: repo,
+    prompt: "legacy queued prompt",
+    config: { "model_providers.x.http_headers.Cookie": "SESSION_SECRET_FROM_1_1_1" }
+  };
+  const legacyJob = {
+    id: "task-legacy-queued",
+    status: "queued",
+    phase: "queued",
+    jobClass: "task",
+    kind: "task",
+    title: "Codex Task",
+    summary: "Legacy queued job written by 1.1.1",
+    createdAt: now,
+    updatedAt: now,
+    request: legacyRequest
+  };
+  const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  state.jobs.push(legacyJob);
+  fs.writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+  const legacyJobFile = resolveJobFile(repo, "task-legacy-queued");
+  fs.writeFileSync(legacyJobFile, `${JSON.stringify(legacyJob, null, 2)}\n`, "utf8");
+
+  const status = run("node", [SCRIPT, "status", "task-legacy-queued", "--json"], { cwd: repo, env });
+  assert.equal(status.status, 0, status.stderr);
+  assert.equal(status.stdout.includes("SESSION_SECRET_FROM_1_1_1"), false, "status --json leaked a legacy --config value");
+  assert.equal(status.stdout.includes("[redacted]"), true);
+
+  // The worker's own read path (`readStoredJob` → `readJobFile`).
+  const workerView = readJobFile(legacyJobFile);
+  assert.equal(workerView.request.config["model_providers.x.http_headers.Cookie"], "[redacted]");
+
+  const requestFile = resolveJobRequestFile(repo, "task-legacy-queued");
+  assert.equal(fs.existsSync(requestFile), true, "the raw request must be moved into the private payload file");
+  assert.equal(fs.statSync(requestFile).mode & 0o777, 0o600, "the payload file must be owner-only");
+  assert.equal(fs.readFileSync(legacyJobFile, "utf8").includes("SESSION_SECRET_FROM_1_1_1"), false, "the record must be redacted on disk");
+
+  // What the worker actually runs with.
+  const consumed = consumeJobRequestFile(repo, "task-legacy-queued");
+  assert.equal(consumed.config["model_providers.x.http_headers.Cookie"], "SESSION_SECRET_FROM_1_1_1");
+  assert.equal(consumed.prompt, "legacy queued prompt");
 });
 
 test("a resume refuses to start a second turn on a thread another job is still using", () => {
@@ -2797,6 +3137,70 @@ test("a resume refuses to start a second turn on a thread another job is still u
   assert.equal(fakeState.lastTurnStart.prompt, "follow up");
 });
 
+// The crash window between a worker's terminal `writeJobFile` and its
+// `upsertJob`: the job file is terminal, the index still says running. The
+// reaper handed the terminal file back to its caller but left the index alone,
+// so the raw `listJobs()` behind `assertThreadIsFree` kept seeing a phantom
+// running job and blocked every later resume of that thread. The recorded pid
+// here is alive and unrelated (this test runner) — exactly what a zombie or a
+// recycled pid looks like — so nothing but the job file itself can settle it.
+test("a terminal job file reconciles the state index and unblocks resume", () => {
+  const repo = seededRepo();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const env = { ...buildEnv(binDir), CODEX_COMPANION_SESSION_ID: "sess-current" };
+
+  const first = run("node", [SCRIPT, "task", "first"], { cwd: repo, env });
+  assert.equal(first.status, 0, first.stderr);
+
+  const stateDir = resolveStateDir(repo);
+  const statePath = path.join(stateDir, "state.json");
+  const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  state.jobs.push({
+    id: "task-crash-window",
+    status: "running",
+    phase: "running",
+    title: "Codex Task",
+    jobClass: "task",
+    sessionId: "sess-other",
+    threadId: "thr_1",
+    pid: process.pid,
+    summary: "Other session task that died after writing its result",
+    updatedAt: "2026-03-24T20:05:00.000Z"
+  });
+  fs.writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+  fs.writeFileSync(
+    path.join(stateDir, "jobs", "task-crash-window.json"),
+    `${JSON.stringify(
+      {
+        id: "task-crash-window",
+        status: "completed",
+        phase: "done",
+        pid: null,
+        threadId: "thr_1",
+        turnId: "turn_9",
+        result: { status: 0, finalMessage: "done" },
+        rendered: "done\n",
+        completedAt: "2026-03-24T20:06:00.000Z"
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+
+  // Resume first: only a reaped/reconciled job list can tell this thread is free.
+  const resumed = run("node", [SCRIPT, "task", "--resume-last", "follow up"], { cwd: repo, env });
+  assert.equal(resumed.status, 0, resumed.stderr);
+
+  const reconciled = JSON.parse(fs.readFileSync(statePath, "utf8")).jobs.find((job) => job.id === "task-crash-window");
+  assert.equal(reconciled.status, "completed", "the terminal job file must be reconciled into the state index");
+  assert.equal(reconciled.pid, null);
+
+  const status = run("node", [SCRIPT, "status", "--json"], { cwd: repo, env });
+  assert.equal(status.status, 0, status.stderr);
+});
+
 test("task --prompt-file wins over --args-stdin and keeps the prompt byte-exact", () => {
   const repo = seededRepo();
   const binDir = makeTempDir();
@@ -2819,4 +3223,439 @@ test("task --prompt-file wins over --args-stdin and keeps the prompt byte-exact"
   const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
   assert.equal(fakeState.lastTurnStart.prompt, promptText);
   assert.equal(fakeState.lastTurnStart.effort, "max");
+});
+
+test("task --await launches a tracked job, waits, and prints the result", () => {
+  const repo = seededRepo();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  const result = run("node", [SCRIPT, "task", "--await", "--json", "--model", "sol", "--effort", "low", "--prompt-stdin"], {
+    cwd: repo, env: buildEnv(binDir), input: "line one \\d+ \"quoted\" 'single'\nline two\n"
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const out = JSON.parse(result.stdout);
+  assert.match(out.job.id, /^task-/);
+  assert.equal(out.job.status, "completed");
+  assert.ok(typeof out.storedJob.result.rawOutput === "string" && out.storedJob.result.rawOutput.length > 0);
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(fakeState.lastTurnStart.prompt, "line one \\d+ \"quoted\" 'single'\nline two");
+  assert.equal(fakeState.lastTurnStart.effort, "low");
+  assert.equal(fakeState.lastTurnStart.model, "gpt-5.6-sol");
+  const status = run("node", [SCRIPT, "status", out.job.id, "--json"], { cwd: repo, env: buildEnv(binDir) });
+  assert.equal(JSON.parse(status.stdout).job.status, "completed");
+});
+
+test("task --await exits 3 with a resumable hint when the await timeout elapses", () => {
+  const repo = seededRepo();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const env = buildEnv(binDir, { FAKE_CODEX_TURN_DELAY_MS: "3000" });
+  const result = run("node", [SCRIPT, "task", "--await", "--await-timeout-ms", "500", "--prompt-stdin"], { cwd: repo, env, input: "slow task\n" });
+  assert.equal(result.status, 3);
+  assert.match(result.stdout, /Still running: job task-[A-Za-z0-9_-]+\. Re-run: node .*result task-[A-Za-z0-9_-]+ --wait --timeout-ms 540000/);
+  const jobId = result.stdout.match(/job (task-[A-Za-z0-9_-]+)/)[1];
+
+  const timedOutJson = run("node", [SCRIPT, "result", jobId, "--wait", "--timeout-ms", "100", "--json"], { cwd: repo, env });
+  assert.equal(timedOutJson.status, 3, timedOutJson.stderr);
+  const snapshot = JSON.parse(timedOutJson.stdout);
+  assert.ok(["queued", "running"].includes(snapshot.job.status), snapshot.job.status);
+  assert.match(
+    snapshot.resumeCommand,
+    new RegExp(`^node ".*codex-companion\\.mjs" result ${jobId} --wait --timeout-ms 540000$`)
+  );
+
+  const done = run("node", [SCRIPT, "result", jobId, "--wait", "--timeout-ms", "20000"], { cwd: repo, env });
+  assert.equal(done.status, 0, done.stderr);
+});
+
+test("task rejects --prompt-stdin combined with --args-stdin or --prompt-file", () => {
+  const repo = seededRepo();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const r = run("node", [SCRIPT, "task", "--prompt-stdin", "--args-stdin"], { cwd: repo, env: buildEnv(binDir), input: "x" });
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /--prompt-stdin/);
+});
+
+test("result on a still-running job exits 3 with the wait hint instead of \"No job found\"", () => {
+  const repo = seededRepo();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const env = buildEnv(binDir, { FAKE_CODEX_TURN_DELAY_MS: "3000" });
+  const launch = run("node", [SCRIPT, "task", "--background", "--json", "--prompt-stdin"], {
+    cwd: repo, env, input: "slow background task\n"
+  });
+  assert.equal(launch.status, 0, launch.stderr);
+  const { jobId } = JSON.parse(launch.stdout);
+
+  const active = run("node", [SCRIPT, "result", jobId], { cwd: repo, env });
+  assert.equal(active.status, 3, active.stderr);
+  assert.match(
+    active.stdout,
+    new RegExp(`Job ${jobId} is still (queued|running)\\. Re-run: node .*result ${jobId} --wait --timeout-ms 540000`)
+  );
+
+  const done = run("node", [SCRIPT, "result", jobId, "--wait", "--timeout-ms", "20000"], { cwd: repo, env });
+  assert.equal(done.status, 0, done.stderr);
+  assert.ok(done.stdout.trim().length > 0);
+});
+
+test("task usage errors around --prompt-stdin arrive without waiting for stdin", async () => {
+  const repo = seededRepo();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const cases = [
+    [["--prompt-stdin", "--args-stdin"], /--prompt-stdin cannot be combined with --args-stdin/],
+    [["--prompt-stdin", "--await", "--background"], /Choose either --await or --background/]
+  ];
+
+  for (const [args, pattern] of cases) {
+    const startedAt = Date.now();
+    const child = spawn("node", [SCRIPT, "task", ...args], {
+      cwd: repo,
+      env: buildEnv(binDir),
+      stdio: ["pipe", "pipe", "pipe"]
+    });
+    let stderr = "";
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
+    // stdin stays open and empty: the error must not wait for EOF.
+    const code = await new Promise((resolve, reject) => {
+      child.on("error", reject);
+      child.on("exit", resolve);
+    });
+    child.stdin.destroy();
+
+    assert.notEqual(code, 0, args.join(" "));
+    assert.match(stderr, pattern, args.join(" "));
+    assert.ok(Date.now() - startedAt < 2000, `${args.join(" ")} took ${Date.now() - startedAt}ms`);
+  }
+});
+
+test("task --prompt-stdin sends the prompt verbatim minus one trailing newline", () => {
+  const repo = seededRepo();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  const promptText = "\n   indented first line   \r\nsecond\tline\n\nlast line without a newline";
+
+  const withNewline = run("node", [SCRIPT, "task", "--prompt-stdin"], {
+    cwd: repo, env: buildEnv(binDir), input: `${promptText}\r\n`
+  });
+  assert.equal(withNewline.status, 0, withNewline.stderr);
+  assert.equal(JSON.parse(fs.readFileSync(statePath, "utf8")).lastTurnStart.prompt, promptText);
+
+  const withoutNewline = run("node", [SCRIPT, "task", "--prompt-stdin"], {
+    cwd: repo, env: buildEnv(binDir), input: promptText
+  });
+  assert.equal(withoutNewline.status, 0, withoutNewline.stderr);
+  assert.equal(JSON.parse(fs.readFileSync(statePath, "utf8")).lastTurnStart.prompt, promptText);
+});
+
+test("task rejects contradictory await and prompt flag combinations", () => {
+  const repo = seededRepo();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const cases = [
+    [["--prompt-stdin", "inline prompt text"], /--prompt-stdin cannot be combined with --prompt-file or prompt text/],
+    [["--prompt-stdin", "--prompt-file", "prompt.txt"], /--prompt-stdin cannot be combined with --prompt-file or prompt text/],
+    [["--await", "--background", "do it"], /Choose either --await or --background/],
+    [["--await-timeout-ms", "1000", "do it"], /--await-timeout-ms requires --await/],
+    [["--await", "--await-timeout-ms", "0", "do it"], /--await-timeout-ms expects a positive integer/],
+    [["--await", "--await-timeout-ms", "-5", "do it"], /--await-timeout-ms expects a positive integer/],
+    [["--await", "--await-timeout-ms", "1.5", "do it"], /--await-timeout-ms expects a positive integer/],
+    [["--await", "--await-timeout-ms", "nope", "do it"], /--await-timeout-ms expects a positive integer/],
+    [["--await", "--await-timeout-ms", "1e400", "do it"], /--await-timeout-ms expects a positive integer/]
+  ];
+
+  for (const [args, pattern] of cases) {
+    const result = run("node", [SCRIPT, "task", ...args], { cwd: repo, env: buildEnv(binDir), input: "" });
+    assert.notEqual(result.status, 0, args.join(" "));
+    assert.match(result.stderr, pattern, args.join(" "));
+  }
+
+  const badResultTimeout = run("node", [SCRIPT, "result", "task-x", "--wait", "--timeout-ms", "0"], {
+    cwd: repo, env: buildEnv(binDir)
+  });
+  assert.notEqual(badResultTimeout.status, 0);
+  assert.match(badResultTimeout.stderr, /--timeout-ms expects a positive integer/);
+
+  const missingWaitTimeout = run("node", [SCRIPT, "result", "task-x", "--timeout-ms", "1000"], {
+    cwd: repo, env: buildEnv(binDir)
+  });
+  assert.notEqual(missingWaitTimeout.status, 0);
+  assert.match(missingWaitTimeout.stderr, /--timeout-ms requires --wait/);
+});
+
+test("task --await reports a failed job with exit 1 while result stays exit 0", () => {
+  const repo = seededRepo();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "turn-start-fails");
+
+  const awaited = run("node", [SCRIPT, "task", "--await", "--json", "--prompt-stdin"], {
+    cwd: repo, env: buildEnv(binDir), input: "break on purpose\n"
+  });
+  assert.equal(awaited.status, 1, awaited.stderr);
+  const out = JSON.parse(awaited.stdout);
+  assert.equal(out.job.status, "failed");
+  assert.match(out.storedJob.errorMessage, /turn\/start failed after thread resolution/);
+
+  const stored = run("node", [SCRIPT, "result", out.job.id], { cwd: repo, env: buildEnv(binDir) });
+  assert.equal(stored.status, 0, stored.stderr);
+  assert.match(stored.stdout, /turn\/start failed after thread resolution/);
+});
+
+test("cancelling an awaited job ends the await with exit 1 and leaves a readable result", async () => {
+  const repo = seededRepo();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const env = buildEnv(binDir, { FAKE_CODEX_TURN_DELAY_MS: "6000" });
+
+  const child = spawn("node", [SCRIPT, "task", "--await", "--await-timeout-ms", "30000", "--prompt-stdin"], {
+    cwd: repo,
+    env,
+    stdio: ["pipe", "pipe", "pipe"]
+  });
+  child.stdin.end("cancel me\n");
+  const exited = new Promise((resolve, reject) => {
+    child.on("error", reject);
+    child.on("exit", resolve);
+  });
+
+  const stateFile = path.join(resolveStateDir(repo), "state.json");
+  const jobId = await waitFor(() => {
+    if (!fs.existsSync(stateFile)) {
+      return null;
+    }
+    const job = JSON.parse(fs.readFileSync(stateFile, "utf8")).jobs?.[0];
+    // Wait for the worker to own the record: the turn has to be under way for
+    // the cancel to have a running turn to interrupt.
+    return job && job.status === "running" && job.pid ? job.id : null;
+  }, { timeoutMs: 15000 });
+
+  const cancelled = run("node", [SCRIPT, "cancel", jobId], { cwd: repo, env });
+  assert.equal(cancelled.status, 0, cancelled.stderr);
+  assert.equal(await exited, 1);
+
+  const stored = run("node", [SCRIPT, "result", jobId, "--json"], { cwd: repo, env });
+  assert.equal(stored.status, 0, stored.stderr);
+  assert.equal(JSON.parse(stored.stdout).job.status, "cancelled");
+});
+
+// A turn that never completes used to hang the companion until Claude Code's
+// Bash tool SIGKILLed it, leaving the job "running" and no output at all.
+test("task --turn-timeout-ms interrupts a stalled turn and fails the job with the timeout message", () => {
+  const repo = seededRepo();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  const env = buildEnv(binDir, { FAKE_CODEX_TURN_DELAY_MS: "5000" });
+
+  const started = Date.now();
+  const result = run("node", [SCRIPT, "task", "--turn-timeout-ms", "500", "--json", "stall please"], {
+    cwd: repo,
+    env
+  });
+
+  assert.equal(result.status, 1, result.stderr);
+  assert.ok(Date.now() - started < 5000, "the turn budget must fire long before the fake turn completes");
+  assert.equal(JSON.parse(result.stdout).status, 1);
+
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.ok(fakeState.lastInterrupt, "a timed-out turn must be interrupted, not abandoned");
+
+  const status = run("node", [SCRIPT, "status", "--json"], { cwd: repo, env });
+  assert.equal(status.status, 0, status.stderr);
+  const latest = JSON.parse(status.stdout).latestFinished;
+  assert.equal(latest.status, "failed");
+  assert.match(latest.errorMessage, /turn timed out after 500 ms/);
+});
+
+// `turn/interrupt` returning is not proof the turn stopped: a wedged app-server
+// answers the RPC and keeps going. Writing `failed` right there claims a turn
+// (possibly a `--write` one) is over while it is still editing files, so the
+// timeout waits for the terminal turn notification and says so when it never
+// arrives. `--resume-last` is the path that owns a direct app-server, so
+// closing the connection is what actually kills the runaway turn.
+test("an unacknowledged interrupt is reported and closes a direct app-server", () => {
+  const repo = seededRepo();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+
+  const seeded = run("node", [SCRIPT, "task", "initial task"], { cwd: repo, env: buildEnv(binDir) });
+  assert.equal(seeded.status, 0, seeded.stderr);
+
+  const env = buildEnv(binDir, { FAKE_CODEX_TURN_DELAY_MS: "20000", FAKE_CODEX_IGNORE_INTERRUPT: "1" });
+  const result = run("node", [SCRIPT, "task", "--resume-last", "--turn-timeout-ms", "500", "--json", "stall please"], {
+    cwd: repo,
+    env
+  });
+
+  assert.equal(result.status, 1, result.stderr);
+
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.ok(fakeState.lastInterrupt, "the timed-out turn must still be interrupted");
+  assert.equal(fakeState.clientClosed, true, "a direct app-server must be closed so the runaway turn dies with it");
+
+  const status = run("node", [SCRIPT, "status", "--json"], { cwd: repo, env: buildEnv(binDir) });
+  assert.equal(status.status, 0, status.stderr);
+  const latest = JSON.parse(status.stdout).latestFinished;
+  assert.equal(latest.status, "failed");
+  assert.match(latest.errorMessage, /turn timed out after 500 ms; interrupt not acknowledged/);
+  assert.match(latest.errorMessage, /may still be running in the shared runtime/);
+});
+
+// The other degraded shape: the app-server answers the interrupt and dies before
+// any terminal notification. Nothing can arrive after that, and the acknowledgement
+// window used to be an unref'd timer with no exit awareness — so the companion
+// waited on a promise nothing would settle and could exit before writing the job's
+// terminal record, leaving it `running` forever.
+test("a transport that exits after the interrupt still writes a terminal record", () => {
+  const repo = seededRepo();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+
+  const seeded = run("node", [SCRIPT, "task", "initial task"], { cwd: repo, env: buildEnv(binDir) });
+  assert.equal(seeded.status, 0, seeded.stderr);
+
+  const env = buildEnv(binDir, { FAKE_CODEX_TURN_DELAY_MS: "20000", FAKE_CODEX_EXIT_AFTER_INTERRUPT: "1" });
+  const started = Date.now();
+  const result = run("node", [SCRIPT, "task", "--resume-last", "--turn-timeout-ms", "500", "--json", "stall please"], {
+    cwd: repo,
+    env
+  });
+  const elapsed = Date.now() - started;
+
+  assert.equal(result.status, 1, result.stderr);
+  assert.ok(elapsed < 9000, `a dead transport must end the acknowledgement wait early, took ${elapsed} ms`);
+
+  const status = run("node", [SCRIPT, "status", "--json"], { cwd: repo, env: buildEnv(binDir) });
+  assert.equal(status.status, 0, status.stderr);
+  const latest = JSON.parse(status.stdout).latestFinished;
+  assert.equal(latest.status, "failed", "the job must not be left running");
+  assert.match(latest.errorMessage, /turn timed out after 500 ms; interrupt not acknowledged/);
+});
+
+test("task --turn-timeout-ms survives into the detached background worker", () => {
+  const repo = seededRepo();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const env = buildEnv(binDir, { FAKE_CODEX_TURN_DELAY_MS: "5000" });
+
+  const launched = run("node", [SCRIPT, "task", "--background", "--turn-timeout-ms", "500", "--json", "stall please"], {
+    cwd: repo,
+    env
+  });
+  assert.equal(launched.status, 0, launched.stderr);
+  const { jobId } = JSON.parse(launched.stdout);
+
+  const waited = run("node", [SCRIPT, "status", jobId, "--wait", "--timeout-ms", "20000", "--json"], { cwd: repo, env });
+  assert.equal(waited.status, 0, waited.stderr);
+  const job = JSON.parse(waited.stdout).job;
+  assert.equal(job.status, "failed");
+  assert.match(job.errorMessage, /turn timed out after 500 ms/);
+});
+
+test("task without a turn budget is unbounded", () => {
+  const repo = seededRepo();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+
+  const result = run("node", [SCRIPT, "task", "--json", "take your time"], {
+    cwd: repo,
+    env: buildEnv(binDir, { FAKE_CODEX_TURN_DELAY_MS: "700" })
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(JSON.parse(result.stdout).status, 0);
+});
+
+test("CODEX_TURN_TIMEOUT_MS bounds a turn when no flag is passed", () => {
+  const repo = seededRepo();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+
+  const result = run("node", [SCRIPT, "task", "--json", "stall please"], {
+    cwd: repo,
+    env: buildEnv(binDir, { FAKE_CODEX_TURN_DELAY_MS: "5000", CODEX_TURN_TIMEOUT_MS: "500" })
+  });
+
+  assert.equal(result.status, 1, result.stderr);
+});
+
+test("task rejects a non-positive turn budget", () => {
+  const repo = seededRepo();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+
+  const result = run("node", [SCRIPT, "task", "--turn-timeout-ms", "0", "hi"], { cwd: repo, env: buildEnv(binDir) });
+
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /--turn-timeout-ms expects a positive integer/);
+});
+
+// Recording the worker pid on the queued record (so a queued job can be
+// cancelled at all) means cancel can now kill a worker *before* it consumed its
+// private one-shot payload. A cancelled job is terminal, so the reaper will
+// never look at it again — cancel has to release the file itself.
+test("cancel removes the private request payload of a job killed in the queued window", async (t) => {
+  const repo = seededRepo();
+  const stateDir = resolveStateDir(repo);
+  const jobsDir = path.join(stateDir, "jobs");
+  fs.mkdirSync(jobsDir, { recursive: true });
+
+  const secret = "sk-cancel-secret-value";
+  const requestFile = path.join(jobsDir, "task-queued.request.json");
+  fs.writeFileSync(requestFile, JSON.stringify({ prompt: "hi", config: { auth_header: secret } }), {
+    encoding: "utf8",
+    mode: 0o600
+  });
+
+  const sleeper = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+    cwd: repo,
+    detached: true,
+    stdio: "ignore"
+  });
+  sleeper.unref();
+  t.after(() => {
+    try {
+      process.kill(-sleeper.pid, "SIGKILL");
+    } catch {
+      // Already gone.
+    }
+  });
+
+  const job = {
+    id: "task-queued",
+    status: "queued",
+    phase: "queued",
+    jobClass: "task",
+    title: "Codex Task",
+    background: true,
+    pid: sleeper.pid,
+    logFile: null,
+    requestFile,
+    request: { prompt: "hi", config: { auth_header: "[redacted]" } },
+    createdAt: "2026-03-18T15:30:00.000Z",
+    updatedAt: "2026-03-18T15:30:00.000Z"
+  };
+  fs.writeFileSync(path.join(jobsDir, "task-queued.json"), `${JSON.stringify(job, null, 2)}\n`, "utf8");
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    `${JSON.stringify({ version: 1, config: { stopReviewGate: false }, jobs: [job] }, null, 2)}\n`,
+    "utf8"
+  );
+
+  const cancelled = run("node", [SCRIPT, "cancel", "task-queued", "--json"], { cwd: repo, env: process.env });
+  assert.equal(cancelled.status, 0, cancelled.stderr);
+  assert.equal(JSON.parse(cancelled.stdout).status, "cancelled");
+
+  assert.equal(fs.existsSync(requestFile), false, "the private payload must not outlive the cancelled job");
+  const stored = readPersistedJob(repo, "task-queued");
+  assert.equal(stored.status, "cancelled");
+  assert.equal(stored.requestFile, null);
+  assert.equal(fs.readFileSync(path.join(stateDir, "state.json"), "utf8").includes(secret), false);
 });

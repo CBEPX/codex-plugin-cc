@@ -288,11 +288,40 @@ const rl = readline.createInterface({ input: process.stdin });
 // escalation) so a test can observe the window while a broker is shutting its
 // app-server child down.
 const CLOSE_DELAY_MS = Number(process.env.FAKE_CODEX_CLOSE_DELAY_MS || 0);
+
+// Test knob: hold a plain turn open for this long before completing it, so a
+// test can observe a job that is still running.
+const TURN_DELAY_MS = Number(process.env.FAKE_CODEX_TURN_DELAY_MS || 0);
+
+// Test knob: answer turn/interrupt but keep running the turn, the way a real
+// app-server that has wedged on a tool call does. Also records that the client
+// closed the connection, which is the only thing that stops such a turn.
+const IGNORE_INTERRUPT = process.env.FAKE_CODEX_IGNORE_INTERRUPT === "1";
+if (IGNORE_INTERRUPT) {
+  rl.on("close", () => {
+    const closingState = loadState();
+    closingState.clientClosed = true;
+    saveState(closingState);
+  });
+}
 if (CLOSE_DELAY_MS > 0) {
   process.on("SIGTERM", () => {});
   rl.on("close", () => {
     setTimeout(() => process.exit(0), CLOSE_DELAY_MS);
   });
+}
+
+// Test knob: exit the moment the interrupt is answered and never send the
+// turn's terminal notification, the way an app-server that dies (or is killed)
+// mid-turn does.
+const EXIT_AFTER_INTERRUPT = process.env.FAKE_CODEX_EXIT_AFTER_INTERRUPT === "1";
+
+// Test knob: an app-server that survives stdin EOF and ignores SIGTERM, so only
+// SIGKILL can end it. The interval is what keeps the process alive once stdin
+// is gone.
+if (process.env.FAKE_CODEX_IGNORE_SIGTERM === "1") {
+  process.on("SIGTERM", () => {});
+  setInterval(() => {}, 1000);
 }
 
 rl.on("line", (line) => {
@@ -611,7 +640,12 @@ rl.on("line", (line) => {
           }
         ];
 
-	        if (BEHAVIOR === "interruptible-slow-task") {
+	        // Any held-open turn is interruptible: an unregistered timer would fire
+	        // after a turn/interrupt and complete a turn the client already cancelled.
+	        const heldTurnDelayMs = BEHAVIOR === "interruptible-slow-task" ? 5000 : TURN_DELAY_MS;
+	        if (BEHAVIOR === "slow-task") {
+	          emitTurnCompletedLater(thread.id, turnId, items, 400);
+	        } else if (heldTurnDelayMs > 0) {
 	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
 	          const timer = setTimeout(() => {
 	            if (!interruptibleTurns.has(turnId)) {
@@ -624,10 +658,8 @@ rl.on("line", (line) => {
 	              }
 	            }
 	            send({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(turnId, "completed") } });
-	          }, 5000);
+	          }, heldTurnDelayMs);
 	          interruptibleTurns.set(turnId, { threadId: thread.id, timer });
-	        } else if (BEHAVIOR === "slow-task") {
-	          emitTurnCompletedLater(thread.id, turnId, items, 400);
 	        } else {
 	          emitTurnCompleted(thread.id, turnId, items);
 	        }
@@ -640,7 +672,12 @@ rl.on("line", (line) => {
 	          turnId: message.params.turnId
 	        };
 	        saveState(state);
-	        const pending = interruptibleTurns.get(message.params.turnId);
+	        if (EXIT_AFTER_INTERRUPT) {
+	          send({ id: message.id, result: {} });
+	          setTimeout(() => process.exit(0), 10);
+	          break;
+	        }
+	        const pending = IGNORE_INTERRUPT ? null : interruptibleTurns.get(message.params.turnId);
 	        if (pending) {
 	          clearTimeout(pending.timer);
 	          interruptibleTurns.delete(message.params.turnId);

@@ -163,8 +163,14 @@ Ask Codex to redesign the database connection to be more resilient.
 - if you do not pass `--model` or `--effort`, Codex chooses its own defaults.
 - `--effort` accepts `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, and `ultra`. Which of those a given model actually supports is decided by Codex, not by the plugin — run `codex debug models` to see the reasoning levels each model advertises.
 - model aliases: `spark` -> `gpt-5.3-codex-spark`, `sol` -> `gpt-5.6-sol`, `luna` -> `gpt-5.6-luna`, `terra` -> `gpt-5.6-terra`, `mini` -> `gpt-5.4-mini`
-- `--config key=value` (repeatable, also on `/codex:review` and `/codex:adversarial-review`) forwards a `config.toml` override to the Codex thread, e.g. `--config model_provider=ollama`. On `--resume-last` the plugin opens a fresh app-server session (cold resume) so `--config` overrides, sandbox and approval policy take effect; model and effort for the resumed turn are sent on the turn, never on the resume request.
+- `--config key=value` (repeatable, also on `/codex:review` and `/codex:adversarial-review`) forwards a `config.toml` override to the Codex thread, e.g. `--config model_provider=ollama`. On `--resume-last` the plugin opens a fresh app-server session (cold resume) so `--config` overrides, sandbox and approval policy take effect; model and effort for the resumed turn are sent on the turn, never on the resume request. In a `--background`/`--await` job record the config **keys** are recorded and the **values** are never stored (they read back as `[redacted]` in `status`/`result`): the real values live only in the job's private 0600 `jobs/<id>.request.json`, which the worker consumes and deletes.
 - follow-up rescue requests can continue the latest Codex task in the repo
+- under the hood, `/codex:rescue` and the `codex-rescue` agent are each a single `scripts/codex-companion.mjs task --await --prompt-stdin <flags>` call: `--await [--await-timeout-ms <ms>]` launches the same tracked background job as `--background`, then waits for it (default 540000 ms), and `--prompt-stdin` reads the prompt as stdin verbatim (so it cannot be combined with `--args-stdin`, `--prompt-file`, or prompt text on the command line). Exit code is 0 when the job completed, 1 when it failed or was cancelled, and 3 when the wait times out while the job is still queued or running — exit 3 prints a `Re-run: node "<abs>" result <id> --wait --timeout-ms 540000` hint, which is the only follow-up call the rescue flow makes.
+- `result <id> [--wait [--timeout-ms <ms>]]` answers a different question, so it has its own contract: `result` exits 0 for any terminal record (completed, failed or cancelled) and 3 while the job is still active. Its exit code means "a result was retrieved", not "the job succeeded" — unlike `task --await` it never returns 1 for a failed job, so read the rendered record for the outcome. A plain `result <id>` on a still-running job prints the same `--wait` hint and exits 3 instead of failing (fixes upstream #498/#524, which reported "No job found" for a running job). `--json` on either returns `{ job, storedJob }` (or, on a timeout, the `status --json` snapshot plus a `resumeCommand` field).
+- The detached worker outlives the companion only when the companion returns on its own (exit 3); a host process-tree kill — e.g. Claude Code's Bash timeout — also kills the worker, so keep `--await-timeout-ms` below the host limit (default 540000 < 600000).
+- `--turn-timeout-ms <ms>` (or `CODEX_TURN_TIMEOUT_MS`, also on `/codex:review` and `/codex:adversarial-review`) bounds a single Codex turn: on expiry it interrupts the turn and returns a structured failed result ("turn timed out after `<ms>` ms") instead of hanging. Default is `0` (unbounded). The budget travels with a `--background`/`--await` job, so a detached worker enforces it too. The interrupt is not trusted on its own: the run waits up to 10 s for the turn's terminal notification, and if none arrives the failure says so ("interrupt not acknowledged — the turn may still be running in the shared runtime, check status or cancel"), because a shared broker runtime can keep executing a turn nobody is listening to any more. A run that owns its own app-server (a cold `--resume-last`) closes it in that case, which does stop the turn (stdin EOF, then `SIGTERM`, then `SIGKILL`, so the close is bounded too). Partial output on a timed-out turn is best-effort: only whole items Codex had already completed are kept, so a turn interrupted mid-message reports less text than Codex had produced.
+- the `SessionEnd` hook works to one absolute budget (`SESSION_END_BUDGET_MS`, 12 s; `CODEX_COMPANION_SESSION_END_BUDGET_MS` can only *shorten* it — a larger value is ignored with a note, since the hook timeout is fixed), and every bounded step inside it — the workspace state lock, each broker handshake, the busy retries, the teardown probe — is clamped to what is left of that budget. `hooks/hooks.json` gives `SessionEnd` a 15 s timeout, which must stay **above** the budget: below it Claude Code would kill the hook mid-decision instead of letting it report one. A test asserts the pair, so the two numbers cannot drift apart.
+- if a background job's session ends while `CODEX_COMPANION_BROKER_IDLE_TIMEOUT_MS=0`, the shared broker that keeps running for that job never self-terminates on its own — its normal idle exit is disabled in that configuration, so the broker only goes away once the job finishes (or is reaped as dead) and a later `SessionEnd` runs.
 
 ### `/codex:transfer`
 
@@ -208,7 +214,11 @@ Examples:
 ```bash
 /codex:result
 /codex:result task-abc123
+/codex:result task-abc123 --wait
+/codex:result task-abc123 --wait --timeout-ms 60000
 ```
+
+On a job that already has a terminal record (completed, failed, or cancelled), `/codex:result` exits 0 and shows it — the exit code reports that a result was retrieved, not whether the job succeeded. On a job that is still queued or running, a plain `/codex:result <id>` prints a `Re-run: … result <id> --wait` hint and exits 3 instead of failing; add `--wait [--timeout-ms <ms>]` (default 540000 ms) to block until the job reaches a terminal status instead of returning immediately. `--json` returns `{ job, storedJob }` (or, on a `--wait` timeout, the `status --json` snapshot plus a `resumeCommand` field).
 
 ### `/codex:cancel`
 
@@ -327,6 +337,27 @@ That means:
 ### Will it use the same Codex config I already have?
 
 Yes. If you already use Codex, the plugin picks up the same [configuration](#common-configurations).
+
+### A command failed with "Timed out … waiting for the Codex state lock"
+
+Every write to this workspace's job state is serialized by a ticket lock: each
+command takes a numbered ticket in `state.lock.d/` and waits for the tickets ahead
+of it. A ticket whose process is gone is cleared automatically, so a crash never
+wedges the workspace. A ticket whose process is still *running* is never taken
+away — a slow writer and a stuck one look the same from outside, and taking the
+lock from a process that is mid-write is how state gets corrupted — so the error
+names that PID and the exact ticket file. If that process really is stuck, stop it
+and the next command goes through; if the PID belongs to something unrelated (PID
+reuse), delete the ticket file the error names.
+
+### A command failed with a raw `EACCES` or `EIO` from the state directory
+
+The same lock refuses to guess. If a ticket in `state.lock.d/` cannot be listed,
+read or `stat`ed, the command fails with that error instead of assuming the entry
+is absent or abandoned — guessing there is what would let two commands write the
+job state at once. Fix the permissions on the state directory (or remove the entry
+the error names, once you know no Codex command is using it) and the next command
+goes through.
 
 ### Can I keep using my current API key or base URL setup?
 

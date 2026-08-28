@@ -1,7 +1,11 @@
+import net from "node:net";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { AppServerClientBase } from "../plugins/codex/scripts/lib/app-server.mjs";
+import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
+import { makeTempDir } from "./helpers.mjs";
+import { AppServerClientBase, CodexAppServerClient } from "../plugins/codex/scripts/lib/app-server.mjs";
+import { createBrokerEndpoint, parseBrokerEndpoint } from "../plugins/codex/scripts/lib/broker-endpoint.mjs";
 
 /** Minimal client that records the JSON-RPC messages it would send. */
 class CapturingClient extends AppServerClientBase {
@@ -88,4 +92,87 @@ test("permission approval requests grant nothing for the turn", () => {
     params: { threadId: "t1", permissions: { network: { enabled: true } } }
   });
   assert.deepEqual(client.sent, [{ id: 25, result: { permissions: {}, scope: "turn" } }]);
+});
+
+// `close()` is what the turn timeout uses to kill a runaway turn on a transport
+// it owns, so it must never become the second hang: an app-server that ignores
+// SIGTERM (or is wedged in a tool call) used to leave it awaiting process exit
+// forever. TERM, then KILL, then give up on the process rather than the caller.
+test("close() bounds an app-server that ignores SIGTERM", { timeout: 8000 }, async (t) => {
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const client = await CodexAppServerClient.connect(binDir, {
+    disableBroker: true,
+    env: buildEnv(binDir, { FAKE_CODEX_IGNORE_SIGTERM: "1" })
+  });
+  t.after(() => {
+    try {
+      client.proc.kill("SIGKILL");
+    } catch {
+      // Already gone, which is the point of the test.
+    }
+  });
+
+  const started = Date.now();
+  await client.close();
+  const elapsed = Date.now() - started;
+
+  assert.ok(elapsed < 6000, `close() must be bounded, took ${elapsed} ms`);
+  assert.equal(client.proc.signalCode, "SIGKILL", "a SIGTERM-immune app-server must be killed outright");
+});
+
+// The bound only ever applied to the first call: a second one took the "already
+// closed" branch and awaited the raw process-exit promise with no deadline at
+// all. The turn timeout always closes twice — `failTurnOnTimeout` closes the
+// runaway app-server, then `withAppServer` closes it again on the way out — so
+// the one case the deadline exists for is exactly the case that hung.
+test("close() stays bounded when it is called twice", { timeout: 15000 }, async (t) => {
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const client = await CodexAppServerClient.connect(binDir, {
+    disableBroker: true,
+    env: buildEnv(binDir, { FAKE_CODEX_IGNORE_SIGTERM: "1" })
+  });
+  const childPid = client.proc.pid;
+  t.after(() => {
+    try {
+      process.kill(childPid, "SIGKILL");
+    } catch {
+      // Already gone.
+    }
+  });
+  // A child nothing can kill: the fixture ignores SIGTERM and stdin EOF, and
+  // swallowing the signals means even the SIGKILL escalation never lands.
+  client.proc.kill = () => true;
+
+  await client.close();
+  const started = Date.now();
+  await client.close();
+
+  assert.ok(Date.now() - started < 1000, `a repeated close must not wait again, took ${Date.now() - started} ms`);
+  assert.equal(client.proc.exitCode, null, "the test needs a child that never exits");
+});
+
+// The broker can be tearing down at the exact moment a background job dials it:
+// the connection is accepted and then dropped before `initialize` is answered.
+// That is a race, not a failure — the job must go on with its own app-server.
+test("a broker that drops the connection during initialize falls back to a direct app-server", async (t) => {
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const sessionDir = makeTempDir("cxc-");
+  const endpoint = createBrokerEndpoint(sessionDir);
+  const stub = net.createServer((socket) => socket.destroy());
+  await new Promise((resolve, reject) => {
+    stub.once("error", reject);
+    stub.listen(parseBrokerEndpoint(endpoint).path, resolve);
+  });
+
+  let client = null;
+  t.after(async () => {
+    await client?.close();
+    stub.close();
+  });
+
+  client = await CodexAppServerClient.connect(binDir, { brokerEndpoint: endpoint, env: buildEnv(binDir) });
+  assert.equal(client.transport, "direct", "a broker that hangs up must not fail the run");
 });

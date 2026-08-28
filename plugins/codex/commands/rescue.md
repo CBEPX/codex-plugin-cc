@@ -1,7 +1,7 @@
 ---
 description: Delegate investigation, an explicit fix request, or follow-up rescue work to the Codex rescue subagent
-argument-hint: "[--background|--wait] [--resume|--fresh] [--model <model|spark|sol|luna|terra|mini>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [--config key=value]... [what Codex should investigate, solve, or continue]"
-allowed-tools: Bash, AskUserQuestion, Agent
+argument-hint: "[--background] [--resume|--fresh] [--model <model|spark|sol|luna|terra|mini>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [--turn-timeout-ms <ms>] [--config key=value]... [what Codex should investigate, solve, or continue]"
+allowed-tools: Bash(node:*), AskUserQuestion, Agent
 ---
 
 Delegate the request to Codex through the shared companion runtime. Default is synchronous: the user gets Codex's answer in this turn.
@@ -9,45 +9,20 @@ Delegate the request to Codex through the shared companion runtime. Default is s
 Raw slash-command arguments:
 `$ARGUMENTS`
 
-If the request contains `--background`, skip directly to step 3 — steps 1 and 2 are the default synchronous path and do not run for a `--background` request.
+Strip `--background`, `--wait`, `--resume`, and `--fresh` out of `<flags>` before the Bash call below — they are routing controls Claude Code consumes here, not `task` flags forwarded to the script.
 
-1. Strip `--wait` if present (it is the default). If the request contains `--resume`, use `task --resume-last`; if `--fresh`, use a fresh `task`. Otherwise run `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task-resume-candidate --json`: when it reports no resumable thread, start a fresh `task`; when it reports one, ask with `AskUserQuestion` exactly once before choosing — options `Continue current Codex thread` (use `task --resume-last`) and `Start a new Codex thread` (use a fresh `task`). Resuming silently would append this request to an unrelated earlier thread, so never pick `--resume-last` on your own. Pass `--model`, `--effort` and every `--config key=value` through unchanged. Never add `--write` unless the user explicitly asked Codex to modify files.
-
-2. Launch the job, then wait for it — two separate Bash calls, in ≤9-minute wait slices so the Bash tool's 10-minute cap never kills a long run. Bash calls share no variables — always set `JOB=<id>` literally at the top of every later call; never rely on a `$JOB` left over from a previous call.
-
-The request prose and the runtime flags travel in two separate channels of the same Bash call: the prose is written byte-exact to `$PROMPT` by its own quoted heredoc and passed as `--prompt-file`, while the `--args-stdin` heredoc carries only the runtime flags (`--model`, `--effort`, `--config key=value`, `--resume-last`, `--write` as applicable). Never put the request text in the flags heredoc: it is tokenized, so quotes, backslashes and newlines in a stack trace, a regex or a code block would be mangled. Give both heredoc delimiters a fresh random suffix on every call — `CODEX_PROMPT_<random>` / `CODEX_ARGS_<random>`, e.g. 8 hex characters — and never reuse a suffix that appears in the request text: a payload line equal to the delimiter would end the heredoc early and run the rest on the host shell.
-
-2a. Launch (one Bash call):
-
+1. If the request contains `--resume`, use `--resume-last`; if `--fresh`, use a fresh task. Otherwise run `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task-resume-candidate --json`: when it reports a resumable thread ask ONCE with `AskUserQuestion` — `Continue current Codex thread` (→ `--resume-last`) / `Start a new Codex thread` (→ fresh) — otherwise fresh. This decision is made here for BOTH the synchronous and the `--background` path. Pass `--model`, `--effort`, `--config key=value` through; never add `--write` unless the user explicitly asked Codex to modify files.
+2. Synchronous path (default): ONE Bash call (`timeout: 600000`); flags on the command line, the request prose in a quoted heredoc whose delimiter is `CODEX_PROMPT_` + 8 fresh random hex chars that do not appear as an exact line in the request:
 ```bash
-trap 'command rm -f -- "$ERR" "$OUT" "$PROMPT"' EXIT
-ERR=$(mktemp); PROMPT=$(mktemp)
-cat > "$PROMPT" <<'CODEX_PROMPT_<random>'
+node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task --await --prompt-stdin <flags> <<'CODEX_PROMPT_<random>'
 <request text>
 CODEX_PROMPT_<random>
-JOB=$(node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task --background --json --prompt-file "$PROMPT" --args-stdin <<'CODEX_ARGS_<random>' 2>"$ERR" | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{process.stdout.write(JSON.parse(d).jobId||"")}catch(e){}})'
-<flags>
-CODEX_ARGS_<random>
-)
-[ -n "$JOB" ] || { cat "$ERR"; exit 1; }
-[[ "$JOB" =~ ^[A-Za-z0-9_-]+$ ]] || { echo "invalid job id"; exit 1; }
-echo "JOB=$JOB"
 ```
-If this call exits non-zero, its output is the launch failure (Codex missing, unauthenticated, a bad flag, etc.) — show it to the user verbatim and stop; never report "no result". Otherwise its last line is `JOB=<id>`; read `<id>` from it.
+Exit 0 → show the output verbatim, then your assessment. Exit 3 → the output ends with a `Re-run:` line — run exactly that line (again `timeout: 600000`) until it exits 0; its output is the final job record: if it shows the job completed, show the Codex result verbatim and add your assessment; if it shows failed or cancelled, show the output verbatim and stop. Exit 1 from the first call → the job failed or was cancelled: show the output verbatim and stop.
+3. `--background`: invoke the `Agent` tool with `codex:codex-rescue`, passing the request minus `--background` PLUS the explicit `--resume-last` or `--fresh` decided in step 1; tell the user the result arrives as a completion notification and via `/codex:status` / `/codex:result <id>`.
 
-2b. Wait and fetch the result (one Bash call, tool `timeout: 600000`). Set `JOB=<id>` literally as the first line, using the id you just read from 2a:
+Never reuse a delimiter suffix that appears as an exact line in the request: a payload line equal to it would end the heredoc early and run the rest on the host shell.
 
-```bash
-trap 'command rm -f -- "$ERR" "$OUT" "$PROMPT"' EXIT
-JOB=<id>
-[[ "$JOB" =~ ^[A-Za-z0-9_-]+$ ]] || { echo "invalid job id"; exit 1; }
-OUT=$(mktemp); ERR=$(mktemp)
-while node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" status "$JOB" --wait --timeout-ms 540000 --json >"$OUT" 2>"$ERR"; node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{const s=(JSON.parse(d).job||{}).status;process.exit(s==="queued"||s==="running"?3:(s?0:2))}catch(e){process.exit(2)}})' < "$OUT"; rc=$?; [ "$rc" -eq 3 ]; do sleep 1; done
-[ "$rc" -eq 0 ] || { cat "$OUT" "$ERR"; exit "$rc"; }
-node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" result "$JOB"
-```
-The status check exits 3 while the job is still `queued`/`running` (loop — `sleep 1` keeps a fast exit-3 from spinning hot), 0 once the job reaches a terminal status, or 2 if the status output was empty or unparseable; either non-3 outcome ends the loop. If this Bash call is itself cut off by the tool's own timeout before the loop finishes, the job keeps running server-side — run 2b again with the same literal `JOB=<id>` line. If it exits non-zero, show its output verbatim and stop; never report "no result". Otherwise show the `result` output to the user verbatim, then add your own assessment.
-
-3. Only when the request contains `--background`: invoke the `codex:codex-rescue` subagent via the `Agent` tool (`subagent_type: "codex:codex-rescue"`, prompt = the raw request minus `--background`) and tell the user the job id will arrive as a completion notification; they can also run `/codex:status` and `/codex:result <job-id>`.
+`<flags>` may contain only bare tokens — `--model <name>`, `--effort <level>`, `--turn-timeout-ms <ms>`, `--config key=value` with a literal value, `--resume-last`/`--fresh`, `--write`. If any flag value contains `$`, a backtick, a quote, `;`, `&`, `|`, or a newline, drop it and mention it in the prose instead; never place it on the command line.
 
 Do not call `Skill(codex:rescue)` from here (it re-enters this command). If any Bash step exits non-zero, show its stderr to the user — never report "no result".

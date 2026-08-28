@@ -27,10 +27,15 @@ export async function waitForBrokerEndpoint(endpoint, timeoutMs = 2000) {
   while (Date.now() - start < timeoutMs) {
     const ready = await new Promise((resolve) => {
       const socket = connectToEndpoint(endpoint);
+      let connected = false;
       socket.on("connect", () => {
+        connected = true;
         socket.end();
-        resolve(true);
       });
+      // Report ready only once the probe connection is fully closed. A probe the
+      // broker still sees as open is a phantom client: it holds off the idle
+      // timer and makes the broker refuse a shutdown.
+      socket.on("close", () => resolve(connected));
       socket.on("error", () => resolve(false));
     });
     if (ready) {
@@ -41,19 +46,63 @@ export async function waitForBrokerEndpoint(endpoint, timeoutMs = 2000) {
   return false;
 }
 
-export async function sendBrokerShutdown(endpoint) {
-  await new Promise((resolve) => {
+const SHUTDOWN_REQUEST_ID = 1;
+// A broker that has not answered by now is not going to: the handshake is one
+// round trip to a local socket. Without this bound a peer that connects and
+// stays silent blocks the SessionEnd hook forever.
+const SHUTDOWN_HANDSHAKE_MS = 5000;
+
+// Three answers, not two:
+//   `false` — the broker said it is idle, or it is gone (connection error, or the
+//             socket closed without answering): the caller must clean up after it.
+//   `true`  — the broker refused because another client is still using it.
+//   `null`  — nothing usable came back before the deadline, or the reply was not
+//             parsable JSONL. The caller cannot prove the broker is idle, so it
+//             must leave it alone.
+// The reply is framed by newline and matched by request id: a socket is a byte
+// stream, and parsing whatever a single `data` event happened to carry turned a
+// split `{"busy":true}` into "not busy" — a broker destroyed under a live turn.
+export async function sendBrokerShutdown(endpoint, { timeoutMs = SHUTDOWN_HANDSHAKE_MS } = {}) {
+  return await new Promise((resolve) => {
     const socket = connectToEndpoint(endpoint);
     socket.setEncoding("utf8");
+    let buffer = "";
+    const finish = (busy) => {
+      clearTimeout(deadline);
+      socket.destroy();
+      resolve({ busy });
+    };
+    const deadline = setTimeout(() => finish(null), timeoutMs);
+
     socket.on("connect", () => {
-      socket.write(`${JSON.stringify({ id: 1, method: "broker/shutdown", params: {} })}\n`);
+      socket.write(`${JSON.stringify({ id: SHUTDOWN_REQUEST_ID, method: "broker/shutdown", params: {} })}\n`);
     });
-    socket.on("data", () => {
-      socket.end();
-      resolve();
+    socket.on("data", (chunk) => {
+      buffer += chunk;
+      let newlineIndex = buffer.indexOf("\n");
+      while (newlineIndex !== -1) {
+        const line = buffer.slice(0, newlineIndex);
+        buffer = buffer.slice(newlineIndex + 1);
+        newlineIndex = buffer.indexOf("\n");
+        if (!line.trim()) {
+          continue;
+        }
+        let message;
+        try {
+          message = JSON.parse(line);
+        } catch {
+          finish(null);
+          return;
+        }
+        if (message.id !== SHUTDOWN_REQUEST_ID) {
+          continue;
+        }
+        finish(message.result?.busy === true);
+        return;
+      }
     });
-    socket.on("error", resolve);
-    socket.on("close", resolve);
+    socket.on("error", () => finish(false));
+    socket.on("close", () => finish(false));
   });
 }
 
@@ -176,21 +225,26 @@ export async function ensureBrokerSession(cwd, options = {}) {
 // record behind long enough for the OS to hand the PID — and with it the process
 // group `terminateProcessTree` kills — to something unrelated. Windows has no
 // cheap equivalent probe, so it keeps the previous unconditional behavior.
-function ownsBrokerProcess(pid, endpoint) {
+function ownsBrokerProcess(pid, endpoint, timeoutMs) {
   if (process.platform === "win32") {
     return true;
   }
-  const commandLine = processCommandLine(pid);
+  const commandLine = processCommandLine(pid, { timeoutMs });
   if (!commandLine || !commandLine.includes("app-server-broker.mjs")) {
     return false;
   }
   return !endpoint || commandLine.includes(endpoint);
 }
 
-export function teardownBrokerSession({ endpoint = null, pidFile, logFile, sessionDir = null, pid = null, killProcess = null }) {
-  if (Number.isFinite(pid) && killProcess && ownsBrokerProcess(pid, endpoint)) {
+// Reports whether the recorded process was actually signalled: a PID that no
+// longer looks like this broker is deliberately left alone, and a caller that
+// wonders why a broker outlived its teardown needs to know which it was.
+export function teardownBrokerSession({ endpoint = null, pidFile, logFile, sessionDir = null, pid = null, killProcess = null, timeoutMs = undefined }) {
+  let signalled = false;
+  if (Number.isFinite(pid) && killProcess && ownsBrokerProcess(pid, endpoint, timeoutMs)) {
     try {
       killProcess(pid);
+      signalled = true;
     } catch {
       // Ignore missing or already-exited broker processes.
     }
@@ -223,4 +277,6 @@ export function teardownBrokerSession({ endpoint = null, pidFile, logFile, sessi
       // Ignore non-empty or missing directories.
     }
   }
+
+  return { signalled };
 }

@@ -1,0 +1,66 @@
+name: Verify release
+
+# Mirrors the release gate of CBEPX/cc-plugin-codex (publish.yml) minus the npm
+# publish step: this plugin is installed from the repository through
+# .claude-plugin/marketplace.json, so a release only needs to be verified.
+
+on:
+  release:
+    types:
+      - published
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref to verify
+        required: false
+        default: main
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out release ref
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.ref || github.ref_name }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Codex CLI
+        run: npm install -g @openai/codex
+
+      - name: Codex version
+        run: codex --version
+
+      - name: Version metadata matches the tag
+        run: npm run check-version
+
+      - name: Run test suite
+        run: npm test
+
+      - name: No leaked test processes
+        run: |
+          sleep 10
+          if pgrep -f codex-plugin-test- ; then echo "leaked test processes" >&2; exit 1; fi
+
+      - name: Run build
+        run: npm run build
+
+      - name: Runtime dependency audit
+        run: npm audit --omit=dev
+
+      - name: Pack (dry run)
+        run: npm pack --dry-run

@@ -45,6 +45,7 @@ import { BROKER_BUSY_RPC_CODE, BROKER_ENDPOINT_ENV, CodexAppServerClient } from 
 import { loadBrokerSession } from "./broker-lifecycle.mjs";
 import { binaryAvailable } from "./process.mjs";
 import { listJobs } from "./state.mjs";
+import { reapDeadJobs } from "./tracked-jobs.mjs";
 
 const SERVICE_NAME = "claude_code_codex_plugin";
 const TASK_THREAD_PREFIX = "Codex Companion Task";
@@ -609,9 +610,112 @@ function applyTurnNotification(state, message) {
   }
 }
 
+export const TURN_TIMEOUT_ENV = "CODEX_TURN_TIMEOUT_MS";
+
+// Client-side per-turn budget: `--turn-timeout-ms` > `CODEX_TURN_TIMEOUT_MS` >
+// unbounded. `TurnStartParams` has no timeout field, so this never rides on the
+// app-server RPC. Read at call time, not import time, so a value the companion
+// sets after this module was loaded still takes effect.
+export function resolveTurnTimeoutMs(value = null) {
+  const fromOption = Number(value);
+  if (Number.isFinite(fromOption) && fromOption > 0) {
+    return fromOption;
+  }
+  const fromEnv = Number(process.env[TURN_TIMEOUT_ENV]);
+  return Number.isFinite(fromEnv) && fromEnv > 0 ? fromEnv : 0;
+}
+
+// How long the interrupt may take before the turn is failed anyway: the app
+// server is already misbehaving, so this must never become a second hang.
+const TURN_INTERRUPT_GRACE_MS = 2000;
+
+// How long the turn's own terminal notification (`turn/completed`, whatever
+// status it carries) may take after the interrupt. Answering `turn/interrupt`
+// proves nothing: only that notification proves the runtime stopped the turn.
+const TURN_INTERRUPT_ACK_MS = 10000;
+
+// Resolves true once the turn reached a terminal notification (which is what
+// runs `completeTurn`), false if the runtime stayed silent for the whole window
+// or died without sending one.
+function waitForTurnAcknowledgement(client, state, timeoutMs) {
+  if (state.completed) {
+    return Promise.resolve(true);
+  }
+  let timer = null;
+  return Promise.race([
+    state.completion.then(() => true),
+    // A transport that is gone is an answer too: no notification can follow it,
+    // so waiting out the rest of the window would only delay the terminal record.
+    client.exitPromise.then(() => state.completed),
+    new Promise((resolve) => {
+      // Deliberately referenced: this timer is the only thing keeping the process
+      // alive once a dead transport has released its handles, and the job still
+      // has to be written terminal before we exit.
+      timer = setTimeout(() => resolve(false), timeoutMs);
+    })
+  ]).finally(() => {
+    if (timer) {
+      clearTimeout(timer);
+    }
+  });
+}
+
+// A timed-out turn is resolved as a normal failed turn — never thrown — so the
+// caller still gets its partial output, the job record still gets a result, and
+// the message reaches stdout instead of only stderr.
+async function failTurnOnTimeout(client, state, timeoutMs) {
+  if (state.completed) {
+    return;
+  }
+  const timeoutMessage = `turn timed out after ${timeoutMs} ms`;
+  state.error = { message: timeoutMessage };
+  emitProgress(state.onProgress, `Turn timed out after ${timeoutMs} ms; interrupting.`, "failed");
+
+  if (state.turnId) {
+    let graceTimer = null;
+    try {
+      await Promise.race([
+        client.request("turn/interrupt", { threadId: state.threadId, turnId: state.turnId }),
+        new Promise((resolve) => {
+          graceTimer = setTimeout(resolve, TURN_INTERRUPT_GRACE_MS);
+          graceTimer.unref?.();
+        })
+      ]);
+    } catch {
+      // The turn is being abandoned either way.
+    } finally {
+      if (graceTimer) {
+        clearTimeout(graceTimer);
+      }
+    }
+  }
+
+  // Wait for the turn to actually end. With no turnId there was nothing to
+  // interrupt (and notifications are still buffered), so this window only ever
+  // expires — the report then says the turn may still be running, which is the
+  // truth. `completeTurn` already ran if the notification arrived.
+  if (await waitForTurnAcknowledgement(client, state, TURN_INTERRUPT_ACK_MS)) {
+    return;
+  }
+
+  state.error = {
+    message: `${timeoutMessage}; interrupt not acknowledged — the turn may still be running in the shared runtime, check status or cancel`
+  };
+  // A client that owns its app-server can still stop the turn: killing the
+  // process takes the turn with it. A broker's app-server is shared, so closing
+  // this connection would only hide a turn that keeps writing.
+  if (client.transport !== "broker") {
+    await client.close().catch(() => {});
+  }
+
+  completeTurn(state, { id: state.turnId ?? "timed-out-turn", status: "failed" });
+}
+
 async function captureTurn(client, threadId, startRequest, options = {}) {
   const state = createTurnCaptureState(threadId, options);
   const previousHandler = client.notificationHandler;
+  const timeoutMs = resolveTurnTimeoutMs(options.turnTimeoutMs);
+  let timeoutTimer = null;
 
   client.setNotificationHandler((message) => {
     if (!state.turnId) {
@@ -654,10 +758,20 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
 
     if (response.turn?.status && response.turn.status !== "inProgress") {
       completeTurn(state, response.turn);
+    } else if (timeoutMs > 0) {
+      // Armed only once the turn is actually running: before that there is no
+      // turnId to interrupt, and `startRequest` has its own failure paths.
+      timeoutTimer = setTimeout(() => {
+        void failTurnOnTimeout(client, state, timeoutMs);
+      }, timeoutMs);
+      timeoutTimer.unref?.();
     }
 
     return await state.completion;
   } finally {
+    if (timeoutTimer) {
+      clearTimeout(timeoutTimer);
+    }
     clearCompletionTimer(state);
     client.setNotificationHandler(previousHandler ?? null);
   }
@@ -1093,6 +1207,7 @@ export async function runAppServerReview(cwd, options = {}) {
         }),
       {
         onProgress: options.onProgress,
+        turnTimeoutMs: options.turnTimeoutMs,
         onResponse(response, state) {
           if (response.reviewThreadId) {
             state.threadIds.add(response.reviewThreadId);
@@ -1159,8 +1274,11 @@ export async function importExternalAgentSession(cwd, options = {}) {
 // Two concurrent turns on one thread interleave their history. The
 // session-scoped resume-candidate lookup cannot see jobs from other Claude
 // sessions, so the thread itself is checked here, where every resume passes.
+// Reaped, not raw: a job whose worker is gone — or whose terminal record only
+// reached its job file — is not holding the thread, and its stale index entry
+// would block the resume forever.
 function assertThreadIsFree(cwd, threadId, excludeJobId = null) {
-  const busy = listJobs(cwd).find(
+  const busy = reapDeadJobs(cwd, listJobs(cwd)).find(
     (job) =>
       job.id !== excludeJobId &&
       job.threadId === threadId &&
@@ -1217,7 +1335,10 @@ export async function runAppServerTurn(cwd, options = {}) {
       resolved
     });
 
-    const prompt = options.prompt?.trim() || options.defaultPrompt || "";
+    // `promptRaw` marks a prompt the caller already normalised byte for byte
+    // (`task --prompt-stdin`): trimming it here would eat indentation the user
+    // typed on purpose.
+    const prompt = (options.promptRaw ? options.prompt : options.prompt?.trim()) || options.defaultPrompt || "";
     if (!prompt) {
       throw new Error("A prompt is required for this Codex run.");
     }
@@ -1235,6 +1356,7 @@ export async function runAppServerTurn(cwd, options = {}) {
         }),
       {
         onProgress: options.onProgress,
+        turnTimeoutMs: options.turnTimeoutMs,
         onResponse() {
           if (!options.effort) {
             return;
