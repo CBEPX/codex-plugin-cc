@@ -3,9 +3,11 @@ import process from "node:process";
 
 import {
   readJobFile,
+  removeJobPidFile,
   removeJobRequestFile,
   resolveJobFile,
   resolveJobLogFile,
+  resolveJobPid,
   upsertJob,
   writeJobFile
 } from "./state.mjs";
@@ -199,6 +201,7 @@ export async function runTrackedJob(job, runner, options = {}) {
       pid: null,
       completedAt
     });
+    removeJobPidFile(job.workspaceRoot, job.id);
     appendLogBlock(options.logFile ?? job.logFile ?? null, "Final output", execution.rendered);
     return execution;
   } catch (error) {
@@ -222,6 +225,7 @@ export async function runTrackedJob(job, runner, options = {}) {
       errorMessage,
       completedAt
     });
+    removeJobPidFile(job.workspaceRoot, job.id);
     throw error;
   }
 }
@@ -253,6 +257,7 @@ function markJobDead(workspaceRoot, jobSummary, errorMessage) {
   // its path is cleared on the record: the values themselves are never lifted
   // into the record or the state index, which `status`/`result` echo back.
   removeJobRequestFile(workspaceRoot, jobSummary.id);
+  removeJobPidFile(workspaceRoot, jobSummary.id);
   const record = {
     ...base,
     status: "failed",
@@ -289,10 +294,11 @@ const DEAD_WORKER_MESSAGE = "worker exited before completing";
 const QUEUED_WITHOUT_PID_GRACE_MS = 30000;
 
 // A worker killed between the spawn and `updateJobPid` leaves a queued record
-// with no pid at all. `isPidAlive(null)` cannot tell that apart from a record
-// that was written microseconds ago, so age decides it.
-function isQueuedWithoutWorker(job) {
-  if (job.status !== "queued" || job.pid != null) {
+// with no pid at all — not in the record and not in the sidecar. `isPidAlive(null)`
+// cannot tell that apart from a record that was written microseconds ago, so age
+// decides it.
+function isQueuedWithoutWorker(job, pid) {
+  if (job.status !== "queued" || pid != null) {
     return false;
   }
   const createdAt = Date.parse(job.createdAt ?? "");
@@ -309,7 +315,10 @@ export function reapDeadJobs(workspaceRoot, jobs) {
     if (job.status !== "running" && job.status !== "queued") {
       return job;
     }
-    if (isPidAlive(job.pid) === false || isQueuedWithoutWorker(job)) {
+    // The queued record carries no pid of its own — the parent records it in an
+    // atomic sidecar instead of rewriting the worker's job file.
+    const pid = resolveJobPid(workspaceRoot, job);
+    if (isPidAlive(pid) === false || isQueuedWithoutWorker(job, pid)) {
       return markJobDead(workspaceRoot, job, DEAD_WORKER_MESSAGE);
     }
     return job;

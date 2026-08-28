@@ -31,7 +31,9 @@ import {
   generateJobId,
   getConfig,
   listJobs,
+  removeJobPidFile,
   removeJobRequestFile,
+  resolveJobPid,
   setConfig,
   updateJobPid,
   upsertJob,
@@ -923,10 +925,10 @@ function enqueueBackgroundTask(cwd, job, request) {
   }
 
   // The record was written before the spawn, so this is the first moment the
-  // worker's pid exists. `updateJobPid` patches nothing but `pid`, and only
-  // while the job is still `queued`, so it cannot race the worker's own
-  // `running` write. Without it a `cancel` inside the queued window signals
-  // nothing and the reaper cannot tell a dead queued worker from a live one.
+  // worker's pid exists. `updateJobPid` never touches the job file — the worker
+  // owns it — it writes an atomic `jobs/<id>.pid` sidecar plus a pid-only index
+  // patch. Without it a `cancel` inside the queued window signals nothing and
+  // the reaper cannot tell a dead queued worker from a live one.
   updateJobPid(job.workspaceRoot, job.id, child.pid);
 
   return {
@@ -1299,7 +1301,7 @@ async function handleCancel(argv) {
     );
   }
 
-  terminateProcessTree(job.pid ?? Number.NaN);
+  terminateProcessTree(resolveJobPid(workspaceRoot, job) ?? Number.NaN);
   appendLogLine(job.logFile, "Cancelled by user.");
 
   // A worker cancelled inside the queued window may never have consumed its
@@ -1307,6 +1309,7 @@ async function handleCancel(argv) {
   // look at it again — so the 0600 file (possibly holding `--config` secrets)
   // has to be released here.
   removeJobRequestFile(workspaceRoot, job.id);
+  removeJobPidFile(workspaceRoot, job.id);
 
   const completedAt = nowIso();
   const nextJob = {

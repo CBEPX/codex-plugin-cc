@@ -11,11 +11,14 @@ import {
   listJobs,
   readJobFile,
   resolveJobFile,
+  resolveJobPid,
+  resolveJobPidFile,
   resolveJobRequestFile,
   resolveStateFile,
   updateJobPid,
   upsertJob,
   writeJobFile,
+  writeJobPidFile,
   writeJobRequestFile
 } from "../plugins/codex/scripts/lib/state.mjs";
 
@@ -257,18 +260,70 @@ test("a reaped job leaves no private --config secret behind in state.json", () =
   assert.equal(fs.readFileSync(resolveJobFile(workspace, "job-secret"), "utf8").includes(REQUEST_SECRET), false);
 });
 
-test("updateJobPid records the worker pid without touching the rest of the queued record", () => {
+// The worker owns its job file from its first line, so the parent must never
+// write that file back — not even to add the pid. It goes to an atomic sidecar
+// and to the pid-only index patch instead.
+test("updateJobPid records the worker pid without rewriting the job file", () => {
   const workspace = makeTempDir();
   const job = seedQueuedJobWithPayload(workspace, "job-pid");
+  const jobFile = resolveJobFile(workspace, "job-pid");
+  const before = fs.readFileSync(jobFile, "utf8");
 
   updateJobPid(workspace, "job-pid", 424242);
 
-  const stored = readJobFile(resolveJobFile(workspace, "job-pid"));
-  assert.equal(stored.pid, 424242);
+  assert.equal(fs.readFileSync(jobFile, "utf8"), before, "the parent must not rewrite the worker's job file");
+  const stored = readJobFile(jobFile);
   assert.equal(stored.status, "queued");
-  assert.equal(stored.phase, "queued");
   assert.equal(stored.requestFile, job.requestFile);
+  assert.equal(resolveJobPid(workspace, stored), 424242, "readers must find the pid in the sidecar");
   assert.equal(listJobs(workspace).find((entry) => entry.id === "job-pid").pid, 424242);
+});
+
+// The race the sidecar removes: the worker finishes between the parent's read
+// and its write, and the parent puts the queued snapshot back — losing the
+// result, threadId and turnId while the index already says completed.
+test("updateJobPid leaves a record the worker already completed intact", () => {
+  const workspace = makeTempDir();
+  seedQueuedJobWithPayload(workspace, "job-raced");
+
+  const completed = {
+    id: "job-raced",
+    status: "completed",
+    phase: "done",
+    pid: null,
+    threadId: "thr_1",
+    turnId: "turn_1",
+    result: { status: 0, finalMessage: "done" },
+    completedAt: "2026-03-18T15:31:00.000Z"
+  };
+  writeJobFile(workspace, "job-raced", completed);
+  upsertJob(workspace, completed);
+
+  updateJobPid(workspace, "job-raced", 424242);
+
+  const stored = readJobFile(resolveJobFile(workspace, "job-raced"));
+  assert.equal(stored.status, "completed");
+  assert.equal(stored.threadId, "thr_1");
+  assert.equal(stored.turnId, "turn_1");
+  assert.deepEqual(stored.result, completed.result);
+  const indexed = listJobs(workspace).find((entry) => entry.id === "job-raced");
+  assert.equal(indexed.status, "completed");
+  assert.equal(indexed.pid, null, "a finished job must not get its pid back");
+  assert.equal(resolveJobPid(workspace, stored), null, "a terminal record never reports a pid");
+});
+
+// A worker that took the record over but has not written its own pid yet is
+// still reapable through the sidecar, and the sidecar goes away with the job.
+test("reapDeadJobs resolves a pid from the sidecar and releases it", () => {
+  const workspace = makeTempDir();
+  seedQueuedJobWithPayload(workspace, "job-sidecar", { status: "running", phase: "starting" });
+  writeJobPidFile(workspace, "job-sidecar", spawnDeadPid());
+
+  const reaped = reapDeadJobs(workspace, listJobs(workspace));
+
+  assert.equal(reaped[0].status, "failed");
+  assert.match(reaped[0].errorMessage, /worker exited before completing/);
+  assert.equal(fs.existsSync(resolveJobPidFile(workspace, "job-sidecar")), false, "a terminal job must not keep a stale pid file");
 });
 
 // The parent patches the pid in after the spawn, but the worker owns the record

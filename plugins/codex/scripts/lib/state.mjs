@@ -109,6 +109,7 @@ export function saveState(cwd, state) {
     }
     removeJobFile(resolveJobFile(cwd, job.id));
     removeFileIfExists(resolveJobRequestFile(cwd, job.id));
+    removeFileIfExists(resolveJobPidFile(cwd, job.id));
     removeFileIfExists(job.logFile);
   }
 
@@ -148,28 +149,22 @@ export function upsertJob(cwd, jobPatch) {
 }
 
 // The queued record is written before the worker is spawned, so its pid can only
-// be filled in afterwards — and the worker owns the record from its first line
-// (`runTrackedJob` writes `running` with the same pid). This narrows that race
-// rather than closing it: the job file is still rewritten wholesale from the
-// record read a moment earlier, so a worker that flips to `running` inside that
-// window can have its job file rewound (roughly the time it takes Node to boot).
-// What keeps it harmless is that the status guard skips the write in every later
-// call, the index patch carries `pid` alone — so `listJobs`, which the reaper and
-// `cancel` read, can never be rewound — and the worker's own completion write is
-// the last word on the job file.
+// be filled in afterwards — and the worker owns the job file from its first line
+// (`runTrackedJob` writes `running` with the same pid). So the parent never
+// writes that file back: a read-modify-write from the parent could put a queued
+// snapshot over a record the worker had already completed, losing its result,
+// threadId and turnId. The pid goes into an atomic sidecar plus the pid-only
+// index patch, and readers fall back to the sidecar (`resolveJobPid`) only while
+// the job is still active.
 export function updateJobPid(cwd, jobId, pid) {
-  const jobFile = resolveJobFile(cwd, jobId);
-  if (!fs.existsSync(jobFile)) {
-    return null;
+  writeJobPidFile(cwd, jobId, pid);
+  // The index is patch-based, so it cannot lose a field — but a worker that
+  // already reported `running` wrote its own pid there, and that record is the
+  // newer one. A job that is gone from the index needs no pid at all.
+  const indexed = listJobs(cwd).find((job) => job.id === jobId);
+  if (indexed?.status === "queued") {
+    upsertJob(cwd, { id: jobId, pid });
   }
-  const stored = readJobFile(jobFile);
-  if (stored.status !== "queued") {
-    return stored;
-  }
-  const patched = { ...stored, pid };
-  writeJobFile(cwd, jobId, patched);
-  upsertJob(cwd, { id: jobId, pid });
-  return patched;
 }
 
 export function listJobs(cwd) {
@@ -214,6 +209,47 @@ export function resolveJobLogFile(cwd, jobId) {
 export function resolveJobFile(cwd, jobId) {
   ensureStateDir(cwd);
   return path.join(resolveJobsDir(cwd), `${jobId}.json`);
+}
+
+export function resolveJobPidFile(cwd, jobId) {
+  ensureStateDir(cwd);
+  return path.join(resolveJobsDir(cwd), `${jobId}.pid`);
+}
+
+// Atomic (write + rename) so a reader never sees a half-written pid.
+export function writeJobPidFile(cwd, jobId, pid) {
+  const pidFile = resolveJobPidFile(cwd, jobId);
+  const tempFile = `${pidFile}.${process.pid}.tmp`;
+  fs.writeFileSync(tempFile, `${pid}\n`, "utf8");
+  fs.renameSync(tempFile, pidFile);
+  return pidFile;
+}
+
+export function removeJobPidFile(cwd, jobId) {
+  removeFileIfExists(resolveJobPidFile(cwd, jobId));
+}
+
+function readJobPidSidecar(cwd, jobId) {
+  try {
+    const pid = Number.parseInt(fs.readFileSync(resolveJobPidFile(cwd, jobId), "utf8").trim(), 10);
+    return Number.isInteger(pid) && pid > 0 ? pid : null;
+  } catch {
+    return null;
+  }
+}
+
+// The pid every reader (cancel, reaper, SessionEnd cleanup) should use: the
+// record's own pid once the worker has taken the record over, the sidecar during
+// the queued window before that. A terminal job never reports one — its worker
+// is gone and the sidecar may name a pid the OS has recycled.
+export function resolveJobPid(cwd, job) {
+  if (job?.pid != null) {
+    return job.pid;
+  }
+  if (job?.status !== "queued" && job?.status !== "running") {
+    return null;
+  }
+  return readJobPidSidecar(cwd, job.id);
 }
 
 // The full task request can carry secrets (`--config` values such as auth
