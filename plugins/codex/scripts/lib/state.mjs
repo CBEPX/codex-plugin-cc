@@ -149,9 +149,14 @@ export function upsertJob(cwd, jobPatch) {
 
 // The queued record is written before the worker is spawned, so its pid can only
 // be filled in afterwards — and the worker owns the record from its first line
-// (`runTrackedJob` writes `running` with the same pid). A load-mutate-save of the
-// whole record would race that and could rewind `running` back to `queued`, so
-// this patches `pid` alone and gives up as soon as the worker has taken over.
+// (`runTrackedJob` writes `running` with the same pid). This narrows that race
+// rather than closing it: the job file is still rewritten wholesale from the
+// record read a moment earlier, so a worker that flips to `running` inside that
+// window can have its job file rewound (roughly the time it takes Node to boot).
+// What keeps it harmless is that the status guard skips the write in every later
+// call, the index patch carries `pid` alone — so `listJobs`, which the reaper and
+// `cancel` read, can never be rewound — and the worker's own completion write is
+// the last word on the job file.
 export function updateJobPid(cwd, jobId, pid) {
   const jobFile = resolveJobFile(cwd, jobId);
   if (!fs.existsSync(jobFile)) {

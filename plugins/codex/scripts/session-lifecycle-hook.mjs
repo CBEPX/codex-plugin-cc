@@ -14,6 +14,7 @@ import {
   teardownBrokerSession
 } from "./lib/broker-lifecycle.mjs";
 import { loadState, resolveStateFile, saveState } from "./lib/state.mjs";
+import { reapDeadJobs } from "./lib/tracked-jobs.mjs";
 import { TRANSCRIPT_PATH_ENV } from "./lib/claude-session-transfer.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
@@ -111,7 +112,10 @@ function hasActiveBackgroundJobs(cwd) {
     return false;
   }
   const state = loadState(workspaceRoot);
-  return state.jobs.some(
+  // Reap first: a worker killed outright (SIGKILL, OOM) leaves `running` behind,
+  // and trusting that record would keep this broker — and every later session's —
+  // alive forever, with the dead job's private payload still on disk.
+  return reapDeadJobs(workspaceRoot, state.jobs).some(
     (job) => job.background && (job.status === "queued" || job.status === "running")
   );
 }

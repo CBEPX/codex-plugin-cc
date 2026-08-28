@@ -302,3 +302,61 @@ test("session end does not clear the record of a replacement broker started duri
     clearBrokerSession(workspace);
   }
 });
+
+// A worker killed outright (SIGKILL/OOM) never writes a terminal status. If the
+// active-background check trusts that stale `running` record, every later
+// SessionEnd in the workspace takes the early return and the broker — plus its
+// app-server child — lingers forever.
+test("session end reaps a SIGKILLed background worker instead of keeping its broker alive", async (t) => {
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const workspace = makeTempDir();
+  const env = buildEnv(binDir, {
+    // Long enough that only the hook can be the reason the broker goes away.
+    CODEX_COMPANION_BROKER_IDLE_TIMEOUT_MS: "20000",
+    CODEX_COMPANION_SESSION_ID: "sess-current",
+    FAKE_CODEX_TURN_DELAY_MS: "20000"
+  });
+
+  const launched = run("node", [SCRIPT, "task", "--background", "--json", "die mid-turn"], { cwd: workspace, env });
+  assert.equal(launched.status, 0, launched.stderr);
+  const { jobId } = JSON.parse(launched.stdout);
+
+  const stateFile = path.join(resolveStateDir(workspace), "state.json");
+  const running = await waitUntil(() => {
+    const job = JSON.parse(fs.readFileSync(stateFile, "utf8")).jobs.find((entry) => entry.id === jobId);
+    return job && job.status === "running" && job.pid ? job : null;
+  }, { timeoutMs: 20000 });
+  assert.ok(running, "the background worker must have taken over its record");
+  const broker = await waitUntil(() => loadBrokerSession(workspace));
+  assert.ok(broker, "the background worker must have started a broker");
+
+  t.after(() => {
+    for (const pid of [running.pid, broker.pid]) {
+      try {
+        process.kill(-pid, "SIGKILL");
+      } catch {
+        try {
+          process.kill(pid, "SIGKILL");
+        } catch {
+          // Already gone.
+        }
+      }
+    }
+    clearBrokerSession(workspace);
+  });
+
+  process.kill(-running.pid, "SIGKILL");
+  await waitUntil(() => (isAlive(running.pid) ? null : "dead"));
+
+  const cleanup = runSessionEndHook(workspace, { env, sessionId: "sess-current" });
+  assert.equal(cleanup.status, 0, cleanup.stderr);
+
+  const exited = await waitUntil(() => (isAlive(broker.pid) ? null : "exited"), { timeoutMs: 5000 });
+  assert.equal(exited, "exited", "a dead worker must not keep the broker alive");
+  assert.equal(loadBrokerSession(workspace), null, "the broker record must be cleared");
+
+  const job = JSON.parse(fs.readFileSync(stateFile, "utf8")).jobs.find((entry) => entry.id === jobId);
+  assert.equal(job.status, "failed", "the dead worker's job must be reaped");
+  assert.equal(job.requestFile, null, "the reaped job must not keep its private payload path");
+});
