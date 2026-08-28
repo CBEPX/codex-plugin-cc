@@ -477,3 +477,59 @@ test("migrating a running legacy record does not stage a payload nobody consumes
     "a running job's request has already been consumed; staging it again only leaks it"
   );
 });
+
+// The re-check alone is only a narrower window. The fence is a tombstone named
+// after the generation being broken: exactly one process can create it, so only
+// that process may rename the lock aside. A breaker that finds the tombstone
+// taken does not break at all — it goes back to waiting on whatever lock is
+// there now, which by then may be the winner's live one.
+test("only one breaker may take over a given lock generation", () => {
+  const workspace = makeTempDir();
+  saveState(workspace, { jobs: [] });
+  const stateDir = resolveStateDir(workspace);
+  const lockDir = path.join(stateDir, "state.lock");
+  const holderFile = path.join(lockDir, "holder.json");
+  const dead = run(process.execPath, ["-e", "process.exit(0)"], { env: process.env });
+  const holder = { pid: dead.pid, token: `${dead.pid}-gone`, startedAt: new Date().toISOString() };
+  fs.mkdirSync(lockDir, { recursive: true });
+  fs.writeFileSync(holderFile, JSON.stringify(holder), "utf8");
+
+  // Another breaker owns this generation's takeover.
+  const tomb = path.join(stateDir, `state.lock.tomb-${holder.token}`);
+  fs.mkdirSync(tomb);
+
+  breakStaleLock(lockDir, holder);
+  assert.equal(fs.existsSync(holderFile), true, "a breaker that lost the fence must not touch the lock");
+
+  // The winner finished and dropped its tombstone.
+  fs.rmdirSync(tomb);
+  breakStaleLock(lockDir, holder);
+  assert.equal(fs.existsSync(lockDir), false, "the breaker that wins the fence takes the lock over");
+  assert.equal(fs.existsSync(tomb), false, "a finished break must not leave its tombstone behind");
+
+  // And the workspace is usable again.
+  upsertJob(workspace, { id: "job-after-takeover", status: "queued" });
+  assert.deepEqual(listJobs(workspace).map((job) => job.id), ["job-after-takeover"]);
+});
+
+// A breaker that dies mid-break must not fence off its generation forever.
+test("a tombstone left behind by a dead breaker is reclaimed", () => {
+  const workspace = makeTempDir();
+  saveState(workspace, { jobs: [] });
+  const stateDir = resolveStateDir(workspace);
+  const lockDir = path.join(stateDir, "state.lock");
+  const dead = run(process.execPath, ["-e", "process.exit(0)"], { env: process.env });
+  const holder = { pid: dead.pid, token: `${dead.pid}-gone`, startedAt: new Date().toISOString() };
+  fs.mkdirSync(lockDir, { recursive: true });
+  fs.writeFileSync(path.join(lockDir, "holder.json"), JSON.stringify(holder), "utf8");
+
+  const tomb = path.join(stateDir, `state.lock.tomb-${holder.token}`);
+  fs.mkdirSync(tomb);
+  const longAgo = new Date(Date.now() - 60000);
+  fs.utimesSync(tomb, longAgo, longAgo);
+
+  breakStaleLock(lockDir, holder);
+
+  assert.equal(fs.existsSync(lockDir), false, "an abandoned tombstone must not block the takeover");
+  assert.equal(fs.existsSync(tomb), false, "the reclaimed tombstone must not be left behind");
+});

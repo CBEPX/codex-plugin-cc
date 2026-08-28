@@ -184,6 +184,12 @@ function removeFileIfExists(filePath) {
 // few file writes, so a shared-read lock would only add ways to get it wrong.
 const LOCK_DIR_NAME = "state.lock";
 const LOCK_STAGING_PREFIX = ".state.lock-";
+// One tombstone per lock generation: creating it is what elects the single
+// process allowed to break that generation.
+const LOCK_TOMB_PREFIX = "state.lock.tomb-";
+// A tombstone outlives its breaker only if that breaker died mid-break. Breaking
+// is two syscalls, so anything this old is abandoned.
+const LOCK_TOMB_STALE_MS = 5000;
 const LOCK_HOLDER_FILE = "holder.json";
 const LOCK_WAIT_MS = 5000;
 const LOCK_POLL_MS = 25;
@@ -271,31 +277,90 @@ function releaseLock(lockDir, token) {
 // one has already re-acquired. A rename can only succeed once, so exactly one
 // breaker wins and the loser simply retries.
 //
-// `judged` is the holder snapshot the staleness decision was made from. It is
-// re-checked here because that decision is not the same instant as this rename:
-// the faster breaker may already have taken the lock over, and breaking its live
-// lock would put two writers in the critical section — with its own release then
-// silently doing nothing, since the directory it holds would be gone.
+// `judged` is the holder snapshot the staleness decision was made from, and it
+// names the generation this breaker is entitled to remove. The decision and this
+// rename are not the same instant: a faster breaker can take the lock over in
+// between, and renaming its live lock aside would put two writers in the critical
+// section — with the winner's release then silently doing nothing, since the
+// directory it holds would be gone.
+//
+// The fence is the tombstone: `mkdir` of a name derived from the judged
+// generation succeeds for exactly one process, and only that process may break.
+// A breaker that loses returns and goes back to waiting on whatever lock is there
+// now. The holder re-check below covers the one remaining shape — a tombstone
+// recycled after the winner finished — because the successor's token can never
+// match the judged one.
 // Exported for the lock's own tests; nothing else calls it.
-// ponytail: a re-read, not a compare-and-swap — a directory rename cannot be
-// conditional. It narrows the window to two adjacent syscalls; closing it fully
-// would need a lock server, which is a lot of machinery for a per-workspace file.
 export function breakStaleLock(lockDir, judged) {
-  const current = readLockHolder(lockDir);
-  if (judged?.missing ? current !== null : current?.token !== judged?.token) {
+  const tomb = resolveLockTomb(lockDir, judged);
+  if (!tomb || !claimLockTomb(tomb)) {
     return;
   }
-  const doomed = `${lockDir}.stale-${process.pid}-${Date.now()}`;
+
   try {
-    fs.renameSync(lockDir, doomed);
-  } catch {
-    return;
+    const current = readLockHolder(lockDir);
+    if (judged?.missing ? current !== null : current?.token !== judged?.token) {
+      return;
+    }
+    const doomed = `${lockDir}.stale-${process.pid}-${Date.now()}`;
+    try {
+      fs.renameSync(lockDir, doomed);
+    } catch {
+      return;
+    }
+    try {
+      fs.rmSync(doomed, { recursive: true, force: true });
+    } catch {
+      // Leftover directory, not a lock: nothing ever looks at it again.
+    }
+  } finally {
+    try {
+      fs.rmdirSync(tomb);
+    } catch {
+      // Already reclaimed by a later breaker; it goes stale on its own anyway.
+    }
   }
-  try {
-    fs.rmSync(doomed, { recursive: true, force: true });
-  } catch {
-    // Leftover directory, not a lock: nothing ever looks at it again.
+}
+
+// The generation being broken: the holder's one-off token, or — for a lock with
+// no holder file to name — the directory identity that judgement was made about.
+function resolveLockTomb(lockDir, judged) {
+  let key = judged?.missing ? null : judged?.token;
+  if (!key) {
+    // Nothing to name the generation after — no holder file, or one written by a
+    // version that had no token — so use the directory's own identity, which a
+    // successor's lock cannot share.
+    try {
+      const stats = fs.statSync(lockDir);
+      key = `gen-${stats.ino}-${Math.trunc(stats.mtimeMs)}`;
+    } catch {
+      return null;
+    }
   }
+  // The key comes off disk, so keep it to a plain file name.
+  return path.join(path.dirname(lockDir), `${LOCK_TOMB_PREFIX}${String(key).replace(/[^a-zA-Z0-9._-]/g, "")}`);
+}
+
+function claimLockTomb(tomb) {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      fs.mkdirSync(tomb);
+      return true;
+    } catch (error) {
+      if (error.code !== "EEXIST") {
+        return false;
+      }
+      if (Date.now() - statMtimeMs(tomb) <= LOCK_TOMB_STALE_MS) {
+        return false;
+      }
+      try {
+        fs.rmdirSync(tomb);
+      } catch {
+        // Someone else reclaimed it first; the retry settles who owns the break.
+      }
+    }
+  }
+  return false;
 }
 
 // Returns the token the lock was claimed under; only that token may release it.
