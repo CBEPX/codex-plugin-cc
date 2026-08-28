@@ -41,19 +41,31 @@ export async function waitForBrokerEndpoint(endpoint, timeoutMs = 2000) {
   return false;
 }
 
+// Returns `{ busy: true }` only when the broker explicitly refused because
+// another client is still using it. Everything else — a connection error, a
+// closed socket, an unparsable reply — reports not busy: a broker that cannot
+// answer is a broker the caller must still clean up after.
 export async function sendBrokerShutdown(endpoint) {
-  await new Promise((resolve) => {
+  return await new Promise((resolve) => {
     const socket = connectToEndpoint(endpoint);
     socket.setEncoding("utf8");
+    const finish = (busy) => {
+      socket.end();
+      resolve({ busy });
+    };
     socket.on("connect", () => {
       socket.write(`${JSON.stringify({ id: 1, method: "broker/shutdown", params: {} })}\n`);
     });
-    socket.on("data", () => {
-      socket.end();
-      resolve();
+    socket.on("data", (chunk) => {
+      const line = String(chunk).split("\n").find((candidate) => candidate.trim());
+      try {
+        finish(JSON.parse(line).result?.busy === true);
+      } catch {
+        finish(false);
+      }
     });
-    socket.on("error", resolve);
-    socket.on("close", resolve);
+    socket.on("error", () => resolve({ busy: false }));
+    socket.on("close", () => resolve({ busy: false }));
   });
 }
 

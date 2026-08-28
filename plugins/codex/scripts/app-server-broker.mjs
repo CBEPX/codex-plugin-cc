@@ -101,6 +101,11 @@ async function main() {
   let activeStreamSocket = null;
   let activeStreamThreadIds = null;
   const sockets = new Set();
+  // Clients that have sent at least one message. A bare connection is not proof
+  // of use — `waitForBrokerEndpoint` probes the endpoint and hangs up without
+  // saying anything — but a client that has spoken is one whose next request may
+  // already be on the wire.
+  const engagedSockets = new Set();
   let idleTimer = null;
   let shuttingDown = false;
 
@@ -224,6 +229,8 @@ async function main() {
           continue;
         }
 
+        engagedSockets.add(socket);
+
         let message;
         try {
           message = JSON.parse(line);
@@ -250,6 +257,22 @@ async function main() {
         }
 
         if (message.id !== undefined && message.method === "broker/shutdown") {
+          // The caller (a SessionEnd hook) decides to shut the broker down from a
+          // snapshot of the job index, and another session can enqueue a job and
+          // connect in the gap between that snapshot and this request. Only the
+          // broker knows whether it is actually idle, so it refuses while another
+          // client is holding a request/stream *or* has merely said something and
+          // may have its next request already on the wire. The requester's own
+          // connection is the one that does not count. Refusing is fail-safe: the
+          // idle timeout reaps a broker whose clients all leave later.
+          const busy =
+            (activeRequestSocket && activeRequestSocket !== socket) ||
+            (activeStreamSocket && activeStreamSocket !== socket) ||
+            [...engagedSockets].some((other) => other !== socket);
+          if (busy) {
+            send(socket, { id: message.id, result: { busy: true } });
+            continue;
+          }
           send(socket, { id: message.id, result: {} });
           await shutdown(server);
           process.exit(0);
@@ -316,12 +339,14 @@ async function main() {
 
     socket.on("close", () => {
       sockets.delete(socket);
+      engagedSockets.delete(socket);
       clearSocketOwnership(socket);
       armIdleTimer();
     });
 
     socket.on("error", () => {
       sockets.delete(socket);
+      engagedSockets.delete(socket);
       clearSocketOwnership(socket);
       armIdleTimer();
     });

@@ -162,8 +162,17 @@ async function handleSessionEnd(input) {
     return;
   }
 
+  // The check above is a snapshot; the broker itself has the live answer. If a
+  // job started in that gap the broker refuses, and refusing means every teardown
+  // step below would be wrong: the endpoint, pid file and record all still belong
+  // to a broker somebody is talking to. Leave it to the next SessionEnd or to its
+  // own idle timeout.
   if (brokerEndpoint) {
-    await sendBrokerShutdown(brokerEndpoint);
+    const shutdown = await sendBrokerShutdown(brokerEndpoint);
+    if (shutdown.busy) {
+      process.stderr.write("[codex] Shared broker is still serving another session; leaving it running.\n");
+      return;
+    }
   }
 
   teardownBrokerSession({

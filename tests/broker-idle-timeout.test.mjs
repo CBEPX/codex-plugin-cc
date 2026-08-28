@@ -196,3 +196,108 @@ test("broker refuses clients that connect after the idle shutdown starts", async
     }
   }
 });
+
+// A JSON-RPC client that keeps every message the broker sent, so a test can wait
+// for one instead of guessing at timings.
+async function openClient(endpoint) {
+  const socket = await connectClient(endpoint);
+  socket.setEncoding("utf8");
+  const messages = [];
+  let buffer = "";
+  socket.on("data", (chunk) => {
+    buffer += chunk;
+    let newlineIndex = buffer.indexOf("\n");
+    while (newlineIndex !== -1) {
+      const line = buffer.slice(0, newlineIndex);
+      buffer = buffer.slice(newlineIndex + 1);
+      newlineIndex = buffer.indexOf("\n");
+      if (line.trim()) {
+        messages.push(JSON.parse(line));
+      }
+    }
+  });
+
+  const client = {
+    socket,
+    messages,
+    send(message) {
+      socket.write(`${JSON.stringify(message)}\n`);
+    },
+    async waitFor(predicate, { timeoutMs = 5000 } = {}) {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        const found = messages.find(predicate);
+        if (found) {
+          return found;
+        }
+        await delay(25);
+      }
+      throw new Error(`Timed out waiting for a broker message. Got: ${JSON.stringify(messages)}`);
+    },
+    async request(id, method, params = {}) {
+      client.send({ id, method, params });
+      return client.waitFor((message) => message.id === id);
+    },
+    close() {
+      socket.end();
+      return new Promise((resolve) => socket.once("close", resolve));
+    }
+  };
+  return client;
+}
+
+// `hasActiveWorkspaceJobs()` in the SessionEnd hook is only a snapshot: another
+// session can enqueue a job and connect between that check and the shutdown RPC.
+// The broker is the only place that knows whether it is actually idle, so it
+// refuses a shutdown while any other client is connected — the requester's own
+// connection is the one that does not count.
+test("broker refuses shutdown while another client is using it", async () => {
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const sessionDir = makeTempDir("cxc-");
+  const endpoint = createBrokerEndpoint(sessionDir);
+  const child = spawnBroker({
+    cwd: sessionDir,
+    endpoint,
+    env: buildEnv(binDir, { FAKE_CODEX_TURN_DELAY_MS: "1500" }),
+    idleTimeoutMs: 20000
+  });
+
+  let holder = null;
+  let requester = null;
+  try {
+    assert.equal(await waitForBrokerEndpoint(endpoint, 3000), true);
+
+    holder = await openClient(endpoint);
+    await holder.request(1, "initialize", {});
+    const started = await holder.request(2, "thread/start", { cwd: sessionDir });
+    const threadId = started.result.thread.id;
+    await holder.request(3, "turn/start", { threadId, input: [{ type: "text", text: "hold the runtime" }] });
+
+    requester = await openClient(endpoint);
+    const refused = await requester.request(1, "broker/shutdown", {});
+    assert.equal(refused.result?.busy, true, `shutdown must be refused: ${JSON.stringify(refused)}`);
+    assert.equal(child.exitCode, null, "the broker must keep serving after refusing a shutdown");
+
+    // The refused shutdown must not have cost the holder its turn.
+    const completed = await holder.waitFor((message) => message.method === "turn/completed", { timeoutMs: 8000 });
+    assert.equal(completed.params.threadId, threadId);
+
+    await holder.close();
+    holder = null;
+    await requester.close();
+    requester = null;
+
+    const closer = await openClient(endpoint);
+    const accepted = await closer.request(1, "broker/shutdown", {});
+    assert.notEqual(accepted.result?.busy, true, "an idle broker must accept the shutdown");
+    const exited = await waitForExit(child, { timeoutMs: 5000 });
+    assert.equal(exited.code, 0, "the broker must exit once nothing else is connected");
+  } finally {
+    holder?.socket.destroy();
+    requester?.socket.destroy();
+    if (child.exitCode === null && child.signalCode === null) {
+      child.kill("SIGKILL");
+    }
+  }
+});
