@@ -3,6 +3,8 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { makeTempDir } from "./helpers.mjs";
 import {
@@ -15,6 +17,16 @@ import {
   saveState,
   writeJobRequestFile
 } from "../plugins/codex/scripts/lib/state.mjs";
+
+const STATE_MODULE = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "..",
+  "plugins",
+  "codex",
+  "scripts",
+  "lib",
+  "state.mjs"
+);
 
 test("resolveStateDir uses a temp-backed per-workspace directory", () => {
   const workspace = makeTempDir();
@@ -135,4 +147,57 @@ test("saveState drops the private request payload of pruned jobs", () => {
 
   saveState(workspace, { jobs: [] });
   assert.equal(fs.existsSync(requestFile), false);
+});
+
+// A reader that catches `state.json` mid-write parses a truncated file, and
+// `loadState` turns that into "no jobs" — which is how a SessionEnd with a live
+// job decided the workspace was idle and shut the shared broker down. Writers
+// must swap the file in atomically so a reader sees the old or the new one.
+test("concurrent writers never leave a torn state.json for a reader", async () => {
+  const workspace = makeTempDir();
+  const jobs = Array.from({ length: 50 }, (_, index) => ({
+    id: `job-${index}`,
+    status: "running",
+    updatedAt: `2026-03-18T15:${String(index % 60).padStart(2, "0")}:00.000Z`,
+    summary: "x".repeat(2048)
+  }));
+  saveState(workspace, { jobs });
+  const stateFile = resolveStateFile(workspace);
+
+  const writer = spawn(
+    process.execPath,
+    [
+      "--input-type=module",
+      "-e",
+      `import { saveState } from ${JSON.stringify(pathToFileURL(STATE_MODULE).href)};
+       const jobs = ${JSON.stringify(jobs)};
+       const deadline = Date.now() + 2000;
+       while (Date.now() < deadline) {
+         saveState(${JSON.stringify(workspace)}, { jobs });
+       }`
+    ],
+    { env: process.env, stdio: ["ignore", "ignore", "pipe"] }
+  );
+  let writerStderr = "";
+  writer.stderr.on("data", (chunk) => {
+    writerStderr += chunk;
+  });
+
+  let reads = 0;
+  const deadline = Date.now() + 2000;
+  while (Date.now() < deadline) {
+    const raw = fs.readFileSync(stateFile, "utf8");
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (error) {
+      assert.fail(`torn read after ${reads} reads (${raw.length} bytes): ${error.message}`);
+    }
+    assert.equal(parsed.jobs.length, 50, `torn read after ${reads} reads: lost jobs`);
+    reads += 1;
+  }
+
+  await new Promise((resolve) => writer.on("exit", resolve));
+  assert.equal(writerStderr, "");
+  assert.ok(reads > 100, `expected the reader to race the writer, got ${reads} reads`);
 });

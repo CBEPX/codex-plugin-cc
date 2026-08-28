@@ -83,6 +83,20 @@ function pruneJobs(jobs) {
     .slice(0, MAX_JOBS);
 }
 
+// Every reader of these files tolerates a corrupt one by falling back to a
+// default (`loadState` returns an empty job list), so a reader that catches a
+// plain `writeFileSync` mid-flight cannot tell a truncated file from an idle
+// workspace — that is how a SessionEnd with a live job shut the shared broker.
+// Writing a sibling temp file and renaming it swaps the content in one step:
+// a reader sees either the old file or the new one, never half of either.
+/** @param {import("node:fs").WriteFileOptions} options */
+function writeFileAtomic(filePath, contents, options = "utf8") {
+  const tempFile = `${filePath}.${process.pid}.tmp`;
+  fs.writeFileSync(tempFile, contents, options);
+  fs.renameSync(tempFile, filePath);
+  return filePath;
+}
+
 function removeFileIfExists(filePath) {
   if (filePath && fs.existsSync(filePath)) {
     fs.unlinkSync(filePath);
@@ -113,7 +127,7 @@ export function saveState(cwd, state) {
     removeFileIfExists(job.logFile);
   }
 
-  fs.writeFileSync(resolveStateFile(cwd), `${JSON.stringify(nextState, null, 2)}\n`, "utf8");
+  writeFileAtomic(resolveStateFile(cwd), `${JSON.stringify(nextState, null, 2)}\n`);
   return nextState;
 }
 
@@ -187,7 +201,7 @@ export function getConfig(cwd) {
 export function writeJobFile(cwd, jobId, payload) {
   ensureStateDir(cwd);
   const jobFile = resolveJobFile(cwd, jobId);
-  fs.writeFileSync(jobFile, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+  writeFileAtomic(jobFile, `${JSON.stringify(payload, null, 2)}\n`);
   return jobFile;
 }
 
@@ -216,13 +230,8 @@ export function resolveJobPidFile(cwd, jobId) {
   return path.join(resolveJobsDir(cwd), `${jobId}.pid`);
 }
 
-// Atomic (write + rename) so a reader never sees a half-written pid.
 export function writeJobPidFile(cwd, jobId, pid) {
-  const pidFile = resolveJobPidFile(cwd, jobId);
-  const tempFile = `${pidFile}.${process.pid}.tmp`;
-  fs.writeFileSync(tempFile, `${pid}\n`, "utf8");
-  fs.renameSync(tempFile, pidFile);
-  return pidFile;
+  return writeFileAtomic(resolveJobPidFile(cwd, jobId), `${pid}\n`);
 }
 
 export function removeJobPidFile(cwd, jobId) {
@@ -261,9 +270,12 @@ export function resolveJobRequestFile(cwd, jobId) {
 }
 
 export function writeJobRequestFile(cwd, jobId, payload) {
-  const requestFile = resolveJobRequestFile(cwd, jobId);
-  fs.writeFileSync(requestFile, `${JSON.stringify(payload, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
-  return requestFile;
+  // The temp file carries the 0600 mode through the rename, so the payload is
+  // never briefly world-readable.
+  return writeFileAtomic(resolveJobRequestFile(cwd, jobId), `${JSON.stringify(payload, null, 2)}\n`, {
+    encoding: "utf8",
+    mode: 0o600
+  });
 }
 
 export function removeJobRequestFile(cwd, jobId) {
