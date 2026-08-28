@@ -406,6 +406,15 @@ class BrokerCodexAppServerClient extends AppServerClientBase {
   }
 }
 
+// The connection went away underneath us: reset by the peer, a write to a closed
+// pipe, or our own "connection closed" error, which carries no errno at all.
+function isConnectionDropped(error) {
+  if (error?.code) {
+    return error.code === "ECONNRESET" || error.code === "EPIPE";
+  }
+  return /connection closed/i.test(error?.message ?? "");
+}
+
 export class CodexAppServerClient {
   static async connect(cwd, options = {}) {
     let brokerEndpoint = null;
@@ -419,10 +428,27 @@ export class CodexAppServerClient {
         brokerEndpoint = brokerSession?.endpoint ?? null;
       }
     }
-    const client = brokerEndpoint
-      ? new BrokerCodexAppServerClient(cwd, { ...options, brokerEndpoint })
-      : new SpawnedCodexAppServerClient(cwd, options);
-    await client.initialize();
-    return client;
+    if (!brokerEndpoint) {
+      const direct = new SpawnedCodexAppServerClient(cwd, options);
+      await direct.initialize();
+      return direct;
+    }
+
+    const client = new BrokerCodexAppServerClient(cwd, { ...options, brokerEndpoint });
+    try {
+      await client.initialize();
+      return client;
+    } catch (error) {
+      // A broker that is shutting down accepts the connection and drops it before
+      // answering `initialize`. That is a race with someone else's SessionEnd, not
+      // a reason to fail a background job — run on our own app-server instead.
+      if (!isConnectionDropped(error)) {
+        throw error;
+      }
+      await client.close().catch(() => {});
+      const direct = new SpawnedCodexAppServerClient(cwd, options);
+      await direct.initialize();
+      return direct;
+    }
   }
 }

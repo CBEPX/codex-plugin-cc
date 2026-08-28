@@ -27,10 +27,15 @@ export async function waitForBrokerEndpoint(endpoint, timeoutMs = 2000) {
   while (Date.now() - start < timeoutMs) {
     const ready = await new Promise((resolve) => {
       const socket = connectToEndpoint(endpoint);
+      let connected = false;
       socket.on("connect", () => {
+        connected = true;
         socket.end();
-        resolve(true);
       });
+      // Report ready only once the probe connection is fully closed. A probe the
+      // broker still sees as open is a phantom client: it holds off the idle
+      // timer and makes the broker refuse a shutdown.
+      socket.on("close", () => resolve(connected));
       socket.on("error", () => resolve(false));
     });
     if (ready) {

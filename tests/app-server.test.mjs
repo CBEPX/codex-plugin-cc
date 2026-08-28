@@ -1,9 +1,11 @@
+import net from "node:net";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { makeTempDir } from "./helpers.mjs";
 import { AppServerClientBase, CodexAppServerClient } from "../plugins/codex/scripts/lib/app-server.mjs";
+import { createBrokerEndpoint, parseBrokerEndpoint } from "../plugins/codex/scripts/lib/broker-endpoint.mjs";
 
 /** Minimal client that records the JSON-RPC messages it would send. */
 class CapturingClient extends AppServerClientBase {
@@ -149,4 +151,28 @@ test("close() stays bounded when it is called twice", { timeout: 15000 }, async 
 
   assert.ok(Date.now() - started < 1000, `a repeated close must not wait again, took ${Date.now() - started} ms`);
   assert.equal(client.proc.exitCode, null, "the test needs a child that never exits");
+});
+
+// The broker can be tearing down at the exact moment a background job dials it:
+// the connection is accepted and then dropped before `initialize` is answered.
+// That is a race, not a failure — the job must go on with its own app-server.
+test("a broker that drops the connection during initialize falls back to a direct app-server", async (t) => {
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const sessionDir = makeTempDir("cxc-");
+  const endpoint = createBrokerEndpoint(sessionDir);
+  const stub = net.createServer((socket) => socket.destroy());
+  await new Promise((resolve, reject) => {
+    stub.once("error", reject);
+    stub.listen(parseBrokerEndpoint(endpoint).path, resolve);
+  });
+
+  let client = null;
+  t.after(async () => {
+    await client?.close();
+    stub.close();
+  });
+
+  client = await CodexAppServerClient.connect(binDir, { brokerEndpoint: endpoint, env: buildEnv(binDir) });
+  assert.equal(client.transport, "direct", "a broker that hangs up must not fail the run");
 });

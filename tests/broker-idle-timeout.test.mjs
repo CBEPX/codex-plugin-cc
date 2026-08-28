@@ -301,3 +301,45 @@ test("broker refuses shutdown while another client is using it", async () => {
     }
   }
 });
+
+// A client is a client from the moment it is accepted: `CodexAppServerClient`
+// connects and only then writes `initialize`, and a shutdown that lands in that
+// gap kills the broker under it. Refusing costs nothing — the requester's own
+// connection never counts, and a probe that hangs up only postpones teardown.
+test("broker refuses shutdown while a client is connected but has not spoken yet", async () => {
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const sessionDir = makeTempDir("cxc-");
+  const endpoint = createBrokerEndpoint(sessionDir);
+  const child = spawnBroker({ cwd: sessionDir, endpoint, env: buildEnv(binDir), idleTimeoutMs: 20000 });
+
+  let silent = null;
+  let requester = null;
+  try {
+    assert.equal(await waitForBrokerEndpoint(endpoint, 3000), true);
+
+    silent = await connectClient(endpoint);
+    requester = await openClient(endpoint);
+
+    const refused = await requester.request(1, "broker/shutdown", {});
+    assert.equal(refused.result?.busy, true, `shutdown must be refused: ${JSON.stringify(refused)}`);
+    assert.equal(child.exitCode, null, "the broker must survive a refused shutdown");
+
+    const closed = new Promise((resolve) => silent.once("close", resolve));
+    silent.end();
+    await closed;
+    silent = null;
+    await delay(100);
+
+    const accepted = await requester.request(2, "broker/shutdown", {});
+    assert.notEqual(accepted.result?.busy, true, "the last client leaving makes the broker shuttable");
+    const exited = await waitForExit(child, { timeoutMs: 5000 });
+    assert.equal(exited.code, 0);
+  } finally {
+    silent?.destroy();
+    requester?.socket.destroy();
+    if (child.exitCode === null && child.signalCode === null) {
+      child.kill("SIGKILL");
+    }
+  }
+});
