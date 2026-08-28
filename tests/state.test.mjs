@@ -617,6 +617,10 @@ test(
     saveState(workspace, { jobs: [] });
     const lockDir = lockDirFor(workspace);
     const foreign = seedLockEntry(lockDir, `1.${process.pid}-live.ticket`, process.pid);
+    // Old enough that the rule this replaces would have aged it out, so the test
+    // fails against an implementation that keeps guessing rather than failing.
+    const longAgo = new Date(Date.now() - 600000);
+    fs.utimesSync(foreign, longAgo, longAgo);
     fs.chmodSync(foreign, 0o000);
 
     let ran = false;
@@ -690,4 +694,97 @@ test("the timeout says so when no blocker is left to name", () => {
   } finally {
     fs.readFileSync = realRead;
   }
+});
+
+// An eviction that did not actually happen is not progress. Treating a failed
+// unlink as one skipped the poll pause on every pass, so an abandoned entry this
+// process may not remove turned the bounded wait into a busy loop hammering the
+// filesystem.
+test("an eviction that fails keeps the poll pause", () => {
+  const workspace = makeTempDir();
+  saveState(workspace, { jobs: [] });
+  const lockDir = lockDirFor(workspace);
+  const gone = deadPid();
+  const stuck = seedLockEntry(lockDir, `1.${gone}-gone.ticket`, gone);
+
+  let attempts = 0;
+  let listings = 0;
+  const realUnlink = fs.unlinkSync;
+  const realReaddir = fs.readdirSync;
+  fs.unlinkSync = (candidate, ...rest) => {
+    if (String(candidate) === stuck) {
+      attempts += 1;
+      throw Object.assign(new Error(`EPERM: injected, unlink '${candidate}'`), { code: "EPERM" });
+    }
+    return realUnlink.call(fs, candidate, ...rest);
+  };
+  fs.readdirSync = (candidate, ...rest) => {
+    if (String(candidate) === lockDir) {
+      listings += 1;
+    }
+    return realReaddir.call(fs, candidate, ...rest);
+  };
+
+  let ran = false;
+  const started = Date.now();
+  try {
+    assert.throws(() => withStateLock(workspace, () => {
+      ran = true;
+    }, { waitMs: 300 }), /state lock/i);
+  } finally {
+    fs.unlinkSync = realUnlink;
+    fs.readdirSync = realReaddir;
+  }
+  const elapsed = Date.now() - started;
+
+  assert.equal(ran, false, "the callback must not run while a blocker is still there");
+  assert.ok(elapsed >= 250, `the wait must use its whole budget, took ${elapsed} ms`);
+  assert.ok(elapsed < 3000, `the wait must end at its own deadline, took ${elapsed} ms`);
+  assert.ok(attempts <= 300 / 25 + 5, `the waiter span instead of polling: ${attempts} unlink attempts`);
+  assert.ok(listings <= 300 / 25 + 5, `the waiter span instead of polling: ${listings} listings`);
+  assert.equal(fs.existsSync(stuck), true, "the entry that could not be removed must still be there");
+  assert.deepEqual(fs.readdirSync(lockDir), [path.basename(stuck)], "our own entries must be cleaned up");
+});
+
+// The two grace periods, stated directly: an entry whose content says nothing
+// about an owner is debris after 2 s, and one that names a PID nothing can check
+// gets 30 s. Both are judged against the entry's own mtime.
+test("a junk entry holds its place for the orphan grace and no longer", () => {
+  const fresh = makeTempDir();
+  saveState(fresh, { jobs: [] });
+  const freshEntry = path.join(lockDirFor(fresh), `1.${process.pid}-junk.ticket`);
+  fs.writeFileSync(freshEntry, "{ not json", "utf8");
+  assert.throws(() => withStateLock(fresh, () => "too soon", { waitMs: 150 }), /state lock/i);
+  assert.equal(fs.existsSync(freshEntry), true, "junk younger than the grace keeps its place");
+
+  const aged = makeTempDir();
+  saveState(aged, { jobs: [] });
+  const agedEntry = path.join(lockDirFor(aged), `1.${process.pid}-junk.ticket`);
+  fs.writeFileSync(agedEntry, "{ not json", "utf8");
+  const pastGrace = new Date(Date.now() - 5000);
+  fs.utimesSync(agedEntry, pastGrace, pastGrace);
+
+  assert.equal(withStateLock(aged, () => "ok", { waitMs: 500 }), "ok");
+  assert.equal(fs.existsSync(agedEntry), false, "junk past the grace is debris");
+});
+
+test("an entry with no checkable PID holds its place for the long grace", () => {
+  const fresh = makeTempDir();
+  saveState(fresh, { jobs: [] });
+  const freshEntry = path.join(lockDirFor(fresh), `1.${process.pid}-nopid.ticket`);
+  fs.writeFileSync(freshEntry, JSON.stringify({ pid: null }), "utf8");
+  const withinGrace = new Date(Date.now() - 10000);
+  fs.utimesSync(freshEntry, withinGrace, withinGrace);
+  assert.throws(() => withStateLock(fresh, () => "too soon", { waitMs: 150 }), /state lock/i);
+  assert.equal(fs.existsSync(freshEntry), true, "an unusable PID is given the long grace, not the short one");
+
+  const aged = makeTempDir();
+  saveState(aged, { jobs: [] });
+  const agedEntry = path.join(lockDirFor(aged), `1.${process.pid}-nopid.ticket`);
+  fs.writeFileSync(agedEntry, JSON.stringify({ pid: null }), "utf8");
+  const pastGrace = new Date(Date.now() - 60000);
+  fs.utimesSync(agedEntry, pastGrace, pastGrace);
+
+  assert.equal(withStateLock(aged, () => "ok", { waitMs: 500 }), "ok");
+  assert.equal(fs.existsSync(agedEntry), false, "past the long grace it is debris");
 });

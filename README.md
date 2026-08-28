@@ -349,6 +349,15 @@ names that PID and the exact ticket file. If that process really is stuck, stop 
 and the next command goes through; if the PID belongs to something unrelated (PID
 reuse), delete the ticket file the error names.
 
+### A command failed with a raw `EACCES` or `EIO` from the state directory
+
+The same lock refuses to guess. If a ticket in `state.lock.d/` cannot be listed,
+read or `stat`ed, the command fails with that error instead of assuming the entry
+is absent or abandoned — guessing there is what would let two commands write the
+job state at once. Fix the permissions on the state directory (or remove the entry
+the error names, once you know no Codex command is using it) and the next command
+goes through.
+
 ### Can I keep using my current API key or base URL setup?
 
 Yes. Because the plugin uses your local Codex CLI, your existing sign-in method and config still apply.

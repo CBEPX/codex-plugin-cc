@@ -347,12 +347,17 @@ function writeLockEntry(lockDir, name, token, contents) {
   fs.renameSync(staged, path.join(lockDir, name));
 }
 
+// True only when this call actually removed the entry. Failure is never raised:
+// the name may already be retired (someone else judged the same entry abandoned,
+// or its owner released it — tokens are one-off, so a name is never reused), and a
+// foreign entry this process may not remove must not fail a release. Callers that
+// need to know whether the queue really moved read the answer instead.
 function unlinkLockEntry(lockDir, name) {
   try {
     fs.unlinkSync(path.join(lockDir, name));
+    return true;
   } catch {
-    // Already gone: someone else judged the same entry abandoned, or its owner
-    // released it. Either way the name is retired for good — tokens are one-off.
+    return false;
   }
 }
 
@@ -466,14 +471,14 @@ function waitForTurn(lockDir, ticket, waitMs) {
 
     let evicted = false;
     for (const { blocker, verdict } of verdicts) {
-      if (verdict === LOCK_ENTRY_ABANDONED) {
-        unlinkLockEntry(lockDir, blocker.name);
+      if (verdict === LOCK_ENTRY_ABANDONED && unlinkLockEntry(lockDir, blocker.name)) {
         evicted = true;
       }
     }
-    // Only actually removing something earns an immediate re-scan. A queue that
-    // merely keeps changing under us — entries appearing and vanishing — must not
-    // turn the wait into a spin.
+    // Only a removal that actually happened earns an immediate re-scan. An entry
+    // this process may not remove would otherwise be re-judged and re-unlinked with
+    // no pause at all, hammering the filesystem until the deadline; a queue that
+    // merely keeps changing under us must not become a spin either.
     if (!evicted) {
       sleepSync(LOCK_POLL_MS);
     }
