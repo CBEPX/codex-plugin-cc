@@ -233,22 +233,36 @@ function statLockEntry(entryPath) {
   }
 }
 
-// Unreadable is not the same as absent: a foreign entry this process may not read
-// (another user's 0600 file, a half-written one) still holds its place until its
-// age says otherwise, so a read failure other than ENOENT is not propagated.
+// Only the entry having disappeared is an answer here too. A read that fails for
+// any other reason (EACCES, EIO, EISDIR) says nothing about the owner, so it fails
+// the acquisition rather than letting the entry be aged out.
+//
+// Content that reads but does not parse is different: entries are published by
+// rename, so a live holder's entry is never half-written — junk can only be debris,
+// and debris is judged by its age.
 function readLockEntryOwner(entryPath) {
+  let contents;
   try {
-    return { present: true, owner: JSON.parse(fs.readFileSync(entryPath, "utf8")) };
+    contents = fs.readFileSync(entryPath, "utf8");
   } catch (error) {
-    return error.code === "ENOENT" ? { present: false, owner: null } : { present: true, owner: null };
+    if (error.code === "ENOENT") {
+      return { present: false, owner: null };
+    }
+    throw error;
+  }
+
+  try {
+    return { present: true, owner: JSON.parse(contents) };
+  } catch {
+    return { present: true, owner: null };
   }
 }
 
 // A live owner is never evicted, whatever the clock says: from out here a slow
 // process and a stuck one look identical, and evicting either puts two writers in
-// the critical section. A dead one releases its place at once; an entry nothing
-// can be read from is debris after a short grace; one that carries no usable PID
-// to check after a long one. (A PID that exists but belongs to another user reads
+// the critical section. A dead one releases its place at once; an entry whose
+// content is junk is debris after a short grace; one that carries no usable PID to
+// check after a long one. (A PID that exists but belongs to another user reads
 // as alive, which is the safe answer.) A stuck live owner is the operator's call —
 // the timeout error names it.
 function judgeLockEntry(entryPath) {
@@ -441,21 +455,26 @@ function waitForTurn(lockDir, ticket, waitMs) {
       return;
     }
 
-    let cleared = false;
-    for (const blocker of blockers) {
-      const verdict = judgeLockEntry(path.join(lockDir, blocker.name));
-      if (verdict === LOCK_ENTRY_HELD) {
-        continue;
-      }
+    // Judge every blocker before touching any of them. Done in one pass, a verdict
+    // that throws halfway through would leave the entries it had already evicted
+    // gone — breaking the one promise a failed acquisition makes, that it removed
+    // nothing but its own files.
+    const verdicts = blockers.map((blocker) => ({
+      blocker,
+      verdict: judgeLockEntry(path.join(lockDir, blocker.name))
+    }));
+
+    let evicted = false;
+    for (const { blocker, verdict } of verdicts) {
       if (verdict === LOCK_ENTRY_ABANDONED) {
         unlinkLockEntry(lockDir, blocker.name);
+        evicted = true;
       }
-      // Gone or evicted: either way the queue moved, so look again at once.
-      cleared = true;
     }
-    // Clearing something is the only reason to look again immediately; it may skip
-    // the poll interval and nothing else.
-    if (!cleared) {
+    // Only actually removing something earns an immediate re-scan. A queue that
+    // merely keeps changing under us — entries appearing and vanishing — must not
+    // turn the wait into a spin.
+    if (!evicted) {
       sleepSync(LOCK_POLL_MS);
     }
   }

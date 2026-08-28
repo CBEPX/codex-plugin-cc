@@ -485,26 +485,6 @@ test(
   }
 );
 
-// A blocker that is judged abandoned but cannot actually be unlinked used to be a
-// hot loop with no exit: clearing an entry skipped the deadline check, so the
-// waiter span the CPU forever instead of giving up. (Unlink can only ever fail on
-// a foreign entry — a permission or filesystem problem, modelled here by a
-// directory, which `unlink` refuses on every POSIX platform.)
-test("a blocker that cannot be removed still ends at the deadline", { timeout: 10000 }, () => {
-  const workspace = makeTempDir();
-  saveState(workspace, { jobs: [] });
-  const lockDir = lockDirFor(workspace);
-  const stuck = path.join(lockDir, `1.${deadPid()}-unremovable.ticket`);
-  fs.mkdirSync(stuck);
-  const longAgo = new Date(Date.now() - 600000);
-  fs.utimesSync(stuck, longAgo, longAgo);
-
-  const started = Date.now();
-  assert.throws(() => withStateLock(workspace, () => "never", { waitMs: 300 }), /state lock/i);
-
-  assert.ok(Date.now() - started < 5000, `the wait must end at its own deadline, took ${Date.now() - started} ms`);
-  assert.deepEqual(fs.readdirSync(lockDir), [path.basename(stuck)], "the waiter must take its own entries back out");
-});
 
 // `statSync` failing is not "the entry is infinitely old". When the entry's own
 // content cannot be read either, a swallowed stat error left the age comparison
@@ -592,4 +572,122 @@ test("a zero budget takes a free lock but does not queue", () => {
   const held = seedLockEntry(lockDir, `1.${process.pid}-live.ticket`, process.pid);
   assert.throws(() => withStateLock(workspace, () => "queued", { waitMs: 0 }), /state lock/i);
   assert.equal(fs.existsSync(held), true, "the live holder keeps its ticket");
+});
+
+// Judging and evicting have to be separate passes. Done in one, a verdict that
+// throws halfway through leaves the entries it already evicted gone — breaking the
+// only promise a failed acquisition makes: it touches nothing but its own files.
+test("a blocker that cannot be judged leaves every foreign entry in place", () => {
+  const workspace = makeTempDir();
+  saveState(workspace, { jobs: [] });
+  const lockDir = lockDirFor(workspace);
+  const abandoned = seedLockEntry(lockDir, `1.${deadPid()}-gone.ticket`, deadPid());
+  // Unreadable content, so its age decides — and its age cannot be read.
+  const unjudgeable = path.join(lockDir, `2.${process.pid}-live.ticket`);
+  fs.writeFileSync(unjudgeable, "{ not json", "utf8");
+
+  let ran = false;
+  assert.throws(
+    () =>
+      withStatFailure(unjudgeable, "EIO", () =>
+        withStateLock(workspace, () => {
+          ran = true;
+        }, { waitMs: 200 })
+      ),
+    /EIO/
+  );
+
+  assert.equal(ran, false, "the callback must not run");
+  assert.equal(fs.existsSync(abandoned), true, "an entry judged before the failure must not have been evicted");
+  assert.equal(fs.existsSync(unjudgeable), true, "the unjudgeable entry must be left alone");
+  assert.deepEqual(
+    fs.readdirSync(lockDir).sort(),
+    [path.basename(abandoned), path.basename(unjudgeable)].sort(),
+    "only our own entries may be removed on a failed acquisition"
+  );
+});
+
+// An entry this process may not read says nothing about its owner, so it cannot be
+// aged out either — that is the same fail-closed rule as a stat failure.
+test(
+  "an unreadable foreign entry fails the acquisition instead of being aged out",
+  { skip: process.platform === "win32" || process.getuid?.() === 0 },
+  () => {
+    const workspace = makeTempDir();
+    saveState(workspace, { jobs: [] });
+    const lockDir = lockDirFor(workspace);
+    const foreign = seedLockEntry(lockDir, `1.${process.pid}-live.ticket`, process.pid);
+    fs.chmodSync(foreign, 0o000);
+
+    let ran = false;
+    try {
+      assert.throws(() => withStateLock(workspace, () => {
+        ran = true;
+      }, { waitMs: 200 }), /EACCES/);
+    } finally {
+      fs.chmodSync(foreign, 0o600);
+    }
+
+    assert.equal(ran, false, "the callback must not run when an entry cannot be read");
+    assert.deepEqual(fs.readdirSync(lockDir), [path.basename(foreign)], "the entry must be intact and ours removed");
+  }
+);
+
+// A verdict that keeps saying "it left the queue" while the listing keeps showing
+// it must still end: clearing something may skip the poll interval, never the
+// deadline.
+test("a blocker that never settles still ends at the deadline", { timeout: 10000 }, () => {
+  const workspace = makeTempDir();
+  saveState(workspace, { jobs: [] });
+  const lockDir = lockDirFor(workspace);
+  const foreign = seedLockEntry(lockDir, `1.${process.pid}-live.ticket`, process.pid);
+
+  const realRead = fs.readFileSync;
+  fs.readFileSync = (candidate, ...rest) => {
+    if (String(candidate) === foreign) {
+      throw Object.assign(new Error(`ENOENT: injected, open '${candidate}'`), { code: "ENOENT" });
+    }
+    return realRead.call(fs, candidate, ...rest);
+  };
+
+  const started = Date.now();
+  try {
+    assert.throws(() => withStateLock(workspace, () => "never", { waitMs: 300 }), /state lock/i);
+  } finally {
+    fs.readFileSync = realRead;
+  }
+
+  assert.ok(Date.now() - started < 5000, `the wait must end at its own deadline, took ${Date.now() - started} ms`);
+  assert.deepEqual(fs.readdirSync(lockDir), [path.basename(foreign)], "the waiter must take its own entries back out");
+});
+
+// The blocker the last scan saw may be gone by the time the error is built — not
+// least because this waiter cleared it. Naming a file that no longer exists helps
+// nobody, so the message says plainly that there is nothing left to point at.
+test("the timeout says so when no blocker is left to name", () => {
+  const workspace = makeTempDir();
+  saveState(workspace, { jobs: [] });
+  const lockDir = lockDirFor(workspace);
+  const foreign = path.join(lockDir, `1.${process.pid}-live.ticket`);
+  const owner = JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() });
+  fs.writeFileSync(foreign, owner, "utf8");
+
+  // Held at the moment it is judged, gone by the time the message is built.
+  const realRead = fs.readFileSync;
+  fs.readFileSync = (candidate, ...rest) => {
+    if (String(candidate) === foreign) {
+      fs.rmSync(foreign, { force: true });
+      return owner;
+    }
+    return realRead.call(fs, candidate, ...rest);
+  };
+
+  try {
+    assert.throws(
+      () => withStateLock(workspace, () => "never", { waitMs: 0 }),
+      /waiting for the Codex state lock .*; no blocker visible now\./
+    );
+  } finally {
+    fs.readFileSync = realRead;
+  }
 });
