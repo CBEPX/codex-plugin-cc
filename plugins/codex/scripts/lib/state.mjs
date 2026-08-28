@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -197,8 +197,9 @@ const LOCK_ORPHAN_MS = 2000;
 // real filesystem error and is rethrown.
 const LOCK_CONTENDED_CODES = new Set(["EEXIST", "ENOTEMPTY", "EPERM", "EACCES"]);
 
-// Locks this process already holds: a locked section may call another one
-// (`updateState` → `saveState`) and must not deadlock against itself.
+// Locks this process already holds, with the token each was claimed under: a
+// locked section may call another one (`updateState` → `saveState`) and must not
+// deadlock against itself.
 const heldLocks = new Map();
 
 function sleepSync(ms) {
@@ -218,9 +219,22 @@ function isLockStale(lockDir) {
   if (!holder) {
     return !(Date.now() - statMtimeMs(lockDir) <= LOCK_ORPHAN_MS);
   }
-  if (isPidAlive(holder.pid) === false) {
+
+  const alive = isPidAlive(holder.pid);
+  if (alive === true) {
+    // Never taken over, however long it has been held. Age cannot tell a slow
+    // holder from a stuck one, and evicting a process that is still writing
+    // state.json puts two writers in the critical section — the exact corruption
+    // this lock exists to prevent. A holder that is genuinely stuck has to be
+    // killed by the operator (the wait error names its PID); its death is what
+    // makes the lock reclaimable.
+    return false;
+  }
+  if (alive === false) {
     return true;
   }
+
+  // No usable PID to check, only holder info: age is the only signal left.
   const startedAt = Date.parse(holder.startedAt ?? "");
   const heldSince = Number.isFinite(startedAt) ? startedAt : statMtimeMs(lockDir);
   return Number.isFinite(heldSince) ? Date.now() - heldSince > LOCK_STALE_MS : true;
@@ -234,12 +248,13 @@ function statMtimeMs(target) {
   }
 }
 
-function releaseLock(lockDir) {
+function releaseLock(lockDir, token) {
   try {
-    // Only ever remove a lock that is still ours: if it was taken over while we
-    // held it (a stall past the stale window), the directory now belongs to
-    // whoever claimed it next.
-    if (readLockHolder(lockDir)?.pid === process.pid) {
+    // Only ever remove the lock we ourselves claimed. If it was taken over while
+    // we held it, the directory belongs to whoever claimed it next — and a PID is
+    // no way to tell them apart, since PIDs are reused and the successor can even
+    // be this same process on a later acquisition. The token is one-off.
+    if (readLockHolder(lockDir)?.token === token) {
       fs.rmSync(lockDir, { recursive: true, force: true });
     }
   } catch {
@@ -265,20 +280,22 @@ function breakStaleLock(lockDir) {
   }
 }
 
+// Returns the token the lock was claimed under; only that token may release it.
 function acquireLock(lockDir, waitMs) {
   const deadline = Date.now() + waitMs;
   for (;;) {
     // Stage the lock with its holder info, then publish it with one rename, so
     // the lock never exists in a state where its holder is unknown.
+    const token = `${process.pid}-${randomBytes(8).toString("hex")}`;
     const staging = fs.mkdtempSync(path.join(path.dirname(lockDir), LOCK_STAGING_PREFIX));
     fs.writeFileSync(
       path.join(staging, LOCK_HOLDER_FILE),
-      `${JSON.stringify({ pid: process.pid, startedAt: nowIso() })}\n`,
+      `${JSON.stringify({ pid: process.pid, token, startedAt: nowIso() })}\n`,
       "utf8"
     );
     try {
       fs.renameSync(staging, lockDir);
-      return;
+      return token;
     } catch (error) {
       fs.rmSync(staging, { recursive: true, force: true });
       if (!LOCK_CONTENDED_CODES.has(error.code)) {
@@ -287,8 +304,10 @@ function acquireLock(lockDir, waitMs) {
     }
 
     if (Date.now() >= deadline) {
+      const holderPid = readLockHolder(lockDir)?.pid;
       throw new Error(
-        `Timed out after ${waitMs} ms waiting for the Codex state lock (${lockDir}). Remove that directory if no Codex command is running.`
+        `Timed out after ${waitMs} ms waiting for the Codex state lock (${lockDir}).` +
+          (holderPid ? ` It is held by pid ${holderPid}; stop that process if it is stuck.` : " Remove that directory if no Codex command is running.")
       );
     }
     if (isLockStale(lockDir)) {
@@ -308,23 +327,23 @@ export function withStateLock(cwd, fn, options = {}) {
 }
 
 function withLockDir(lockDir, fn, options = {}) {
-  const depth = heldLocks.get(lockDir) ?? 0;
-  if (depth > 0) {
-    heldLocks.set(lockDir, depth + 1);
+  const held = heldLocks.get(lockDir);
+  if (held) {
+    held.depth += 1;
     try {
       return fn();
     } finally {
-      heldLocks.set(lockDir, depth);
+      held.depth -= 1;
     }
   }
 
-  acquireLock(lockDir, options.waitMs ?? LOCK_WAIT_MS);
-  heldLocks.set(lockDir, 1);
+  const token = acquireLock(lockDir, options.waitMs ?? LOCK_WAIT_MS);
+  heldLocks.set(lockDir, { depth: 1, token });
   try {
     return fn();
   } finally {
     heldLocks.delete(lockDir);
-    releaseLock(lockDir);
+    releaseLock(lockDir, token);
   }
 }
 

@@ -326,3 +326,91 @@ test("withStateLock gives up when a live holder never releases", () => {
     /state lock/i
   );
 });
+
+// Both writers find the same dead holder at the same moment. Takeover has to be a
+// single winner-takes-it step, or both delete and both enter: two processes doing
+// read-modify-write on state.json is precisely the data loss the lock exists to
+// prevent.
+test("two writers that both find a stale lock still run one at a time", async () => {
+  const workspace = makeTempDir();
+  saveState(workspace, { jobs: [] });
+  const dead = run(process.execPath, ["-e", "process.exit(0)"], { env: process.env });
+  const lockDir = path.join(resolveStateDir(workspace), "state.lock");
+  fs.mkdirSync(lockDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(lockDir, "holder.json"),
+    JSON.stringify({ pid: dead.pid, token: dead.pid + "-gone", startedAt: new Date().toISOString() }),
+    "utf8"
+  );
+
+  const trace = path.join(workspace, "trace.log");
+  const contender = (name) => `
+    import fs from "node:fs";
+    import { upsertJob, withStateLock } from ${STATE_MODULE_URL};
+    const workspace = ${JSON.stringify(workspace)};
+    const trace = ${JSON.stringify(trace)};
+    withStateLock(workspace, () => {
+      fs.appendFileSync(trace, "enter ${name}" + "\\n");
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 300);
+      upsertJob(workspace, { id: "job-${name}", status: "queued" });
+      fs.appendFileSync(trace, "leave ${name}" + "\\n");
+    });
+  `;
+
+  const [first, second] = await Promise.all([
+    collectExit(runModule(contender("a"))),
+    collectExit(runModule(contender("b")))
+  ]);
+  assert.equal(first.code, 0, first.stderr);
+  assert.equal(second.code, 0, second.stderr);
+
+  const steps = fs.readFileSync(trace, "utf8").trim().split("\n");
+  assert.deepEqual(
+    steps.map((line) => line.split(" ")[0]),
+    ["enter", "leave", "enter", "leave"],
+    `critical sections overlapped: ${steps.join(" | ")}`
+  );
+  assert.deepEqual(listJobs(workspace).map((job) => job.id).sort(), ["job-a", "job-b"]);
+});
+
+// Age says nothing about health: a holder that is alive may simply be slow, and
+// stealing its lock puts a second writer inside the critical section. Only a
+// holder that is gone can be evicted; a genuinely stuck one is the operator's
+// call, and the waiter says so instead of helping itself.
+test("a lock held by a live process is never taken over, however old it is", () => {
+  const workspace = makeTempDir();
+  saveState(workspace, { jobs: [] });
+  const lockDir = path.join(resolveStateDir(workspace), "state.lock");
+  fs.mkdirSync(lockDir, { recursive: true });
+  const holder = {
+    pid: process.pid,
+    token: `${process.pid}-live`,
+    startedAt: new Date(Date.now() - 10 * 60 * 1000).toISOString()
+  };
+  fs.writeFileSync(path.join(lockDir, "holder.json"), JSON.stringify(holder), "utf8");
+
+  assert.throws(() => withStateLock(workspace, () => "stolen", { waitMs: 200 }), /state lock/i);
+  assert.deepEqual(
+    JSON.parse(fs.readFileSync(path.join(lockDir, "holder.json"), "utf8")),
+    holder,
+    "a live holder's lock must survive"
+  );
+});
+
+// A writer whose lock was taken over must not take its successor's lock down with
+// it on the way out. The PID is not enough to tell them apart — it is reused, and
+// the successor can even be this same process later — so the holder carries a
+// one-off token.
+test("release only removes a lock this process still owns", () => {
+  const workspace = makeTempDir();
+  saveState(workspace, { jobs: [] });
+  const holderFile = path.join(resolveStateDir(workspace), "state.lock", "holder.json");
+  const successor = { pid: process.pid, token: `${process.pid}-successor`, startedAt: new Date().toISOString() };
+
+  withStateLock(workspace, () => {
+    fs.writeFileSync(holderFile, JSON.stringify(successor), "utf8");
+  });
+
+  assert.equal(fs.existsSync(holderFile), true, "a successor's lock must survive our release");
+  assert.deepEqual(JSON.parse(fs.readFileSync(holderFile, "utf8")), successor);
+});
