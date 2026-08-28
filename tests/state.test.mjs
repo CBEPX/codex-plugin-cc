@@ -11,6 +11,7 @@ import {
   breakStaleLock,
   consumeJobRequestFile,
   listJobs,
+  readJobFile,
   resolveJobFile,
   resolveJobLogFile,
   resolveJobRequestFile,
@@ -449,4 +450,30 @@ test("the stale-lock breaker leaves a successor's lock alone", () => {
   assert.equal(fs.existsSync(holderFile), true, "the successor's lock must survive a late breaker");
   assert.deepEqual(JSON.parse(fs.readFileSync(holderFile, "utf8")), successor);
   assert.throws(() => withStateLock(workspace, () => "stolen", { waitMs: 150 }), /state lock/i);
+});
+
+// A `running` legacy job has already consumed its request: the worker reads the
+// payload (or the record) BEFORE `runTrackedJob` flips the record to `running`.
+// Staging a payload for it would write plaintext `--config` values that nothing
+// ever reads and nothing ever deletes — only a `queued` record still has a worker
+// coming for them.
+test("migrating a running legacy record does not stage a payload nobody consumes", () => {
+  const workspace = makeTempDir();
+  const legacy = {
+    id: "job-running-legacy",
+    status: "running",
+    request: { prompt: "old", config: { "model_providers.x.http_headers.Cookie": "SESSION_SECRET" } }
+  };
+  const jobFile = resolveJobFile(workspace, legacy.id);
+  fs.writeFileSync(jobFile, `${JSON.stringify(legacy, null, 2)}\n`, "utf8");
+
+  const view = readJobFile(jobFile);
+
+  assert.equal(view.request.config["model_providers.x.http_headers.Cookie"], "[redacted]");
+  assert.equal(fs.readFileSync(jobFile, "utf8").includes("SESSION_SECRET"), false, "the record must be redacted on disk");
+  assert.equal(
+    fs.existsSync(resolveJobRequestFile(workspace, legacy.id)),
+    false,
+    "a running job's request has already been consumed; staging it again only leaks it"
+  );
 });

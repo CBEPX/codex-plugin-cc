@@ -505,7 +505,12 @@ export function readJobFile(jobFile) {
       if (!current || !hasStoredConfigValues(current)) {
         return;
       }
-      const active = current.status === "queued" || current.status === "running";
+      // Only a `queued` record still has a worker coming for its request: the
+      // worker consumes the payload (or falls back to the record) *before*
+      // `runTrackedJob` flips the status to `running`, so staging one for a
+      // running job would write plaintext `--config` values that nothing reads
+      // and nothing deletes.
+      const active = current.status === "queued";
       const migrated = withRedactedRequest(current);
       if (active && !fs.existsSync(requestFile)) {
         // Same shape and mode as `writeJobRequestFile`: the temp file carries the

@@ -6,7 +6,7 @@ import { spawn } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { makeTempDir, run } from "./helpers.mjs";
-import { reapDeadJobs } from "../plugins/codex/scripts/lib/tracked-jobs.mjs";
+import { reapDeadJobs, runTrackedJob } from "../plugins/codex/scripts/lib/tracked-jobs.mjs";
 import {
   listJobs,
   readJobFile,
@@ -369,4 +369,30 @@ test("reapDeadJobs reconciles a terminal job file even when the recorded pid is 
   const indexed = listJobs(workspace).find((entry) => entry.id === "job-zombie");
   assert.equal(indexed.status, "completed", "the terminal record must reach the index");
   assert.equal(indexed.pid, null);
+});
+
+// The payload is a 0600 file that can hold `--config` credentials. The worker
+// consumes it on the way in, but a job that never got that far (or a migration
+// that staged one) leaves it behind: nothing revisits a terminal job, so its
+// terminal write is the last chance to release it.
+test("a terminal write releases the job's private request payload", async () => {
+  const workspace = makeTempDir();
+
+  writeJobRequestFile(workspace, "job-done", { prompt: "x", config: { "http_headers.Cookie": "SECRET" } });
+  await runTrackedJob({ id: "job-done", workspaceRoot: workspace, logFile: null }, async () => ({
+    exitStatus: 0,
+    payload: { ok: true },
+    rendered: "done\n",
+    summary: "done"
+  }));
+  assert.equal(fs.existsSync(resolveJobRequestFile(workspace, "job-done")), false, "a completed job must not keep its payload");
+
+  writeJobRequestFile(workspace, "job-thrown", { prompt: "x", config: { "http_headers.Cookie": "SECRET" } });
+  await assert.rejects(
+    runTrackedJob({ id: "job-thrown", workspaceRoot: workspace, logFile: null }, async () => {
+      throw new Error("boom");
+    }),
+    /boom/
+  );
+  assert.equal(fs.existsSync(resolveJobRequestFile(workspace, "job-thrown")), false, "a failed job must not keep its payload");
 });

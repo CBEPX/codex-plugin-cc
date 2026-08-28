@@ -205,6 +205,10 @@ export async function runTrackedJob(job, runner, options = {}) {
       completedAt
     });
     removeJobPidFile(job.workspaceRoot, job.id);
+    // Nothing revisits a terminal job, so this is the last chance to release a
+    // payload the worker never consumed (a crash before the read, or one staged
+    // by the legacy-record migration).
+    removeJobRequestFile(job.workspaceRoot, job.id);
     appendLogBlock(options.logFile ?? job.logFile ?? null, "Final output", execution.rendered);
     return execution;
   } catch (error) {
@@ -229,6 +233,10 @@ export async function runTrackedJob(job, runner, options = {}) {
       completedAt
     });
     removeJobPidFile(job.workspaceRoot, job.id);
+    // Nothing revisits a terminal job, so this is the last chance to release a
+    // payload the worker never consumed (a crash before the read, or one staged
+    // by the legacy-record migration).
+    removeJobRequestFile(job.workspaceRoot, job.id);
     throw error;
   }
 }
