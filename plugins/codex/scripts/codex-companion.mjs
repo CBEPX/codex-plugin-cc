@@ -869,19 +869,17 @@ function spawnDetachedTaskWorker(cwd, jobId) {
   return child;
 }
 
-const PRIVATE_CONFIG_KEY_PATTERN = /key|token|secret|auth|password/i;
-
 // `status --json` / `result --json` echo the stored job record back to the user
-// and to Claude, so a `--config model_providers.x.http_headers.Authorization=...`
-// would end up in the transcript. The worker reads the real values from the
-// private one-shot payload file; the record keeps only a redacted copy.
+// and to Claude, so a `--config model_providers.x.http_headers.Cookie=...` would
+// end up in the transcript and in long-lived state. No key-name heuristic can
+// tell a credential from a harmless override — `Cookie` matches no denylist —
+// so every value is dropped and only the keys are recorded. The worker reads the
+// real values from the private 0600 one-shot payload file.
 function redactPrivateConfigValues(config) {
   if (!config || typeof config !== "object") {
     return config;
   }
-  return Object.fromEntries(
-    Object.entries(config).map(([key, value]) => [key, PRIVATE_CONFIG_KEY_PATTERN.test(key) ? "[redacted]" : value])
-  );
+  return Object.fromEntries(Object.keys(config).map((key) => [key, "[redacted]"]));
 }
 
 function enqueueBackgroundTask(cwd, job, request) {

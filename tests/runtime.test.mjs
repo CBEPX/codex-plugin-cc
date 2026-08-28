@@ -2901,6 +2901,9 @@ test("task --background persists the job record before spawning the worker", () 
   assert.equal(JSON.parse(waited.stdout).job.status, "completed");
 });
 
+// Classifying secrets by key name always misses one: a session cookie header is
+// every bit a credential and matches no denylist. Every `--config` value stays
+// out of the public record; only the keys are kept.
 test("task --background keeps secret --config values out of every job record", () => {
   const repo = seededRepo();
   const binDir = makeTempDir();
@@ -2915,7 +2918,7 @@ test("task --background keeps secret --config values out of every job record", (
       "--background",
       "--json",
       "--config",
-      "model_providers.x.http_headers.Authorization=SECRET_SENTINEL_42",
+      "model_providers.x.http_headers.Cookie=SECRET_SENTINEL_42",
       "--config",
       "model_provider=ollama",
       "x"
@@ -2944,7 +2947,8 @@ test("task --background keeps secret --config values out of every job record", (
   for (const [label, text] of Object.entries(exposures)) {
     assert.equal(text.includes("SECRET_SENTINEL_42"), false, `${label} leaked the secret --config value`);
     assert.equal(text.includes("[redacted]"), true, `${label} should keep the redacted placeholder`);
-    assert.equal(text.includes("ollama"), true, `${label} should keep non-secret config values readable`);
+    assert.equal(text.includes("model_provider"), true, `${label} should still record which config keys were set`);
+    assert.equal(text.includes("ollama"), false, `${label} stored a --config value; keys are recorded, values never are`);
   }
 
   // The one-shot payload file is deleted by the worker once it has read it.
@@ -2952,7 +2956,7 @@ test("task --background keeps secret --config values out of every job record", (
 
   // The worker still forwarded the real value to Codex.
   const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
-  assert.equal(fakeState.lastThreadStart.config["model_providers.x.http_headers.Authorization"], "SECRET_SENTINEL_42");
+  assert.equal(fakeState.lastThreadStart.config["model_providers.x.http_headers.Cookie"], "SECRET_SENTINEL_42");
   assert.equal(fakeState.lastThreadStart.config.model_provider, "ollama");
 });
 
