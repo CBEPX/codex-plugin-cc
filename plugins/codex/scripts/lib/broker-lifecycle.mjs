@@ -236,10 +236,15 @@ function ownsBrokerProcess(pid, endpoint) {
   return !endpoint || commandLine.includes(endpoint);
 }
 
+// Reports whether the recorded process was actually signalled: a PID that no
+// longer looks like this broker is deliberately left alone, and a caller that
+// wonders why a broker outlived its teardown needs to know which it was.
 export function teardownBrokerSession({ endpoint = null, pidFile, logFile, sessionDir = null, pid = null, killProcess = null }) {
+  let signalled = false;
   if (Number.isFinite(pid) && killProcess && ownsBrokerProcess(pid, endpoint)) {
     try {
       killProcess(pid);
+      signalled = true;
     } catch {
       // Ignore missing or already-exited broker processes.
     }
@@ -272,4 +277,6 @@ export function teardownBrokerSession({ endpoint = null, pidFile, logFile, sessi
       // Ignore non-empty or missing directories.
     }
   }
+
+  return { signalled };
 }

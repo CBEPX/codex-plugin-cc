@@ -343,3 +343,40 @@ test("broker refuses shutdown while a client is connected but has not spoken yet
     }
   }
 });
+
+// A client that stops answering must not make the broker immortal. `shutdown()`
+// awaited `server.close()`, which fires only once every connection has closed, and
+// `socket.end()` is a *graceful* half-close: a peer that never answers the FIN
+// leaves the connection open forever. Because SIGTERM is handled (shut down, then
+// exit), that made the broker ignore SIGTERM outright — the process a SessionEnd
+// had just signalled stayed alive, which is what CI caught on a worker whose
+// socket had not been cleaned up yet.
+test("broker exits on SIGTERM even when a client never answers the FIN", async () => {
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const sessionDir = makeTempDir("cxc-");
+  const endpoint = createBrokerEndpoint(sessionDir);
+  const broker = spawnBroker({ cwd: sessionDir, endpoint, env: buildEnv(binDir), idleTimeoutMs: 60000 });
+
+  let halfOpen = null;
+  try {
+    assert.equal(await waitForBrokerEndpoint(endpoint, 3000), true);
+
+    // `allowHalfOpen` keeps this client's side open when the broker sends its FIN,
+    // exactly like a peer that is gone, wedged, or simply slow to notice.
+    halfOpen = net.createConnection({ path: parseBrokerEndpoint(endpoint).path, allowHalfOpen: true });
+    await new Promise((resolve, reject) => {
+      halfOpen.once("connect", resolve);
+      halfOpen.once("error", reject);
+    });
+
+    broker.kill("SIGTERM");
+    const exited = await waitForExit(broker, { timeoutMs: 8000 });
+    assert.equal(exited.code, 0, "the broker must still exit cleanly");
+  } finally {
+    halfOpen?.destroy();
+    if (broker.exitCode === null && broker.signalCode === null) {
+      broker.kill("SIGKILL");
+    }
+  }
+});

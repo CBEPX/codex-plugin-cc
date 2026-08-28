@@ -455,7 +455,7 @@ test("session end reaps a SIGKILLed background worker instead of keeping its bro
   assert.equal(cleanup.status, 0, cleanup.stderr);
 
   const exited = await waitUntil(() => (isAlive(broker.pid) ? null : "exited"), { timeoutMs: 5000 });
-  assert.equal(exited, "exited", "a dead worker must not keep the broker alive");
+  assert.equal(exited, "exited", `a dead worker must not keep the broker alive; hook said: ${cleanup.stderr.trim()}`);
   assert.equal(loadBrokerSession(workspace), null, "the broker record must be cleared");
 
   const job = JSON.parse(fs.readFileSync(stateFile, "utf8")).jobs.find((entry) => entry.id === jobId);

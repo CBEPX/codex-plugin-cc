@@ -112,22 +112,22 @@ function cleanupSessionJobs(cwd, sessionId) {
 // Every kind of job counts, from every session — a foreground job of another
 // Claude session survives this session's cleanup and is talking to the same
 // shared broker, so tearing the broker down here would break its live turn.
-function hasActiveWorkspaceJobs(cwd) {
+function activeWorkspaceJobs(cwd) {
   if (!cwd) {
-    return false;
+    return [];
   }
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const stateFile = resolveStateFile(workspaceRoot);
   if (!fs.existsSync(stateFile)) {
-    return false;
+    return [];
   }
   const state = loadState(workspaceRoot);
   // Reap first: a worker killed outright (SIGKILL, OOM) leaves `running` behind,
   // and trusting that record would keep this broker — and every later session's —
   // alive forever, with the dead job's private payload still on disk.
-  return reapDeadJobs(workspaceRoot, state.jobs).some(
-    (job) => job.status === "queued" || job.status === "running"
-  );
+  return reapDeadJobs(workspaceRoot, state.jobs)
+    .filter((job) => job.status === "queued" || job.status === "running")
+    .map((job) => `${job.id}:${job.status}`);
 }
 
 function handleSessionStart(input) {
@@ -164,7 +164,9 @@ async function handleSessionEnd(input) {
   // once the last client disconnects it exits and clears its own record. With
   // `CODEX_COMPANION_BROKER_IDLE_TIMEOUT_MS=0` that safety net is off, and a
   // broker kept alive here for an active job never exits on its own.
-  if (hasActiveWorkspaceJobs(cwd)) {
+  const activeJobs = activeWorkspaceJobs(cwd);
+  if (activeJobs.length > 0) {
+    process.stderr.write(`[codex] Workspace jobs still active (${activeJobs.join(", ")}); leaving the broker running.\n`);
     return;
   }
 
@@ -188,7 +190,7 @@ async function handleSessionEnd(input) {
     }
   }
 
-  teardownBrokerSession({
+  const teardown = teardownBrokerSession({
     endpoint: brokerEndpoint,
     pidFile,
     logFile,
@@ -196,6 +198,11 @@ async function handleSessionEnd(input) {
     pid,
     killProcess: terminateProcessTree
   });
+  // Every branch of this hook says what it decided: when a broker outlives a
+  // SessionEnd the only question worth asking is which of these four paths ran.
+  process.stderr.write(
+    `[codex] Broker teardown: endpoint=${brokerEndpoint ?? "none"} pid=${pid ?? "none"} signalled=${teardown.signalled}\n`
+  );
 
   // A replacement broker can have started — and recorded itself — while this one
   // was shutting down. Clearing unconditionally would delete the live broker's

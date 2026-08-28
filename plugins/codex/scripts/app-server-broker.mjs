@@ -21,6 +21,13 @@ const STREAMING_METHODS = new Set(["turn/start", "review/start", "thread/compact
 // and needs no PID/liveness signal, so it covers the abnormal-exit orphan, the
 // dead-co-owner orphan, and the lock-contention skip in one mechanism. See #108,
 // #380, and #450.
+// How long a client is given to close its side once the broker has said goodbye.
+// `socket.end()` is a graceful half-close, so a peer that never answers the FIN —
+// one that is wedged, or one whose process is gone but whose close event has not
+// been processed yet — leaves the connection open. Anything still open after this
+// is closed outright.
+const SHUTDOWN_SOCKET_GRACE_MS = 1000;
+
 const IDLE_TIMEOUT_ENV = "CODEX_COMPANION_BROKER_IDLE_TIMEOUT_MS";
 const DEFAULT_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
 
@@ -189,7 +196,20 @@ async function main() {
       socket.end();
     }
     await appClient.close().catch(() => {});
-    await serverClosed;
+    // Never wait on a client indefinitely. SIGTERM is handled here, so a shutdown
+    // that does not return is a broker that ignores SIGTERM — a SessionEnd could
+    // signal it, get on with its teardown, and leave the process running forever.
+    let graceTimer = null;
+    await Promise.race([
+      serverClosed,
+      new Promise((resolve) => {
+        graceTimer = setTimeout(resolve, SHUTDOWN_SOCKET_GRACE_MS);
+      })
+    ]);
+    clearTimeout(graceTimer);
+    for (const socket of sockets) {
+      socket.destroy();
+    }
     if (listenTarget.kind === "unix" && fs.existsSync(listenTarget.path)) {
       fs.unlinkSync(listenTarget.path);
     }
