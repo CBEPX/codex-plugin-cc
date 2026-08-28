@@ -297,12 +297,17 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
     }
   }
 
-  async close() {
-    if (this.closed) {
-      await this.exitPromise;
-      return;
+  // One bounded close per client, memoized: a second call must return the first
+  // call's outcome, never fall through to an unbounded wait on a process that may
+  // have outlived the deadline. The timeout path closes twice by design.
+  close() {
+    if (!this.closePromise) {
+      this.closePromise = this.closeOnce();
     }
+    return this.closePromise;
+  }
 
+  async closeOnce() {
     this.closed = true;
 
     if (this.readline) {

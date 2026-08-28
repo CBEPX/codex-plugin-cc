@@ -118,3 +118,35 @@ test("close() bounds an app-server that ignores SIGTERM", { timeout: 8000 }, asy
   assert.ok(elapsed < 6000, `close() must be bounded, took ${elapsed} ms`);
   assert.equal(client.proc.signalCode, "SIGKILL", "a SIGTERM-immune app-server must be killed outright");
 });
+
+// The bound only ever applied to the first call: a second one took the "already
+// closed" branch and awaited the raw process-exit promise with no deadline at
+// all. The turn timeout always closes twice — `failTurnOnTimeout` closes the
+// runaway app-server, then `withAppServer` closes it again on the way out — so
+// the one case the deadline exists for is exactly the case that hung.
+test("close() stays bounded when it is called twice", { timeout: 15000 }, async (t) => {
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const client = await CodexAppServerClient.connect(binDir, {
+    disableBroker: true,
+    env: buildEnv(binDir, { FAKE_CODEX_IGNORE_SIGTERM: "1" })
+  });
+  const childPid = client.proc.pid;
+  t.after(() => {
+    try {
+      process.kill(childPid, "SIGKILL");
+    } catch {
+      // Already gone.
+    }
+  });
+  // A child nothing can kill: the fixture ignores SIGTERM and stdin EOF, and
+  // swallowing the signals means even the SIGKILL escalation never lands.
+  client.proc.kill = () => true;
+
+  await client.close();
+  const started = Date.now();
+  await client.close();
+
+  assert.ok(Date.now() - started < 1000, `a repeated close must not wait again, took ${Date.now() - started} ms`);
+  assert.equal(client.proc.exitCode, null, "the test needs a child that never exits");
+});
