@@ -337,6 +337,15 @@ That means:
 
 Yes. If you already use Codex, the plugin picks up the same [configuration](#common-configurations).
 
+### A command failed with "Timed out … waiting for the Codex state lock"
+
+Every write to this workspace's job state is serialized by a lock directory, and a
+crashed holder is reclaimed automatically. A holder that is still *running* is
+never evicted — a slow writer and a stuck one look the same from outside, and
+taking the lock from a process that is mid-write is how state gets corrupted — so
+the error names the PID holding it. If that process really is stuck, stop it; the
+next command reclaims the lock on its own.
+
 ### Can I keep using my current API key or base URL setup?
 
 Yes. Because the plugin uses your local Codex CLI, your existing sign-in method and config still apply.
