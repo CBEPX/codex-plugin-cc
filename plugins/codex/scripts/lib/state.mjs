@@ -214,10 +214,13 @@ function readLockHolder(lockDir) {
   }
 }
 
-function isLockStale(lockDir) {
+// Returns the holder snapshot the verdict was based on when the lock is stale —
+// `{ missing: true }` when there was no holder file to read — and null when it is
+// not. The snapshot is what the breaker re-checks before it touches anything.
+function judgeStaleLock(lockDir) {
   const holder = readLockHolder(lockDir);
   if (!holder) {
-    return !(Date.now() - statMtimeMs(lockDir) <= LOCK_ORPHAN_MS);
+    return Date.now() - statMtimeMs(lockDir) <= LOCK_ORPHAN_MS ? null : { missing: true };
   }
 
   const alive = isPidAlive(holder.pid);
@@ -228,16 +231,17 @@ function isLockStale(lockDir) {
     // this lock exists to prevent. A holder that is genuinely stuck has to be
     // killed by the operator (the wait error names its PID); its death is what
     // makes the lock reclaimable.
-    return false;
+    return null;
   }
   if (alive === false) {
-    return true;
+    return holder;
   }
 
   // No usable PID to check, only holder info: age is the only signal left.
   const startedAt = Date.parse(holder.startedAt ?? "");
   const heldSince = Number.isFinite(startedAt) ? startedAt : statMtimeMs(lockDir);
-  return Number.isFinite(heldSince) ? Date.now() - heldSince > LOCK_STALE_MS : true;
+  const expired = Number.isFinite(heldSince) ? Date.now() - heldSince > LOCK_STALE_MS : true;
+  return expired ? holder : null;
 }
 
 function statMtimeMs(target) {
@@ -266,7 +270,21 @@ function releaseLock(lockDir, token) {
 // same moment, and a plain delete lets the slower one remove the lock the faster
 // one has already re-acquired. A rename can only succeed once, so exactly one
 // breaker wins and the loser simply retries.
-function breakStaleLock(lockDir) {
+//
+// `judged` is the holder snapshot the staleness decision was made from. It is
+// re-checked here because that decision is not the same instant as this rename:
+// the faster breaker may already have taken the lock over, and breaking its live
+// lock would put two writers in the critical section — with its own release then
+// silently doing nothing, since the directory it holds would be gone.
+// Exported for the lock's own tests; nothing else calls it.
+// ponytail: a re-read, not a compare-and-swap — a directory rename cannot be
+// conditional. It narrows the window to two adjacent syscalls; closing it fully
+// would need a lock server, which is a lot of machinery for a per-workspace file.
+export function breakStaleLock(lockDir, judged) {
+  const current = readLockHolder(lockDir);
+  if (judged?.missing ? current !== null : current?.token !== judged?.token) {
+    return;
+  }
   const doomed = `${lockDir}.stale-${process.pid}-${Date.now()}`;
   try {
     fs.renameSync(lockDir, doomed);
@@ -310,8 +328,9 @@ function acquireLock(lockDir, waitMs) {
           (holderPid ? ` It is held by pid ${holderPid}; stop that process if it is stuck.` : " Remove that directory if no Codex command is running.")
       );
     }
-    if (isLockStale(lockDir)) {
-      breakStaleLock(lockDir);
+    const stale = judgeStaleLock(lockDir);
+    if (stale) {
+      breakStaleLock(lockDir, stale);
     } else {
       sleepSync(LOCK_POLL_MS);
     }

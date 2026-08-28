@@ -8,6 +8,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { makeTempDir, run } from "./helpers.mjs";
 import {
+  breakStaleLock,
   consumeJobRequestFile,
   listJobs,
   resolveJobFile,
@@ -413,4 +414,39 @@ test("release only removes a lock this process still owns", () => {
 
   assert.equal(fs.existsSync(holderFile), true, "a successor's lock must survive our release");
   assert.deepEqual(JSON.parse(fs.readFileSync(holderFile, "utf8")), successor);
+});
+
+// Judging a lock stale and breaking it are two separate steps, and a lot can
+// happen in between: another waiter that judged the same lock stale can break it
+// and acquire it before this one gets to its own rename. Renaming that live lock
+// aside would put two writers in the critical section — and the winner's release
+// would then silently do nothing, because the lock it holds is gone.
+test("the stale-lock breaker leaves a successor's lock alone", () => {
+  const workspace = makeTempDir();
+  saveState(workspace, { jobs: [] });
+  const lockDir = path.join(resolveStateDir(workspace), "state.lock");
+  const holderFile = path.join(lockDir, "holder.json");
+  const dead = run(process.execPath, ["-e", "process.exit(0)"], { env: process.env });
+
+  fs.mkdirSync(lockDir, { recursive: true });
+  fs.writeFileSync(
+    holderFile,
+    JSON.stringify({ pid: dead.pid, token: `${dead.pid}-gone`, startedAt: new Date().toISOString() }),
+    "utf8"
+  );
+  // What a waiter reads when it decides this lock is stale.
+  const judged = JSON.parse(fs.readFileSync(holderFile, "utf8"));
+
+  // Another waiter got there first: it broke the stale lock and is now holding
+  // its own, under a live pid and a fresh token.
+  fs.rmSync(lockDir, { recursive: true, force: true });
+  fs.mkdirSync(lockDir, { recursive: true });
+  const successor = { pid: process.pid, token: `${process.pid}-successor`, startedAt: new Date().toISOString() };
+  fs.writeFileSync(holderFile, JSON.stringify(successor), "utf8");
+
+  breakStaleLock(lockDir, judged);
+
+  assert.equal(fs.existsSync(holderFile), true, "the successor's lock must survive a late breaker");
+  assert.deepEqual(JSON.parse(fs.readFileSync(holderFile, "utf8")), successor);
+  assert.throws(() => withStateLock(workspace, () => "stolen", { waitMs: 150 }), /state lock/i);
 });
