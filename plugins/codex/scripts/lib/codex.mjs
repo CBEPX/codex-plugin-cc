@@ -628,6 +628,31 @@ export function resolveTurnTimeoutMs(value = null) {
 // server is already misbehaving, so this must never become a second hang.
 const TURN_INTERRUPT_GRACE_MS = 2000;
 
+// How long the turn's own terminal notification (`turn/completed`, whatever
+// status it carries) may take after the interrupt. Answering `turn/interrupt`
+// proves nothing: only that notification proves the runtime stopped the turn.
+const TURN_INTERRUPT_ACK_MS = 10000;
+
+// Resolves true once the turn reached a terminal notification (which is what
+// runs `completeTurn`), false if the runtime stayed silent for the grace period.
+function waitForTurnAcknowledgement(state, timeoutMs) {
+  if (state.completed) {
+    return Promise.resolve(true);
+  }
+  let timer = null;
+  return Promise.race([
+    state.completion.then(() => true),
+    new Promise((resolve) => {
+      timer = setTimeout(() => resolve(false), timeoutMs);
+      timer.unref?.();
+    })
+  ]).finally(() => {
+    if (timer) {
+      clearTimeout(timer);
+    }
+  });
+}
+
 // A timed-out turn is resolved as a normal failed turn — never thrown — so the
 // caller still gets its partial output, the job record still gets a result, and
 // the message reaches stdout instead of only stderr.
@@ -635,7 +660,8 @@ async function failTurnOnTimeout(client, state, timeoutMs) {
   if (state.completed) {
     return;
   }
-  state.error = { message: `turn timed out after ${timeoutMs} ms` };
+  const timeoutMessage = `turn timed out after ${timeoutMs} ms`;
+  state.error = { message: timeoutMessage };
   emitProgress(state.onProgress, `Turn timed out after ${timeoutMs} ms; interrupting.`, "failed");
 
   if (state.turnId) {
@@ -655,6 +681,24 @@ async function failTurnOnTimeout(client, state, timeoutMs) {
         clearTimeout(graceTimer);
       }
     }
+  }
+
+  // Wait for the turn to actually end. With no turnId there was nothing to
+  // interrupt (and notifications are still buffered), so this window only ever
+  // expires — the report then says the turn may still be running, which is the
+  // truth. `completeTurn` already ran if the notification arrived.
+  if (await waitForTurnAcknowledgement(state, TURN_INTERRUPT_ACK_MS)) {
+    return;
+  }
+
+  state.error = {
+    message: `${timeoutMessage}; interrupt not acknowledged — the turn may still be running in the shared runtime, check status or cancel`
+  };
+  // A client that owns its app-server can still stop the turn: killing the
+  // process takes the turn with it. A broker's app-server is shared, so closing
+  // this connection would only hide a turn that keeps writing.
+  if (client.transport !== "broker") {
+    await client.close().catch(() => {});
   }
 
   completeTurn(state, { id: state.turnId ?? "timed-out-turn", status: "failed" });

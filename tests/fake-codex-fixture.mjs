@@ -292,6 +292,18 @@ const CLOSE_DELAY_MS = Number(process.env.FAKE_CODEX_CLOSE_DELAY_MS || 0);
 // Test knob: hold a plain turn open for this long before completing it, so a
 // test can observe a job that is still running.
 const TURN_DELAY_MS = Number(process.env.FAKE_CODEX_TURN_DELAY_MS || 0);
+
+// Test knob: answer turn/interrupt but keep running the turn, the way a real
+// app-server that has wedged on a tool call does. Also records that the client
+// closed the connection, which is the only thing that stops such a turn.
+const IGNORE_INTERRUPT = process.env.FAKE_CODEX_IGNORE_INTERRUPT === "1";
+if (IGNORE_INTERRUPT) {
+  rl.on("close", () => {
+    const closingState = loadState();
+    closingState.clientClosed = true;
+    saveState(closingState);
+  });
+}
 if (CLOSE_DELAY_MS > 0) {
   process.on("SIGTERM", () => {});
   rl.on("close", () => {
@@ -647,7 +659,7 @@ rl.on("line", (line) => {
 	          turnId: message.params.turnId
 	        };
 	        saveState(state);
-	        const pending = interruptibleTurns.get(message.params.turnId);
+	        const pending = IGNORE_INTERRUPT ? null : interruptibleTurns.get(message.params.turnId);
 	        if (pending) {
 	          clearTimeout(pending.timer);
 	          interruptibleTurns.delete(message.params.turnId);

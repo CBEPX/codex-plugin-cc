@@ -3275,6 +3275,41 @@ test("task --turn-timeout-ms interrupts a stalled turn and fails the job with th
   assert.match(latest.errorMessage, /turn timed out after 500 ms/);
 });
 
+// `turn/interrupt` returning is not proof the turn stopped: a wedged app-server
+// answers the RPC and keeps going. Writing `failed` right there claims a turn
+// (possibly a `--write` one) is over while it is still editing files, so the
+// timeout waits for the terminal turn notification and says so when it never
+// arrives. `--resume-last` is the path that owns a direct app-server, so
+// closing the connection is what actually kills the runaway turn.
+test("an unacknowledged interrupt is reported and closes a direct app-server", () => {
+  const repo = seededRepo();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+
+  const seeded = run("node", [SCRIPT, "task", "initial task"], { cwd: repo, env: buildEnv(binDir) });
+  assert.equal(seeded.status, 0, seeded.stderr);
+
+  const env = buildEnv(binDir, { FAKE_CODEX_TURN_DELAY_MS: "20000", FAKE_CODEX_IGNORE_INTERRUPT: "1" });
+  const result = run("node", [SCRIPT, "task", "--resume-last", "--turn-timeout-ms", "500", "--json", "stall please"], {
+    cwd: repo,
+    env
+  });
+
+  assert.equal(result.status, 1, result.stderr);
+
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.ok(fakeState.lastInterrupt, "the timed-out turn must still be interrupted");
+  assert.equal(fakeState.clientClosed, true, "a direct app-server must be closed so the runaway turn dies with it");
+
+  const status = run("node", [SCRIPT, "status", "--json"], { cwd: repo, env: buildEnv(binDir) });
+  assert.equal(status.status, 0, status.stderr);
+  const latest = JSON.parse(status.stdout).latestFinished;
+  assert.equal(latest.status, "failed");
+  assert.match(latest.errorMessage, /turn timed out after 500 ms; interrupt not acknowledged/);
+  assert.match(latest.errorMessage, /may still be running in the shared runtime/);
+});
+
 test("task --turn-timeout-ms survives into the detached background worker", () => {
   const repo = seededRepo();
   const binDir = makeTempDir();
