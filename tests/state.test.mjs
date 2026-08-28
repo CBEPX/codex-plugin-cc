@@ -533,3 +533,66 @@ test("a tombstone left behind by a dead breaker is reclaimed", () => {
   assert.equal(fs.existsSync(lockDir), false, "an abandoned tombstone must not block the takeover");
   assert.equal(fs.existsSync(tomb), false, "the reclaimed tombstone must not be left behind");
 });
+
+// The tombstone is a fence, so it needs the same protection the lock has: a
+// breaker that is merely slow — descheduled, stuck in a syscall — must not lose
+// its fence to a stopwatch. Losing it means two processes breaking the same
+// generation, which is how a successor's live lock gets renamed away.
+test("a tombstone whose owner is alive is never reclaimed, however old it is", () => {
+  const workspace = makeTempDir();
+  saveState(workspace, { jobs: [] });
+  const stateDir = resolveStateDir(workspace);
+  const lockDir = path.join(stateDir, "state.lock");
+  const dead = run(process.execPath, ["-e", "process.exit(0)"], { env: process.env });
+  const holder = { pid: dead.pid, token: `${dead.pid}-gone`, startedAt: new Date().toISOString() };
+  fs.mkdirSync(lockDir, { recursive: true });
+  fs.writeFileSync(path.join(lockDir, "holder.json"), JSON.stringify(holder), "utf8");
+
+  // The breaker that owns this generation is alive and has been working on it
+  // for longer than any timeout would allow.
+  const tomb = path.join(stateDir, `state.lock.tomb-${holder.token}`);
+  fs.mkdirSync(tomb);
+  const owner = { pid: process.pid, token: `${process.pid}-breaker`, startedAt: new Date(Date.now() - 600000).toISOString() };
+  fs.writeFileSync(path.join(tomb, "owner.json"), JSON.stringify(owner), "utf8");
+  const longAgo = new Date(Date.now() - 600000);
+  fs.utimesSync(tomb, longAgo, longAgo);
+
+  breakStaleLock(lockDir, holder);
+
+  assert.equal(fs.existsSync(path.join(lockDir, "holder.json")), true, "a second breaker must not break the lock");
+  assert.deepEqual(
+    JSON.parse(fs.readFileSync(path.join(tomb, "owner.json"), "utf8")),
+    owner,
+    "a live breaker's tombstone must not be taken, nor its owner replaced"
+  );
+});
+
+// The other half of the same rule: an owner that is provably gone releases the
+// fence at once, with no waiting at all — the lock behind it is still stale and
+// somebody has to reclaim it.
+test("a tombstone whose owner is gone is reclaimed at once", () => {
+  const workspace = makeTempDir();
+  saveState(workspace, { jobs: [] });
+  const stateDir = resolveStateDir(workspace);
+  const lockDir = path.join(stateDir, "state.lock");
+  const dead = run(process.execPath, ["-e", "process.exit(0)"], { env: process.env });
+  const holder = { pid: dead.pid, token: `${dead.pid}-gone`, startedAt: new Date().toISOString() };
+  fs.mkdirSync(lockDir, { recursive: true });
+  fs.writeFileSync(path.join(lockDir, "holder.json"), JSON.stringify(holder), "utf8");
+
+  // Freshly created, but its owner died mid-break.
+  const tomb = path.join(stateDir, `state.lock.tomb-${holder.token}`);
+  fs.mkdirSync(tomb);
+  fs.writeFileSync(
+    path.join(tomb, "owner.json"),
+    JSON.stringify({ pid: dead.pid, token: `${dead.pid}-breaker`, startedAt: new Date().toISOString() }),
+    "utf8"
+  );
+
+  const started = Date.now();
+  breakStaleLock(lockDir, holder);
+
+  assert.ok(Date.now() - started < 2000, "a dead breaker must not cost the next one a grace period");
+  assert.equal(fs.existsSync(lockDir), false, "the stale lock must be taken over");
+  assert.equal(fs.existsSync(tomb), false, "the breaker must drop its own tombstone");
+});
