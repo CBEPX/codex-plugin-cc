@@ -56,6 +56,71 @@ export function ensureStateDir(cwd) {
   fs.mkdirSync(resolveJobsDir(cwd), { recursive: true });
 }
 
+export const REDACTED_CONFIG_VALUE = "[redacted]";
+
+// `status --json` / `result --json` echo the stored job record back to the user
+// and to Claude, so a `--config model_providers.x.http_headers.Cookie=…` would end
+// up in the transcript and in long-lived state. No key-name heuristic can tell a
+// credential from a harmless override — `Cookie` matches no denylist — so every
+// value is dropped and only the keys are recorded. The real values reach Codex
+// from the private 0600 one-shot payload file instead.
+export function redactConfigValues(config) {
+  if (!config || typeof config !== "object") {
+    return config;
+  }
+  return Object.fromEntries(Object.keys(config).map((key) => [key, REDACTED_CONFIG_VALUE]));
+}
+
+function hasStoredConfigValues(record) {
+  const config = record?.request?.config;
+  return (
+    Boolean(config) &&
+    typeof config === "object" &&
+    Object.values(config).some((value) => value !== REDACTED_CONFIG_VALUE)
+  );
+}
+
+function withRedactedRequest(record) {
+  return hasStoredConfigValues(record)
+    ? { ...record, request: { ...record.request, config: redactConfigValues(record.request.config) } }
+    : record;
+}
+
+function readJsonOrNull(filePath) {
+  try {
+    return JSON.parse(fs.readFileSync(filePath, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+// Records written before values were redacted (1.1.1 and earlier) carry the raw
+// ones under the same STATE_VERSION, so an upgrade alone would keep serving them.
+// Redaction happens on every read — that is the boundary every `status`/`result`
+// output crosses — and the file is rewritten once so the values stop living in
+// long-lived state. The rewrite re-reads inside the lock and never goes through
+// `saveState`, whose prune is a diff against a snapshot this does not have.
+function migrateStoredConfigValues(cwd, state) {
+  if (!state.jobs.some(hasStoredConfigValues)) {
+    return state;
+  }
+
+  try {
+    withStateLock(cwd, () => {
+      const current = readJsonOrNull(resolveStateFile(cwd));
+      if (!Array.isArray(current?.jobs)) {
+        return;
+      }
+      current.jobs = current.jobs.map(withRedactedRequest);
+      writeFileAtomic(resolveStateFile(cwd), `${JSON.stringify(current, null, 2)}\n`);
+    });
+  } catch {
+    // Best effort: what this read returns is redacted either way.
+  }
+
+  return { ...state, jobs: state.jobs.map(withRedactedRequest) };
+}
+
 export function loadState(cwd) {
   const stateFile = resolveStateFile(cwd);
   if (!fs.existsSync(stateFile)) {
@@ -64,7 +129,7 @@ export function loadState(cwd) {
 
   try {
     const parsed = JSON.parse(fs.readFileSync(stateFile, "utf8"));
-    return {
+    return migrateStoredConfigValues(cwd, {
       ...defaultState(),
       ...parsed,
       config: {
@@ -72,7 +137,7 @@ export function loadState(cwd) {
         ...(parsed.config ?? {})
       },
       jobs: Array.isArray(parsed.jobs) ? parsed.jobs : []
-    };
+    });
   } catch {
     return defaultState();
   }
@@ -195,7 +260,10 @@ function acquireLock(lockDir, waitMs) {
 // anything read before the call may already be stale.
 export function withStateLock(cwd, fn, options = {}) {
   ensureStateDir(cwd);
-  const lockDir = path.join(resolveStateDir(cwd), LOCK_DIR_NAME);
+  return withLockDir(path.join(resolveStateDir(cwd), LOCK_DIR_NAME), fn, options);
+}
+
+function withLockDir(lockDir, fn, options = {}) {
   const depth = heldLocks.get(lockDir) ?? 0;
   if (depth > 0) {
     heldLocks.set(lockDir, depth + 1);
@@ -337,7 +405,31 @@ export function writeJobFile(cwd, jobId, payload) {
 }
 
 export function readJobFile(jobFile) {
-  return JSON.parse(fs.readFileSync(jobFile, "utf8"));
+  const record = JSON.parse(fs.readFileSync(jobFile, "utf8"));
+  if (!hasStoredConfigValues(record)) {
+    return record;
+  }
+
+  // Same one-shot migration as the index, with one exception the ruling for this
+  // fix names: an active job whose private payload file is gone has this record
+  // as the only copy of its request, so the file is left alone — the values still
+  // never leave this function.
+  const requestFile = jobFile.replace(/\.json$/, ".request.json");
+  const active = record.status === "queued" || record.status === "running";
+  if (!active || fs.existsSync(requestFile)) {
+    try {
+      withLockDir(path.join(path.dirname(path.dirname(jobFile)), LOCK_DIR_NAME), () => {
+        const current = readJsonOrNull(jobFile);
+        if (current) {
+          writeFileAtomic(jobFile, `${JSON.stringify(withRedactedRequest(current), null, 2)}\n`);
+        }
+      });
+    } catch {
+      // Best effort: the record this returns is redacted either way.
+    }
+  }
+
+  return withRedactedRequest(record);
 }
 
 function removeJobFile(jobFile) {

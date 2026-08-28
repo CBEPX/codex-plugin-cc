@@ -32,6 +32,7 @@ import {
   getConfig,
   listJobs,
   removeJobPidFile,
+  redactConfigValues,
   removeJobRequestFile,
   resolveJobPid,
   setConfig,
@@ -872,19 +873,6 @@ function spawnDetachedTaskWorker(cwd, jobId) {
   return child;
 }
 
-// `status --json` / `result --json` echo the stored job record back to the user
-// and to Claude, so a `--config model_providers.x.http_headers.Cookie=...` would
-// end up in the transcript and in long-lived state. No key-name heuristic can
-// tell a credential from a harmless override — `Cookie` matches no denylist —
-// so every value is dropped and only the keys are recorded. The worker reads the
-// real values from the private 0600 one-shot payload file.
-function redactPrivateConfigValues(config) {
-  if (!config || typeof config !== "object") {
-    return config;
-  }
-  return Object.fromEntries(Object.keys(config).map((key) => [key, "[redacted]"]));
-}
-
 function enqueueBackgroundTask(cwd, job, request) {
   const { logFile } = createTrackedProgress(job);
   appendLogLine(logFile, "Queued for background execution.");
@@ -903,7 +891,7 @@ function enqueueBackgroundTask(cwd, job, request) {
     pid: null,
     logFile,
     requestFile,
-    request: { ...request, config: redactPrivateConfigValues(request.config) }
+    request: { ...request, config: redactConfigValues(request.config) }
   };
   writeJobFile(job.workspaceRoot, job.id, queuedRecord);
   upsertJob(job.workspaceRoot, queuedRecord);

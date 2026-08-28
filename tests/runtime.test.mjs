@@ -2960,6 +2960,70 @@ test("task --background keeps secret --config values out of every job record", (
   assert.equal(fakeState.lastThreadStart.config.model_provider, "ollama");
 });
 
+// Redaction was added when the job is created, which does nothing for records
+// v1.1.1 already wrote: same `STATE_VERSION`, raw `--config` values, and every
+// `status`/`result --json` still echoing them back after the upgrade.
+test("a v1.1.1 record's --config values never reach status/result and are redacted on disk", () => {
+  const repo = seededRepo();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const env = buildEnv(binDir);
+
+  const seeded = run("node", [SCRIPT, "task", "seed the state dir"], { cwd: repo, env });
+  assert.equal(seeded.status, 0, seeded.stderr);
+
+  const stateDir = resolveStateDir(repo);
+  const statePath = path.join(stateDir, "state.json");
+  const legacyRequest = {
+    cwd: repo,
+    prompt: "legacy prompt",
+    config: { "model_providers.x.http_headers.Cookie": "SESSION_SECRET_FROM_1_1_1" }
+  };
+  const legacyJob = {
+    id: "task-legacy",
+    status: "completed",
+    phase: "done",
+    jobClass: "task",
+    kind: "task",
+    title: "Codex Task",
+    summary: "Legacy job written by 1.1.1",
+    threadId: "thr_legacy",
+    updatedAt: "2026-03-24T20:05:00.000Z",
+    completedAt: "2026-03-24T20:06:00.000Z",
+    request: legacyRequest
+  };
+  const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  state.jobs.push(legacyJob);
+  fs.writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+  const legacyJobFile = path.join(stateDir, "jobs", "task-legacy.json");
+  fs.writeFileSync(
+    legacyJobFile,
+    `${JSON.stringify({ ...legacyJob, result: { status: 0, finalMessage: "legacy output" }, rendered: "legacy output\n" }, null, 2)}\n`,
+    "utf8"
+  );
+
+  const status = run("node", [SCRIPT, "status", "task-legacy", "--json"], { cwd: repo, env });
+  assert.equal(status.status, 0, status.stderr);
+  const result = run("node", [SCRIPT, "result", "task-legacy", "--json"], { cwd: repo, env });
+  assert.equal(result.status, 0, result.stderr);
+
+  const exposures = {
+    "status --json stdout": status.stdout,
+    "result --json stdout": result.stdout,
+    "state index": fs.readFileSync(statePath, "utf8"),
+    "job file": fs.readFileSync(legacyJobFile, "utf8")
+  };
+  for (const [label, text] of Object.entries(exposures)) {
+    assert.equal(text.includes("SESSION_SECRET_FROM_1_1_1"), false, `${label} leaked a legacy --config value`);
+    assert.equal(text.includes("[redacted]"), true, `${label} should carry the redacted placeholder`);
+    assert.equal(
+      text.includes("model_providers.x.http_headers.Cookie"),
+      true,
+      `${label} should still record which config keys were set`
+    );
+  }
+});
+
 test("a resume refuses to start a second turn on a thread another job is still using", () => {
   const repo = seededRepo();
   const binDir = makeTempDir();
