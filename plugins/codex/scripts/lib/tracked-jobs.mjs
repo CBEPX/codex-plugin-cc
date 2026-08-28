@@ -322,12 +322,24 @@ function isQueuedWithoutWorker(job, pid) {
 // A worker that dies without throwing (SIGKILL, OOM, native crash) never
 // reaches runTrackedJob's catch, so its job stays "running" — or, if it died
 // before taking the record over, "queued" — forever. Rewrite any active job
-// whose worker is gone as failed. Known limitation (upstream too): `kill(pid, 0)`
-// reads a zombie as alive and cannot see a recycled pid.
+// whose worker is gone as failed.
+//
+// The job file is read first, for every active entry: it is the authoritative
+// record, and a worker that died between writing it and updating the index
+// leaves an index entry PID liveness cannot correct — `kill(pid, 0)` reads a
+// zombie as alive and cannot see a recycled pid, so that phantom `running` entry
+// would block resume on its thread for as long as anything held that pid. Pid
+// liveness is only consulted for jobs whose own file still says they are active.
 export function reapDeadJobs(workspaceRoot, jobs) {
   return jobs.map((job) => {
     if (job.status !== "running" && job.status !== "queued") {
       return job;
+    }
+    const stored = readStoredJobOrNull(workspaceRoot, job.id);
+    if (stored && stored.status !== "running" && stored.status !== "queued") {
+      // Terminal on disk: markJobDead keeps the real result and reconciles it
+      // into the index rather than failing the job.
+      return markJobDead(workspaceRoot, job, DEAD_WORKER_MESSAGE);
     }
     // The queued record carries no pid of its own — the parent records it in an
     // atomic sidecar instead of rewriting the worker's job file.

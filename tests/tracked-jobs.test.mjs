@@ -342,3 +342,31 @@ test("updateJobPid never rewinds a worker that already reported running", () => 
   assert.equal(indexed.status, "running");
   assert.equal(indexed.pid, 777);
 });
+
+// PID liveness cannot settle this: a zombie and a recycled pid both read as
+// alive, so a worker that died right after its terminal `writeJobFile` kept a
+// phantom `running` entry in the index — blocking resume on that thread — for as
+// long as some process held its pid. The job file is the authoritative record,
+// so it is read first, for every active entry, whatever the pid says.
+test("reapDeadJobs reconciles a terminal job file even when the recorded pid is alive", () => {
+  const workspace = makeTempDir();
+  upsertJob(workspace, { id: "job-zombie", status: "running", phase: "running", threadId: "thr_1", pid: process.pid });
+  writeJobFile(workspace, "job-zombie", {
+    id: "job-zombie",
+    status: "completed",
+    phase: "done",
+    pid: null,
+    threadId: "thr_1",
+    turnId: "turn_9",
+    result: { status: 0, finalMessage: "done" },
+    completedAt: "2026-03-24T20:06:00.000Z"
+  });
+
+  const reaped = reapDeadJobs(workspace, listJobs(workspace));
+
+  assert.equal(reaped[0].status, "completed", "the authoritative job file decides");
+  assert.equal(reaped[0].turnId, "turn_9");
+  const indexed = listJobs(workspace).find((entry) => entry.id === "job-zombie");
+  assert.equal(indexed.status, "completed", "the terminal record must reach the index");
+  assert.equal(indexed.pid, null);
+});

@@ -3011,7 +3011,9 @@ test("a resume refuses to start a second turn on a thread another job is still u
 // `upsertJob`: the job file is terminal, the index still says running. The
 // reaper handed the terminal file back to its caller but left the index alone,
 // so the raw `listJobs()` behind `assertThreadIsFree` kept seeing a phantom
-// running job and blocked every later resume of that thread.
+// running job and blocked every later resume of that thread. The recorded pid
+// here is alive and unrelated (this test runner) — exactly what a zombie or a
+// recycled pid looks like — so nothing but the job file itself can settle it.
 test("a terminal job file reconciles the state index and unblocks resume", () => {
   const repo = seededRepo();
   const binDir = makeTempDir();
@@ -3020,9 +3022,6 @@ test("a terminal job file reconciles the state index and unblocks resume", () =>
 
   const first = run("node", [SCRIPT, "task", "first"], { cwd: repo, env });
   assert.equal(first.status, 0, first.stderr);
-
-  const deadWorker = run(process.execPath, ["-e", ""]);
-  assert.equal(deadWorker.status, 0);
 
   const stateDir = resolveStateDir(repo);
   const statePath = path.join(stateDir, "state.json");
@@ -3035,7 +3034,7 @@ test("a terminal job file reconciles the state index and unblocks resume", () =>
     jobClass: "task",
     sessionId: "sess-other",
     threadId: "thr_1",
-    pid: deadWorker.pid,
+    pid: process.pid,
     summary: "Other session task that died after writing its result",
     updatedAt: "2026-03-24T20:05:00.000Z"
   });
