@@ -184,7 +184,9 @@ function runSessionEndHookAsync(workspace, { env = process.env, sessionId = null
   child.stderr.on("data", (chunk) => {
     stderr += chunk;
   });
-  return new Promise((resolve) => child.on("exit", (status) => resolve({ status, stdout, stderr })));
+  // `close`, not `exit`: the process can exit before its stdio is drained, and
+  // callers assert on what it logged.
+  return new Promise((resolve) => child.on("close", (status) => resolve({ status, stdout, stderr })));
 }
 
 async function waitUntil(predicate, { timeoutMs = 8000, intervalMs = 100 } = {}) {
@@ -647,12 +649,14 @@ test("session end retries a busy answer that is about to clear", async () => {
   fs.writeFileSync(pidFile, "999999\n", "utf8");
   saveBrokerSession(workspace, { endpoint, pidFile, logFile: path.join(sessionDir, "broker.log"), sessionDir, pid: null });
 
-  const started = Date.now();
+  // Count the answers rather than the clock: under load the first handshake can
+  // land after any wall-clock window, and then the retry path is never exercised.
+  let answered = 0;
   const sockets = [];
   const stub = await listenStub(endpoint, (socket) => {
     sockets.push(socket);
     socket.once("data", () => {
-      const stillBusy = Date.now() - started < 300;
+      const stillBusy = answered++ < 2;
       socket.write(`${JSON.stringify({ id: 1, result: stillBusy ? { busy: true } : {} })}\n`);
     });
   });
@@ -694,6 +698,56 @@ test("session end still leaves a persistently busy broker alone", async () => {
     assert.equal(loadBrokerSession(workspace)?.endpoint, endpoint, "a busy broker keeps its record");
     assert.equal(fs.existsSync(pidFile), true, "a busy broker keeps its pid file");
     assert.match(cleanup.stderr, /still serving another session/);
+  } finally {
+    for (const socket of sockets) {
+      socket.destroy();
+    }
+    stub.close();
+    clearBrokerSession(workspace);
+  }
+});
+
+// Every step of this hook has a bound of its own — the state lock, each broker
+// handshake, the busy retries — and they add up past any single one of them. Claude
+// Code kills the hook at the timeout in hooks.json, so a `busy` answer followed by
+// a broker that stops answering used to get the hook killed before it could decide
+// anything. One absolute budget, clamped into every step, keeps the decision inside
+// the host's timeout.
+test("session end stays inside its budget when a busy broker then goes silent", async () => {
+  const workspace = makeTempDir();
+  const sessionDir = makeTempDir("cxc-");
+  const endpoint = createBrokerEndpoint(sessionDir);
+  const pidFile = path.join(sessionDir, "broker.pid");
+  fs.writeFileSync(pidFile, "999999\n", "utf8");
+  saveBrokerSession(workspace, { endpoint, pidFile, logFile: path.join(sessionDir, "broker.log"), sessionDir, pid: null });
+
+  const sockets = [];
+  let answered = 0;
+  const stub = await listenStub(endpoint, (socket) => {
+    sockets.push(socket);
+    socket.once("data", () => {
+      answered += 1;
+      // Busy once, then nothing at all.
+      if (answered === 1) {
+        socket.write(`${JSON.stringify({ id: 1, result: { busy: true } })}\n`);
+      }
+    });
+  });
+
+  const budgetMs = 3000;
+  try {
+    const started = Date.now();
+    const cleanup = await runSessionEndHookAsync(workspace, {
+      env: { ...process.env, CODEX_COMPANION_SESSION_END_BUDGET_MS: String(budgetMs) }
+    });
+    const elapsed = Date.now() - started;
+
+    assert.equal(cleanup.status, 0, cleanup.stderr);
+    assert.ok(elapsed < budgetMs + 2000, `the hook must stay inside its budget, took ${elapsed} ms: ${cleanup.stderr.trim()}`);
+    assert.match(cleanup.stderr, /busyRetries=\d+/, "the decision line must report the retries");
+    assert.match(cleanup.stderr, /leaving it running/, "the hook must log the decision it made");
+    assert.equal(loadBrokerSession(workspace)?.endpoint, endpoint, "an unconfirmed broker keeps its record");
+    assert.equal(fs.existsSync(pidFile), true, "an unconfirmed broker keeps its pid file");
   } finally {
     for (const socket of sockets) {
       socket.destroy();

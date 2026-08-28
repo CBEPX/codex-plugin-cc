@@ -9,6 +9,7 @@ export function runCommand(command, args = [], options = {}) {
     input: options.input,
     maxBuffer: options.maxBuffer,
     stdio: options.stdio ?? "pipe",
+    timeout: options.timeoutMs,
     shell: options.shell ?? (process.platform === "win32" ? (process.env.SHELL || true) : false),
     windowsHide: true
   });
@@ -68,7 +69,7 @@ export function processCommandLine(pid, options = {}) {
   }
 
   const runCommandImpl = options.runCommandImpl ?? runCommand;
-  const result = runCommandImpl("ps", ["-o", "command=", "-p", String(pid)]);
+  const result = runCommandImpl("ps", ["-o", "command=", "-p", String(pid)], { timeoutMs: options.timeoutMs });
   if (result.error || result.status !== 0) {
     return null;
   }

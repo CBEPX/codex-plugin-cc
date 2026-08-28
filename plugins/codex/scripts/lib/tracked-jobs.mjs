@@ -245,8 +245,10 @@ export async function runTrackedJob(job, runner, options = {}) {
 // it trusts, the index entry it rewrites, the artifacts it deletes — has to move
 // as one step, or a concurrent writer's prune can delete the files this just
 // wrote (or resurrect the ones it deleted).
-function markJobDead(workspaceRoot, jobSummary, errorMessage) {
-  return withStateLock(workspaceRoot, () => markJobDeadLocked(workspaceRoot, jobSummary, errorMessage));
+function markJobDead(workspaceRoot, jobSummary, errorMessage, lockWaitMs = undefined) {
+  return withStateLock(workspaceRoot, () => markJobDeadLocked(workspaceRoot, jobSummary, errorMessage), {
+    waitMs: lockWaitMs
+  });
 }
 
 function markJobDeadLocked(workspaceRoot, jobSummary, errorMessage) {
@@ -338,7 +340,9 @@ function isQueuedWithoutWorker(job, pid) {
 // zombie as alive and cannot see a recycled pid, so that phantom `running` entry
 // would block resume on its thread for as long as anything held that pid. Pid
 // liveness is only consulted for jobs whose own file still says they are active.
-export function reapDeadJobs(workspaceRoot, jobs) {
+/** @param {{ lockWaitMs?: number }} [options] Bounds the reaper's own state-lock wait. */
+export function reapDeadJobs(workspaceRoot, jobs, options = {}) {
+  const { lockWaitMs } = options;
   return jobs.map((job) => {
     if (job.status !== "running" && job.status !== "queued") {
       return job;
@@ -347,13 +351,13 @@ export function reapDeadJobs(workspaceRoot, jobs) {
     if (stored && stored.status !== "running" && stored.status !== "queued") {
       // Terminal on disk: markJobDead keeps the real result and reconciles it
       // into the index rather than failing the job.
-      return markJobDead(workspaceRoot, job, DEAD_WORKER_MESSAGE);
+      return markJobDead(workspaceRoot, job, DEAD_WORKER_MESSAGE, lockWaitMs);
     }
     // The queued record carries no pid of its own — the parent records it in an
     // atomic sidecar instead of rewriting the worker's job file.
     const pid = resolveJobPid(workspaceRoot, job);
     if (isPidAlive(pid) === false || isQueuedWithoutWorker(job, pid)) {
-      return markJobDead(workspaceRoot, job, DEAD_WORKER_MESSAGE);
+      return markJobDead(workspaceRoot, job, DEAD_WORKER_MESSAGE, lockWaitMs);
     }
     return job;
   });

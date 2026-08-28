@@ -62,7 +62,7 @@ const SHUTDOWN_HANDSHAKE_MS = 5000;
 // The reply is framed by newline and matched by request id: a socket is a byte
 // stream, and parsing whatever a single `data` event happened to carry turned a
 // split `{"busy":true}` into "not busy" — a broker destroyed under a live turn.
-export async function sendBrokerShutdown(endpoint) {
+export async function sendBrokerShutdown(endpoint, { timeoutMs = SHUTDOWN_HANDSHAKE_MS } = {}) {
   return await new Promise((resolve) => {
     const socket = connectToEndpoint(endpoint);
     socket.setEncoding("utf8");
@@ -72,7 +72,7 @@ export async function sendBrokerShutdown(endpoint) {
       socket.destroy();
       resolve({ busy });
     };
-    const deadline = setTimeout(() => finish(null), SHUTDOWN_HANDSHAKE_MS);
+    const deadline = setTimeout(() => finish(null), timeoutMs);
 
     socket.on("connect", () => {
       socket.write(`${JSON.stringify({ id: SHUTDOWN_REQUEST_ID, method: "broker/shutdown", params: {} })}\n`);
@@ -225,11 +225,11 @@ export async function ensureBrokerSession(cwd, options = {}) {
 // record behind long enough for the OS to hand the PID — and with it the process
 // group `terminateProcessTree` kills — to something unrelated. Windows has no
 // cheap equivalent probe, so it keeps the previous unconditional behavior.
-function ownsBrokerProcess(pid, endpoint) {
+function ownsBrokerProcess(pid, endpoint, timeoutMs) {
   if (process.platform === "win32") {
     return true;
   }
-  const commandLine = processCommandLine(pid);
+  const commandLine = processCommandLine(pid, { timeoutMs });
   if (!commandLine || !commandLine.includes("app-server-broker.mjs")) {
     return false;
   }
@@ -239,9 +239,9 @@ function ownsBrokerProcess(pid, endpoint) {
 // Reports whether the recorded process was actually signalled: a PID that no
 // longer looks like this broker is deliberately left alone, and a caller that
 // wonders why a broker outlived its teardown needs to know which it was.
-export function teardownBrokerSession({ endpoint = null, pidFile, logFile, sessionDir = null, pid = null, killProcess = null }) {
+export function teardownBrokerSession({ endpoint = null, pidFile, logFile, sessionDir = null, pid = null, killProcess = null, timeoutMs = undefined }) {
   let signalled = false;
-  if (Number.isFinite(pid) && killProcess && ownsBrokerProcess(pid, endpoint)) {
+  if (Number.isFinite(pid) && killProcess && ownsBrokerProcess(pid, endpoint, timeoutMs)) {
     try {
       killProcess(pid);
       signalled = true;

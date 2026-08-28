@@ -449,3 +449,21 @@ test("bump-version --check pins the lockfile identity to package.json", () => {
   assert.equal(lock.name, pkg.name);
   assert.equal(lock.packages[""].name, pkg.name);
 });
+
+// The hook bounds its own work with `SESSION_END_BUDGET_MS`; Claude Code kills it at
+// the timeout in hooks.json. If the second ever drops below the first the hook is
+// killed mid-decision instead of reporting one, so the two numbers are asserted
+// together — that is the only thing keeping them from drifting apart.
+test("the SessionEnd hook timeout stays above the hook's own budget", () => {
+  const hooks = JSON.parse(read("hooks/hooks.json"));
+  const timeoutSeconds = hooks.hooks.SessionEnd[0].hooks[0].timeout;
+  const source = read("scripts/session-lifecycle-hook.mjs");
+  const budgetMs = Number(/const SESSION_END_BUDGET_MS = (\d+);/.exec(source)?.[1]);
+
+  assert.ok(Number.isFinite(budgetMs), "the hook must declare SESSION_END_BUDGET_MS");
+  assert.ok(Number.isFinite(timeoutSeconds), "hooks.json must give SessionEnd a timeout");
+  assert.ok(
+    timeoutSeconds * 1000 > budgetMs,
+    `hooks.json SessionEnd timeout (${timeoutSeconds}s) must exceed the hook budget (${budgetMs}ms)`
+  );
+});
