@@ -368,6 +368,12 @@ function ticketIsBefore(left, right) {
   return left.number === right.number ? left.token < right.token : left.number < right.number;
 }
 
+// A stable discriminator for the one lock failure a caller may reasonably absorb.
+// Matching on the message cannot tell this apart from an integrity error that names
+// the same lock — or from a filesystem error whose path happens to contain the
+// phrase — and swallowing either of those would hide a real fault.
+export const STATE_LOCK_TIMEOUT_CODE = "CODEX_STATE_LOCK_TIMEOUT";
+
 function lockTimeoutError(lockDir, blockers, waitMs) {
   // The remembered blockers are from the last scan, and some may have been cleared
   // since — including by this waiter. Name one that is still there, or say plainly
@@ -385,16 +391,20 @@ function lockTimeoutError(lockDir, blockers, waitMs) {
       .filter((entry) => entry.number !== undefined)
       .sort((left, right) => (ticketIsBefore(left, right) ? -1 : 1))[0] ?? visible[0];
   if (!lowest) {
-    return new Error(
-      `Timed out after ${waitMs} ms waiting for the Codex state lock (${lockDir}); no blocker visible now.`
+    return Object.assign(
+      new Error(`Timed out after ${waitMs} ms waiting for the Codex state lock (${lockDir}); no blocker visible now.`),
+      { code: STATE_LOCK_TIMEOUT_CODE }
     );
   }
   // The blocker may be a ticket or a client still choosing its number.
   const entryPath = path.join(lockDir, lowest.name);
   const pid = readJsonOrNull(entryPath)?.pid ?? "unknown";
-  return new Error(
-    `Timed out after ${waitMs} ms waiting for the Codex state lock. It is held by pid ${pid} (entry ${entryPath}). ` +
-      `Stop that process if it is stuck; if pid ${pid} is not a Codex process (pid reuse), remove that entry file.`
+  return Object.assign(
+    new Error(
+      `Timed out after ${waitMs} ms waiting for the Codex state lock. It is held by pid ${pid} (entry ${entryPath}). ` +
+        `Stop that process if it is stuck; if pid ${pid} is not a Codex process (pid reuse), remove that entry file.`
+    ),
+    { code: STATE_LOCK_TIMEOUT_CODE }
   );
 }
 

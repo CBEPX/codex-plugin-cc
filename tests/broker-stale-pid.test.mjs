@@ -845,3 +845,63 @@ test("session end reports a wedged state lock instead of dying on it", async () 
   assert.match(cleanup.stderr, /budgetExhausted=true/, "the decision line must say the budget decided it");
   assert.match(cleanup.stderr, /state lock/i, "the decision line must name the lock");
 });
+
+// Matching the message would swallow more than the timeout: the lock's own
+// integrity error names the same lock, and any filesystem error whose path happens
+// to contain the phrase reads the same way. Only the typed timeout may be absorbed;
+// everything else has to fail the hook loudly.
+test(
+  "session end fails on a lock error that is not the timeout",
+  { skip: process.platform === "win32" || process.getuid?.() === 0 },
+  async () => {
+    const workspace = makeTempDir();
+    const pluginData = path.join(makeTempDir(), "state lock data");
+    fs.mkdirSync(pluginData, { recursive: true });
+
+    const previous = process.env.CLAUDE_PLUGIN_DATA;
+    process.env.CLAUDE_PLUGIN_DATA = pluginData;
+    let stateDir;
+    try {
+      stateDir = resolveStateDir(workspace);
+    } finally {
+      if (previous === undefined) {
+        delete process.env.CLAUDE_PLUGIN_DATA;
+      } else {
+        process.env.CLAUDE_PLUGIN_DATA = previous;
+      }
+    }
+    // The lock's path now contains the phrase a message match would key on.
+    assert.match(stateDir, /state lock/);
+
+    fs.mkdirSync(path.join(stateDir, "jobs"), { recursive: true });
+    fs.writeFileSync(
+      path.join(stateDir, "state.json"),
+      `${JSON.stringify(
+        {
+          version: 1,
+          config: { stopReviewGate: false },
+          jobs: [{ id: "task-done", status: "completed", sessionId: "sess-current", updatedAt: "2026-03-24T20:05:00.000Z" }]
+        },
+        null,
+        2
+      )}\n`,
+      "utf8"
+    );
+    const lockDir = path.join(stateDir, "state.lock.d");
+    fs.mkdirSync(lockDir, { recursive: true });
+    fs.chmodSync(lockDir, 0o000);
+
+    try {
+      const cleanup = await runSessionEndHookAsync(workspace, {
+        env: { ...process.env, CLAUDE_PLUGIN_DATA: pluginData },
+        sessionId: "sess-current"
+      });
+
+      assert.equal(cleanup.status, 1, `a real lock failure must fail the hook: ${cleanup.stderr.trim()}`);
+      assert.match(cleanup.stderr, /EACCES/, "the real error must reach the operator");
+      assert.doesNotMatch(cleanup.stderr, /budgetExhausted/, "a real failure must not be reported as a spent budget");
+    } finally {
+      fs.chmodSync(lockDir, 0o700);
+    }
+  }
+);

@@ -359,8 +359,12 @@ export function reapDeadJobs(workspaceRoot, jobs, options = {}) {
     const left = Math.max(0, remainingMs());
     return lockWaitMs === undefined ? left : Math.min(lockWaitMs, left);
   };
-  return jobs.map((job) => {
+  const deferred = [];
+  const reaped = jobs.map((job) => {
     if (remainingMs && remainingMs() < REAP_MIN_STEP_MS) {
+      // Left as-is for the next run — say so, or a job that is dead but still
+      // listed as running looks like a live one to whoever reads the decision.
+      deferred.push(job.id);
       return job;
     }
     if (job.status !== "running" && job.status !== "queued") {
@@ -380,6 +384,10 @@ export function reapDeadJobs(workspaceRoot, jobs, options = {}) {
     }
     return job;
   });
+  if (deferred.length > 0) {
+    process.stderr.write(`[codex] Reaper ran out of budget; not judged this run: ${deferred.join(", ")}.\n`);
+  }
+  return reaped;
 }
 
 // Guards only against in-process crashes (uncaughtException / unhandledRejection)

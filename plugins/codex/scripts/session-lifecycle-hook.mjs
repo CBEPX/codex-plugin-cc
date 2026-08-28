@@ -13,7 +13,7 @@ import {
   sendBrokerShutdown,
   teardownBrokerSession
 } from "./lib/broker-lifecycle.mjs";
-import { loadState, resolveJobPid, resolveStateFile, saveState, withStateLock } from "./lib/state.mjs";
+import { loadState, resolveJobPid, resolveStateFile, saveState, STATE_LOCK_TIMEOUT_CODE, withStateLock } from "./lib/state.mjs";
 import { reapDeadJobs } from "./lib/tracked-jobs.mjs";
 import { TRANSCRIPT_PATH_ENV } from "./lib/claude-session-transfer.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
@@ -202,12 +202,15 @@ async function handleSessionEnd(input) {
   } catch (error) {
     // A lock this hook could not take says nothing about the broker, and a
     // SessionEnd that dies here would take its decision with it: report and leave
-    // everything alone. Anything else is a real fault and still fails the hook.
-    if (!/state lock/i.test(error instanceof Error ? error.message : String(error))) {
+    // everything alone. Only that one typed failure — matching the message would
+    // also swallow an integrity error naming the same lock, or a filesystem error
+    // whose path contains the phrase. Anything else is a real fault and still fails
+    // the hook.
+    if (error?.code !== STATE_LOCK_TIMEOUT_CODE) {
       throw error;
     }
     process.stderr.write(
-      `[codex] SessionEnd could not take the state lock (budgetExhausted=true lock=${error.message}); leaving the broker running.\n`
+      `[codex] SessionEnd could not take the state lock (budgetExhausted=true lock=${String(error?.message ?? error)}); leaving the broker running.\n`
     );
     return;
   }
@@ -222,7 +225,9 @@ async function handleSessionEnd(input) {
   // `CODEX_COMPANION_BROKER_IDLE_TIMEOUT_MS=0` that safety net is off, and a
   // broker kept alive here for an active job never exits on its own.
   if (activeJobs.length > 0) {
-    process.stderr.write(`[codex] Workspace jobs still active (${activeJobs.join(", ")}); leaving the broker running.\n`);
+    process.stderr.write(
+      `[codex] Workspace jobs still active (${activeJobs.join(", ")} budgetExhausted=${remainingMs() < MIN_STEP_MS}); leaving the broker running.\n`
+    );
     return;
   }
 
