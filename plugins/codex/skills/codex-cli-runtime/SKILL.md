@@ -26,7 +26,7 @@ Execution rules:
 
 Command selection:
 - If the request names an uncommon domain (private infra runbooks, vendor-specific tooling), prepend to the task text: "If a matching skill is not already loaded, run `$agent-compat:skill-router` to find a reviewed playbook before starting." (Codex has the agent-compat plugin installed; it routes to reviewed route-only skills offline.)
-- Launch exactly one job per rescue handoff with `task --await --prompt-stdin`; on exit 3 the job is still running — re-run exactly the printed `Re-run: node "…" result <id> --wait --timeout-ms 540000` line for that same job until it exits 0 or 1.
+- Launch exactly one job per rescue handoff with `task --await --prompt-stdin`; on exit 3 the job is still running — re-run exactly the printed `Re-run: node "…" result <id> --wait --timeout-ms 540000` line for that same job until it exits 0 (that call's exit code only reports whether a terminal record was retrieved, not whether the job succeeded).
 - The detached worker outlives the companion only when the companion returns on its own (exit 3); a host process-tree kill — e.g. Claude Code's Bash timeout — also kills the worker, so keep `--await-timeout-ms` below the host limit (default 540000 < 600000).
 - There is no shell state between calls — the retry is the literal `Re-run:` hint text printed by the previous call, not a `$JOB` shell variable. If the retry itself is cut off by the Bash tool's own 10-minute timeout, re-issue the same literal id again; the job keeps running server-side.
 - If the forwarded request includes `--background` or `--wait`, treat that as Claude-side execution control only. Strip it before calling `task`, and do not treat it as part of the natural-language task text.

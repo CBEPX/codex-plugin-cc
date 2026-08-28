@@ -101,6 +101,9 @@ test("rescue command absorbs continue semantics", () => {
   // and the inline (no-fork) execution.
   assert.match(rescue, /invoke the `Agent` tool with `codex:codex-rescue`/);
   assert.match(rescue, /do not call `Skill\(codex:rescue\)`/i);
+  // Covers the separate `task-resume-candidate --json` Bash call too: it isn't
+  // part of the payload block, so it needs its own non-zero-exit fallback.
+  assert.match(rescue, /If any Bash step exits non-zero, show its stderr to the user — never report "no result"/i);
   assert.doesNotMatch(rescue, /^context:\s*fork\b/m);
   assert.match(rescue, /--background\|--wait/);
   assert.match(rescue, /--resume\|--fresh/);
@@ -116,7 +119,7 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(agent, /--resume/);
   assert.match(agent, /--fresh/);
   assert.match(agent, /thin forwarding wrapper/i);
-  assert.match(agent, /result <id> --wait --timeout-ms 540000/);
+  assert.match(agent, /the output ends with a `Re-run:` line/i);
   assert.doesNotMatch(agent, /prefer background execution/i);
   assert.match(runtimeSkill, /Launch exactly one job per rescue handoff with `task --await --prompt-stdin`/i);
   assert.match(agent, /Bash tool's 10-minute cap/i);
@@ -166,15 +169,19 @@ test("rescue runs synchronously through the companion and uses Agent only for --
   const agent = fs.readFileSync(path.join(PLUGIN_ROOT, "agents", "codex-rescue.md"), "utf8");
   const runtimeSkill = fs.readFileSync(path.join(PLUGIN_ROOT, "skills", "codex-cli-runtime", "SKILL.md"), "utf8");
   assert.match(rescue, /task --await --prompt-stdin/);
-  assert.match(rescue, /result <id> --wait --timeout-ms 540000/);
+  assert.match(rescue, /the output ends with a `Re-run:` line/i);
   assert.match(rescue, /`--background`: invoke the `Agent` tool with `codex:codex-rescue`/);
   assert.match(rescue, /--config/);
   assert.doesNotMatch(agent, /^model:/m);
   assert.doesNotMatch(agent, /return nothing/i);
   assert.match(agent, /exit status and stderr/i);
   assert.match(agent, /task --await --prompt-stdin/);
-  assert.match(agent, /result <id> --wait --timeout-ms 540000/);
+  assert.match(agent, /the output ends with a `Re-run:` line/i);
   assert.doesNotMatch(agent, /task-resume-candidate --json/);
+  // Fix round 1: the agent must defer to SKILL.md's "only permitted follow-up
+  // is the printed Re-run line" rule instead of granting itself a separate
+  // bare-`status` permission.
+  assert.doesNotMatch(agent, /own `status`/);
   assert.match(agent, /--config/);
   assert.doesNotMatch(runtimeSkill, /return nothing/i);
   assert.match(runtimeSkill, /Map `sol` to `--model gpt-5\.6-sol`/i);

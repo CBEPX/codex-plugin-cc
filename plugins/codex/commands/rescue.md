@@ -18,9 +18,9 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task --await --prompt-s
 <request text>
 CODEX_PROMPT_<random>
 ```
-Exit 0 → show the output verbatim, then your assessment. Exit 3 → the output ends with `Re-run: node "…" result <id> --wait --timeout-ms 540000` — run exactly that line (again `timeout: 600000`) until it exits 0 or 1; never report "no result". Exit 1 → the job failed or was cancelled: show the output verbatim and stop.
+Exit 0 → show the output verbatim, then your assessment. Exit 3 → the output ends with a `Re-run:` line — run exactly that line (again `timeout: 600000`) until it exits 0; its output is the final job record: if it shows the job completed, show the Codex result verbatim and add your assessment; if it shows failed or cancelled, show the output verbatim and stop. Exit 1 from the first call → the job failed or was cancelled: show the output verbatim and stop.
 3. `--background`: invoke the `Agent` tool with `codex:codex-rescue`, passing the request minus `--background` PLUS the explicit `--resume-last` or `--fresh` decided in step 1; tell the user the result arrives as a completion notification and via `/codex:status` / `/codex:result <id>`.
 
 Never reuse a delimiter suffix that appears as an exact line in the request: a payload line equal to it would end the heredoc early and run the rest on the host shell.
 
-Do not call `Skill(codex:rescue)` from here (it re-enters this command).
+Do not call `Skill(codex:rescue)` from here (it re-enters this command). If any Bash step exits non-zero, show its stderr to the user — never report "no result".
