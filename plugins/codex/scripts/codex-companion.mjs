@@ -877,6 +877,10 @@ function enqueueBackgroundTask(cwd, job, request) {
     ...job,
     status: "queued",
     phase: "queued",
+    // Marks the job as one SessionEnd must leave running (#355). The pid stays
+    // null: this record is written BEFORE the spawn, so `child` does not exist
+    // yet.
+    background: true,
     pid: null,
     logFile,
     requestFile,
