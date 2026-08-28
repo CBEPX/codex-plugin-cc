@@ -173,138 +173,40 @@ function removeFileIfExists(filePath) {
 // `saveState` deletes the artifacts of every job that was in the file it read but
 // is not in the snapshot it writes. Unserialized, a process whose snapshot went
 // stale therefore does not merely lose another process's job from the index — it
-// deletes that job's file, private payload, PID sidecar and log. The lock is a
-// directory, claimed by renaming a staged one onto it: a directory rename fails
-// against a non-empty target, so the claim and the holder info inside it land in
-// one atomic step. That matters more than the atomicity of `mkdir` — a holder
-// killed between `mkdir` and writing its own PID would leave a lock nothing can
-// attribute to a process, which is exactly how a SessionEnd hook once sat out
-// the whole bounded wait and left a broker running.
+// deletes that job's file, private payload, PID sidecar and log.
+//
+// The lock is a Lamport bakery on files. Every scheme that takes a lock away from
+// its owner is a check-then-act on a shared path — judge it, then remove or
+// replace it — and POSIX gives no conditional replace, so whatever was judged can
+// change before the act. Here nothing shared is ever replaced or removed: an
+// acquirer only ever creates files whose names are unique to it
+// (`choosing.<token>`, `<n>.<token>.ticket`), and the only deletions are `unlink`s
+// of one exact name whose content never changes — so a verdict about that file
+// cannot go stale between the verdict and the unlink. The directory itself is
+// created once and never removed.
+//
+// A pre-1.2.0 `state.lock` directory, if one is left over, is not read, removed or
+// otherwise touched: that format never shipped.
 // ponytail: one lock per workspace, no reader/writer split — every mutation is a
 // few file writes, so a shared-read lock would only add ways to get it wrong.
-const LOCK_DIR_NAME = "state.lock";
-const LOCK_STAGING_PREFIX = ".state.lock-";
-// One tombstone per lock generation: claiming it is what elects the single
-// process allowed to break that generation. It is claimed exactly like the lock —
-// owner info inside, published by rename — because it is a lock, on the right to
-// break one generation.
-const LOCK_TOMB_PREFIX = "state.lock.tomb-";
-const LOCK_TOMB_OWNER_FILE = "owner.json";
-const LOCK_HOLDER_FILE = "holder.json";
+const LOCK_DIR_NAME = "state.lock.d";
+const LOCK_CHOOSING_PREFIX = "choosing.";
+const LOCK_TICKET_SUFFIX = ".ticket";
 const LOCK_WAIT_MS = 5000;
 const LOCK_POLL_MS = 25;
-const LOCK_STALE_MS = 30000;
-// A lock with no readable holder can only be a leftover: acquisition never
-// publishes one without holder info, so nobody is coming back for it. Age is all
-// there is to go on, and it has to expire well inside the bounded wait.
+// How long an entry nothing can be learned from — unreadable, or written by a
+// process that died between the two syscalls — may sit before it counts as debris.
 const LOCK_ORPHAN_MS = 2000;
-// Renaming a directory onto a non-empty one fails; the code depends on the
-// platform (POSIX ENOTEMPTY/EEXIST, Windows EPERM/EACCES). Anything else is a
-// real filesystem error and is rethrown.
-const LOCK_CONTENDED_CODES = new Set(["EEXIST", "ENOTEMPTY", "EPERM", "EACCES"]);
+// ... and how long one whose PID cannot be checked at all may hold up the queue.
+const LOCK_STALE_MS = 30000;
 
-// Locks this process already holds, with the token each was claimed under: a
-// locked section may call another one (`updateState` → `saveState`) and must not
-// deadlock against itself.
+// Locks this process already holds, with the ticket each was taken under: a locked
+// section may call another one (`updateState` → `saveState`) and must not deadlock
+// against itself.
 const heldLocks = new Map();
 
 function sleepSync(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-}
-
-function readDirOwner(dir, ownerFile) {
-  try {
-    return JSON.parse(fs.readFileSync(path.join(dir, ownerFile), "utf8"));
-  } catch {
-    return null;
-  }
-}
-
-function readLockHolder(lockDir) {
-  return readDirOwner(lockDir, LOCK_HOLDER_FILE);
-}
-
-// Publish `dir` with its owner already inside it: the owner file is written into
-// a staging directory and the whole thing is renamed into place, and a rename
-// against a non-empty directory fails. So the claim is atomic, only one claimant
-// can win, and a claimed directory never exists without an owner to answer for it.
-function claimDir(dir, ownerFile, owner) {
-  // An empty directory is a legal rename target, so a claim that lost its owner
-  // file would be taken over silently, behind the abandonment rules. Anything
-  // already at this path has to be judged and removed first; the rename then
-  // settles the race between claimants that both saw the path free.
-  if (fs.existsSync(dir)) {
-    return false;
-  }
-  const staging = fs.mkdtempSync(path.join(path.dirname(dir), LOCK_STAGING_PREFIX));
-  fs.writeFileSync(path.join(staging, ownerFile), `${JSON.stringify(owner)}\n`, "utf8");
-  try {
-    fs.renameSync(staging, dir);
-    return true;
-  } catch (error) {
-    fs.rmSync(staging, { recursive: true, force: true });
-    if (!LOCK_CONTENDED_CODES.has(error.code)) {
-      throw error;
-    }
-    return false;
-  }
-}
-
-// One verdict for both claimed directories — the lock and a breaker's tombstone.
-// A live owner is never evicted, whatever the clock says: from out here a slow
-// owner and a stuck one look identical, and evicting either puts two processes
-// past the same fence. A dead owner releases it at once; an owner we cannot read
-// at all is abandoned after a short grace, and one with no usable PID after the
-// long one. Returns the snapshot the verdict was based on, or null when the
-// directory is still someone's.
-function judgeAbandoned(dir, ownerFile) {
-  const owner = readDirOwner(dir, ownerFile);
-  if (!owner) {
-    return Date.now() - statMtimeMs(dir) <= LOCK_ORPHAN_MS ? null : { missing: true };
-  }
-
-  const alive = isPidAlive(owner.pid);
-  if (alive === true) {
-    return null;
-  }
-  if (alive === false) {
-    return owner;
-  }
-
-  const startedAt = Date.parse(owner.startedAt ?? "");
-  const heldSince = Number.isFinite(startedAt) ? startedAt : statMtimeMs(dir);
-  const expired = Number.isFinite(heldSince) ? Date.now() - heldSince > LOCK_STALE_MS : true;
-  return expired ? owner : null;
-}
-
-// Never remove a claimed directory we no longer own: if it was taken over, it
-// belongs to whoever claimed it next — and a PID cannot tell them apart, since
-// PIDs are reused and the successor can even be this same process later.
-function releaseClaimedDir(dir, ownerFile, token) {
-  try {
-    if (readDirOwner(dir, ownerFile)?.token === token) {
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
-  } catch {
-    // What we cannot remove is reclaimed by the next claimant once it goes stale.
-  }
-}
-
-// Returns the holder snapshot the verdict was based on when the lock is stale —
-// `{ missing: true }` when there was no holder file to read — and null when it is
-// not. The snapshot is what the breaker re-checks before it touches anything. A
-// holder that is still running is never stale: it has to be stopped by the
-// operator, and the wait error names its PID.
-function judgeStaleLock(lockDir) {
-  return judgeAbandoned(lockDir, LOCK_HOLDER_FILE);
-}
-
-function statInode(target) {
-  try {
-    return fs.statSync(target).ino;
-  } catch {
-    return null;
-  }
 }
 
 function statMtimeMs(target) {
@@ -315,136 +217,153 @@ function statMtimeMs(target) {
   }
 }
 
-function releaseLock(lockDir, token) {
-  releaseClaimedDir(lockDir, LOCK_HOLDER_FILE, token);
-}
-
-// Claim it before deleting it: two writers can judge the same lock stale at the
-// same moment, and a plain delete lets the slower one remove the lock the faster
-// one has already re-acquired. A rename can only succeed once, so exactly one
-// breaker wins and the loser simply retries.
-//
-// `judged` is the holder snapshot the staleness decision was made from, and it
-// names the generation this breaker is entitled to remove. The decision and this
-// rename are not the same instant: a faster breaker can take the lock over in
-// between, and renaming its live lock aside would put two writers in the critical
-// section — with the winner's release then silently doing nothing, since the
-// directory it holds would be gone.
-//
-// The fence is the tombstone: `mkdir` of a name derived from the judged
-// generation succeeds for exactly one process, and only that process may break.
-// A breaker that loses returns and goes back to waiting on whatever lock is there
-// now. The holder re-check below covers the one remaining shape — a tombstone
-// recycled after the winner finished — because the successor's token can never
-// match the judged one.
-// Exported for the lock's own tests; nothing else calls it.
-export function breakStaleLock(lockDir, judged) {
-  const tomb = resolveLockTomb(lockDir, judged);
-  const claim = tomb ? claimLockTomb(tomb) : null;
-  if (!claim) {
-    return;
+// A live owner is never evicted, whatever the clock says: from out here a slow
+// process and a stuck one look identical, and evicting either puts two writers in
+// the critical section. A dead one releases its place at once; an entry nothing
+// can be read from is debris after a short grace; one whose PID cannot be checked
+// (EPERM, or no PID at all) after a long one. A stuck live owner is the operator's
+// call — the timeout error names it.
+function isLockEntryAbandoned(entryPath) {
+  const owner = readJsonOrNull(entryPath);
+  if (!owner) {
+    return !(Date.now() - statMtimeMs(entryPath) <= LOCK_ORPHAN_MS);
   }
 
-  let ownsTomb = true;
+  const alive = isPidAlive(owner.pid);
+  if (alive === true) {
+    return false;
+  }
+  if (alive === false) {
+    return true;
+  }
+
+  const startedAt = Date.parse(owner.startedAt ?? "");
+  const since = Number.isFinite(startedAt) ? startedAt : statMtimeMs(entryPath);
+  return Number.isFinite(since) ? Date.now() - since > LOCK_STALE_MS : true;
+}
+
+function readLockEntries(lockDir) {
+  const choosing = [];
+  const tickets = [];
+  let names = [];
   try {
-    const current = readLockHolder(lockDir);
-    if (judged?.missing ? current !== null : current?.token !== judged?.token) {
-      return;
+    names = fs.readdirSync(lockDir);
+  } catch {
+    return { choosing, tickets };
+  }
+
+  for (const name of names) {
+    if (name.startsWith(LOCK_CHOOSING_PREFIX)) {
+      const token = name.slice(LOCK_CHOOSING_PREFIX.length);
+      if (token) {
+        choosing.push({ name, token });
+      }
+      continue;
     }
-    // Still our own tombstone? A different directory at the same path means the
-    // fence was reclaimed and this is no longer the breaker for this generation —
-    // so it must neither rename the lock nor remove the new owner's tombstone.
-    if (statInode(tomb) !== claim.ino) {
-      ownsTomb = false;
-      return;
+    if (!name.endsWith(LOCK_TICKET_SUFFIX)) {
+      continue;
     }
-    const doomed = `${lockDir}.stale-${process.pid}-${Date.now()}`;
-    try {
-      fs.renameSync(lockDir, doomed);
-    } catch {
-      return;
+    const [rawNumber, token] = name.slice(0, -LOCK_TICKET_SUFFIX.length).split(".");
+    const number = Number.parseInt(rawNumber, 10);
+    if (Number.isInteger(number) && token) {
+      tickets.push({ name, number, token });
     }
-    try {
-      fs.rmSync(doomed, { recursive: true, force: true });
-    } catch {
-      // Leftover directory, not a lock: nothing ever looks at it again.
-    }
-  } finally {
-    // Only our own tombstone: one whose owner we no longer are belongs to the
-    // breaker that reclaimed it, and removing it would unfence that breaker.
-    if (ownsTomb) {
-      releaseClaimedDir(tomb, LOCK_TOMB_OWNER_FILE, claim.token);
-    }
+  }
+  return { choosing, tickets };
+}
+
+// The destination name is unique to this acquisition, so the rename creates it and
+// can never replace anyone else's entry; the staging name is unique too, and the
+// rename is what makes the entry appear complete or not at all.
+function writeLockEntry(lockDir, name, token, contents) {
+  const staged = path.join(lockDir, `${token}.tmp`);
+  fs.writeFileSync(staged, contents, "utf8");
+  fs.renameSync(staged, path.join(lockDir, name));
+}
+
+function unlinkLockEntry(lockDir, name) {
+  try {
+    fs.unlinkSync(path.join(lockDir, name));
+  } catch {
+    // Already gone: someone else judged the same entry abandoned, or its owner
+    // released it. Either way the name is retired for good — tokens are one-off.
   }
 }
 
-// The generation being broken: the holder's one-off token, or — for a lock with
-// no holder file to name — the directory identity that judgement was made about.
-function resolveLockTomb(lockDir, judged) {
-  let key = judged?.missing ? null : judged?.token;
-  if (!key) {
-    // Nothing to name the generation after — no holder file, or one written by a
-    // version that had no token — so use the directory's own identity, which a
-    // successor's lock cannot share.
-    try {
-      const stats = fs.statSync(lockDir);
-      key = `gen-${stats.ino}-${Math.trunc(stats.mtimeMs)}`;
-    } catch {
-      return null;
-    }
-  }
-  // The key comes off disk, so keep it to a plain file name.
-  return path.join(path.dirname(lockDir), `${LOCK_TOMB_PREFIX}${String(key).replace(/[^a-zA-Z0-9._-]/g, "")}`);
+// Numbers can tie (two acquirers reading the ticket list at the same moment), so
+// the token settles the order. Both parts are fixed at acquisition, so every
+// process derives the same queue from the same directory listing.
+function ticketIsBefore(left, right) {
+  return left.number === right.number ? left.token < right.token : left.number < right.number;
 }
 
-// Returns the token this breaker owns the tombstone under, or null when the
-// generation belongs to somebody else. A tombstone is only ever taken from an
-// owner that is provably gone — a breaker that is merely slow keeps its fence,
-// because unfencing it is how two processes end up breaking the same generation.
-function claimLockTomb(tomb) {
+function lockTimeoutError(lockDir, blockers, waitMs) {
+  const tickets = blockers.filter((entry) => entry.number !== undefined);
+  const lowest = tickets.sort((left, right) => (ticketIsBefore(left, right) ? -1 : 1))[0] ?? blockers[0];
+  const entryPath = path.join(lockDir, lowest.name);
+  const pid = readJsonOrNull(entryPath)?.pid ?? "unknown";
+  return new Error(
+    `Timed out after ${waitMs} ms waiting for the Codex state lock. It is held by pid ${pid} (ticket ${entryPath}). ` +
+      `Stop that process if it is stuck; if pid ${pid} is not a Codex process (pid reuse), remove the ticket file.`
+  );
+}
+
+// The bakery's doorway: announce the choice, take a number one higher than any on
+// display, then stop announcing. A later acquirer is therefore always visible as
+// `choosing` to anyone still deciding, which is what stops it slipping in with a
+// lower number behind a holder's back.
+function acquireTicket(lockDir, waitMs) {
+  fs.mkdirSync(lockDir, { recursive: true });
   const token = `${process.pid}-${randomBytes(8).toString("hex")}`;
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    if (claimDir(tomb, LOCK_TOMB_OWNER_FILE, { pid: process.pid, token, startedAt: nowIso() })) {
-      // The inode as well as the token: it identifies this exact directory, so a
-      // replacement at the same path is recognisable even before its contents are.
-      return { token, ino: statInode(tomb) };
-    }
-    if (!judgeAbandoned(tomb, LOCK_TOMB_OWNER_FILE)) {
-      return null;
-    }
-    try {
-      fs.rmSync(tomb, { recursive: true, force: true });
-    } catch {
-      // Someone else reclaimed it first; the retry settles who owns the break.
-    }
+  const owner = `${JSON.stringify({ pid: process.pid, startedAt: nowIso() })}\n`;
+  const choosingName = `${LOCK_CHOOSING_PREFIX}${token}`;
+
+  writeLockEntry(lockDir, choosingName, token, owner);
+  let ticket;
+  try {
+    const highest = readLockEntries(lockDir).tickets.reduce((max, entry) => Math.max(max, entry.number), 0);
+    ticket = { number: highest + 1, token, name: `${highest + 1}.${token}${LOCK_TICKET_SUFFIX}` };
+    writeLockEntry(lockDir, ticket.name, token, owner);
+  } finally {
+    unlinkLockEntry(lockDir, choosingName);
   }
-  return null;
+
+  waitForTurn(lockDir, ticket, waitMs);
+  return ticket;
 }
 
-// Returns the token the lock was claimed under; only that token may release it.
-function acquireLock(lockDir, waitMs) {
+function waitForTurn(lockDir, ticket, waitMs) {
   const deadline = Date.now() + waitMs;
   for (;;) {
-    // Stage the lock with its holder info, then publish it with one rename, so
-    // the lock never exists in a state where its holder is unknown.
-    const token = `${process.pid}-${randomBytes(8).toString("hex")}`;
-    if (claimDir(lockDir, LOCK_HOLDER_FILE, { pid: process.pid, token, startedAt: nowIso() })) {
-      return token;
+    const { choosing, tickets } = readLockEntries(lockDir);
+    const blockers = [
+      // Everyone still choosing may yet take a number below ours.
+      ...choosing.filter((entry) => entry.token !== ticket.token),
+      ...tickets.filter((entry) => entry.token !== ticket.token && ticketIsBefore(entry, ticket))
+    ];
+    if (blockers.length === 0) {
+      return;
+    }
+
+    let cleared = false;
+    for (const blocker of blockers) {
+      if (isLockEntryAbandoned(path.join(lockDir, blocker.name))) {
+        unlinkLockEntry(lockDir, blocker.name);
+        cleared = true;
+      }
+    }
+    if (cleared) {
+      continue;
     }
 
     if (Date.now() >= deadline) {
-      const holderPid = readLockHolder(lockDir)?.pid;
-      throw new Error(
-        `Timed out after ${waitMs} ms waiting for the Codex state lock (${lockDir}).` +
-          (holderPid ? ` It is held by pid ${holderPid}; stop that process if it is stuck.` : " Remove that directory if no Codex command is running.")
-      );
+      // Our own ticket must not outlive the wait: this process is alive, so
+      // nothing would ever judge it abandoned, and everyone behind us would
+      // queue on a lock we are no longer trying to take.
+      unlinkLockEntry(lockDir, ticket.name);
+      throw lockTimeoutError(lockDir, blockers, waitMs);
     }
-    const stale = judgeStaleLock(lockDir);
-    if (stale) {
-      breakStaleLock(lockDir, stale);
-    } else {
-      sleepSync(LOCK_POLL_MS);
-    }
+    sleepSync(LOCK_POLL_MS);
   }
 }
 
@@ -467,13 +386,14 @@ function withLockDir(lockDir, fn, options = {}) {
     }
   }
 
-  const token = acquireLock(lockDir, options.waitMs ?? LOCK_WAIT_MS);
-  heldLocks.set(lockDir, { depth: 1, token });
+  const ticket = acquireTicket(lockDir, options.waitMs ?? LOCK_WAIT_MS);
+  heldLocks.set(lockDir, { depth: 1, ticket });
   try {
     return fn();
   } finally {
     heldLocks.delete(lockDir);
-    releaseLock(lockDir, token);
+    // Leaving the queue is one unlink of one name only this acquisition ever had.
+    unlinkLockEntry(lockDir, ticket.name);
   }
 }
 

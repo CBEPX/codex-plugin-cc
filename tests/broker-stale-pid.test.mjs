@@ -468,7 +468,7 @@ test("session end reaps a SIGKILLed background worker instead of keeping its bro
 // identify its holder. The dead-PID takeover had no PID to check, so the bounded
 // wait expired and the SessionEnd hook died with "Timed out … waiting for the
 // Codex state lock" — leaving the broker and its app-server child running.
-test("session end recovers a lock a killed worker left without holder info", async () => {
+test("session end recovers the lock a killed worker left behind", async () => {
   const binDir = makeTempDir();
   installFakeCodex(binDir);
   const workspace = makeTempDir();
@@ -500,6 +500,16 @@ test("session end recovers a lock a killed worker left without holder info", asy
         null,
         2
       )}\n`,
+      "utf8"
+    );
+    // A worker SIGKILLed while it held the lock leaves its ticket behind; the
+    // pre-1.2.0 lock directory alongside it must simply be ignored.
+    const deadWorker = run(process.execPath, ["-e", "process.exit(0)"], { env: process.env });
+    const lockDir = path.join(stateDir, "state.lock.d");
+    fs.mkdirSync(lockDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(lockDir, `1.${deadWorker.pid}-killed.ticket`),
+      `${JSON.stringify({ pid: deadWorker.pid, startedAt: new Date().toISOString() })}\n`,
       "utf8"
     );
     fs.mkdirSync(path.join(stateDir, "state.lock"), { recursive: true });

@@ -8,7 +8,6 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { makeTempDir, run } from "./helpers.mjs";
 import {
-  breakStaleLock,
   consumeJobRequestFile,
   listJobs,
   readJobFile,
@@ -266,192 +265,6 @@ test("a job created during another process's read-modify-write survives it", asy
   assert.equal(fs.existsSync(resolveJobRequestFile(workspace, "job-b")), true, "the new job's payload must not be pruned");
 });
 
-// A holder that dies with the lock held (SIGKILL, OOM, host reboot) must not
-// wedge the workspace: the next writer proves the holder is gone and takes over
-// on the spot.
-test("a state lock whose holder is gone is taken over", () => {
-  const workspace = makeTempDir();
-  saveState(workspace, { jobs: [] });
-  const dead = run(process.execPath, ["-e", "process.exit(0)"], { env: process.env });
-  const lockDir = path.join(resolveStateDir(workspace), "state.lock");
-  fs.mkdirSync(lockDir, { recursive: true });
-  fs.writeFileSync(
-    path.join(lockDir, "holder.json"),
-    JSON.stringify({ pid: dead.pid, startedAt: new Date().toISOString() }),
-    "utf8"
-  );
-
-  const started = Date.now();
-  upsertJob(workspace, { id: "job-after-crash", status: "queued" });
-
-  assert.ok(Date.now() - started < 1000, `a dead holder must be taken over at once, took ${Date.now() - started} ms`);
-  assert.deepEqual(listJobs(workspace).map((job) => job.id), ["job-after-crash"]);
-});
-
-// The lock that actually wedged a SessionEnd: a worker killed mid-acquire left a
-// directory nothing could attribute to a process, so the dead-holder rule had
-// nothing to read and only the 30 s age rule was left — long past the bounded
-// wait. Acquisition is atomic now, and a lock without usable holder info is
-// treated as abandoned after a couple of seconds.
-test("a state lock with no usable holder info does not outlast the bounded wait", () => {
-  const lockDirFor = (workspace) => path.join(resolveStateDir(workspace), "state.lock");
-
-  const emptyLock = makeTempDir();
-  saveState(emptyLock, { jobs: [] });
-  fs.mkdirSync(lockDirFor(emptyLock), { recursive: true });
-  let started = Date.now();
-  upsertJob(emptyLock, { id: "job-after-empty-lock", status: "queued" });
-  assert.ok(Date.now() - started < 3000, "a lock left half-taken must not block a writer");
-  assert.deepEqual(listJobs(emptyLock).map((job) => job.id), ["job-after-empty-lock"]);
-
-  const junkLock = makeTempDir();
-  saveState(junkLock, { jobs: [] });
-  fs.mkdirSync(lockDirFor(junkLock), { recursive: true });
-  fs.writeFileSync(path.join(lockDirFor(junkLock), "holder.json"), "{not json", "utf8");
-  started = Date.now();
-  upsertJob(junkLock, { id: "job-after-junk-lock", status: "queued" });
-  assert.ok(Date.now() - started < 3000, "an unreadable holder file must not block a writer");
-  assert.deepEqual(listJobs(junkLock).map((job) => job.id), ["job-after-junk-lock"]);
-});
-
-// The bounded wait is what keeps a wedged holder from hanging every command in
-// the workspace: the writer reports the lock instead of blocking forever.
-test("withStateLock gives up when a live holder never releases", () => {
-  const workspace = makeTempDir();
-  saveState(workspace, { jobs: [] });
-  const lockDir = path.join(resolveStateDir(workspace), "state.lock");
-  fs.mkdirSync(lockDir, { recursive: true });
-  fs.writeFileSync(path.join(lockDir, "owner.json"), JSON.stringify({ pid: process.pid, at: new Date().toISOString() }), "utf8");
-
-  assert.throws(
-    () => withStateLock(workspace, () => "never runs", { waitMs: 150 }),
-    /state lock/i
-  );
-});
-
-// Both writers find the same dead holder at the same moment. Takeover has to be a
-// single winner-takes-it step, or both delete and both enter: two processes doing
-// read-modify-write on state.json is precisely the data loss the lock exists to
-// prevent.
-test("two writers that both find a stale lock still run one at a time", async () => {
-  const workspace = makeTempDir();
-  saveState(workspace, { jobs: [] });
-  const dead = run(process.execPath, ["-e", "process.exit(0)"], { env: process.env });
-  const lockDir = path.join(resolveStateDir(workspace), "state.lock");
-  fs.mkdirSync(lockDir, { recursive: true });
-  fs.writeFileSync(
-    path.join(lockDir, "holder.json"),
-    JSON.stringify({ pid: dead.pid, token: dead.pid + "-gone", startedAt: new Date().toISOString() }),
-    "utf8"
-  );
-
-  const trace = path.join(workspace, "trace.log");
-  const contender = (name) => `
-    import fs from "node:fs";
-    import { upsertJob, withStateLock } from ${STATE_MODULE_URL};
-    const workspace = ${JSON.stringify(workspace)};
-    const trace = ${JSON.stringify(trace)};
-    withStateLock(workspace, () => {
-      fs.appendFileSync(trace, "enter ${name}" + "\\n");
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 300);
-      upsertJob(workspace, { id: "job-${name}", status: "queued" });
-      fs.appendFileSync(trace, "leave ${name}" + "\\n");
-    });
-  `;
-
-  const [first, second] = await Promise.all([
-    collectExit(runModule(contender("a"))),
-    collectExit(runModule(contender("b")))
-  ]);
-  assert.equal(first.code, 0, first.stderr);
-  assert.equal(second.code, 0, second.stderr);
-
-  const steps = fs.readFileSync(trace, "utf8").trim().split("\n");
-  assert.deepEqual(
-    steps.map((line) => line.split(" ")[0]),
-    ["enter", "leave", "enter", "leave"],
-    `critical sections overlapped: ${steps.join(" | ")}`
-  );
-  assert.deepEqual(listJobs(workspace).map((job) => job.id).sort(), ["job-a", "job-b"]);
-});
-
-// Age says nothing about health: a holder that is alive may simply be slow, and
-// stealing its lock puts a second writer inside the critical section. Only a
-// holder that is gone can be evicted; a genuinely stuck one is the operator's
-// call, and the waiter says so instead of helping itself.
-test("a lock held by a live process is never taken over, however old it is", () => {
-  const workspace = makeTempDir();
-  saveState(workspace, { jobs: [] });
-  const lockDir = path.join(resolveStateDir(workspace), "state.lock");
-  fs.mkdirSync(lockDir, { recursive: true });
-  const holder = {
-    pid: process.pid,
-    token: `${process.pid}-live`,
-    startedAt: new Date(Date.now() - 10 * 60 * 1000).toISOString()
-  };
-  fs.writeFileSync(path.join(lockDir, "holder.json"), JSON.stringify(holder), "utf8");
-
-  assert.throws(() => withStateLock(workspace, () => "stolen", { waitMs: 200 }), /state lock/i);
-  assert.deepEqual(
-    JSON.parse(fs.readFileSync(path.join(lockDir, "holder.json"), "utf8")),
-    holder,
-    "a live holder's lock must survive"
-  );
-});
-
-// A writer whose lock was taken over must not take its successor's lock down with
-// it on the way out. The PID is not enough to tell them apart — it is reused, and
-// the successor can even be this same process later — so the holder carries a
-// one-off token.
-test("release only removes a lock this process still owns", () => {
-  const workspace = makeTempDir();
-  saveState(workspace, { jobs: [] });
-  const holderFile = path.join(resolveStateDir(workspace), "state.lock", "holder.json");
-  const successor = { pid: process.pid, token: `${process.pid}-successor`, startedAt: new Date().toISOString() };
-
-  withStateLock(workspace, () => {
-    fs.writeFileSync(holderFile, JSON.stringify(successor), "utf8");
-  });
-
-  assert.equal(fs.existsSync(holderFile), true, "a successor's lock must survive our release");
-  assert.deepEqual(JSON.parse(fs.readFileSync(holderFile, "utf8")), successor);
-});
-
-// Judging a lock stale and breaking it are two separate steps, and a lot can
-// happen in between: another waiter that judged the same lock stale can break it
-// and acquire it before this one gets to its own rename. Renaming that live lock
-// aside would put two writers in the critical section — and the winner's release
-// would then silently do nothing, because the lock it holds is gone.
-test("the stale-lock breaker leaves a successor's lock alone", () => {
-  const workspace = makeTempDir();
-  saveState(workspace, { jobs: [] });
-  const lockDir = path.join(resolveStateDir(workspace), "state.lock");
-  const holderFile = path.join(lockDir, "holder.json");
-  const dead = run(process.execPath, ["-e", "process.exit(0)"], { env: process.env });
-
-  fs.mkdirSync(lockDir, { recursive: true });
-  fs.writeFileSync(
-    holderFile,
-    JSON.stringify({ pid: dead.pid, token: `${dead.pid}-gone`, startedAt: new Date().toISOString() }),
-    "utf8"
-  );
-  // What a waiter reads when it decides this lock is stale.
-  const judged = JSON.parse(fs.readFileSync(holderFile, "utf8"));
-
-  // Another waiter got there first: it broke the stale lock and is now holding
-  // its own, under a live pid and a fresh token.
-  fs.rmSync(lockDir, { recursive: true, force: true });
-  fs.mkdirSync(lockDir, { recursive: true });
-  const successor = { pid: process.pid, token: `${process.pid}-successor`, startedAt: new Date().toISOString() };
-  fs.writeFileSync(holderFile, JSON.stringify(successor), "utf8");
-
-  breakStaleLock(lockDir, judged);
-
-  assert.equal(fs.existsSync(holderFile), true, "the successor's lock must survive a late breaker");
-  assert.deepEqual(JSON.parse(fs.readFileSync(holderFile, "utf8")), successor);
-  assert.throws(() => withStateLock(workspace, () => "stolen", { waitMs: 150 }), /state lock/i);
-});
-
 // A `running` legacy job has already consumed its request: the worker reads the
 // payload (or the record) BEFORE `runTrackedJob` flips the record to `running`.
 // Staging a payload for it would write plaintext `--config` values that nothing
@@ -478,121 +291,161 @@ test("migrating a running legacy record does not stage a payload nobody consumes
   );
 });
 
-// The re-check alone is only a narrower window. The fence is a tombstone named
-// after the generation being broken: exactly one process can create it, so only
-// that process may rename the lock aside. A breaker that finds the tombstone
-// taken does not break at all — it goes back to waiting on whatever lock is
-// there now, which by then may be the winner's live one.
-test("only one breaker may take over a given lock generation", () => {
+const LOCK_DIR = "state.lock.d";
+
+function lockDirFor(workspace) {
+  const lockDir = path.join(resolveStateDir(workspace), LOCK_DIR);
+  fs.mkdirSync(lockDir, { recursive: true });
+  return lockDir;
+}
+
+function seedLockEntry(lockDir, name, pid, startedAt = new Date().toISOString()) {
+  const entry = path.join(lockDir, name);
+  fs.writeFileSync(entry, `${JSON.stringify({ pid, startedAt })}\n`, "utf8");
+  return entry;
+}
+
+function deadPid() {
+  const finished = run(process.execPath, ["-e", "process.exit(0)"], { env: process.env });
+  assert.equal(finished.status, 0);
+  return finished.pid;
+}
+
+// The property the whole lock exists for, checked the only way that means
+// anything: a counter that is read, incremented and written back — non-atomic by
+// construction, so any overlap loses increments.
+test("two processes acquiring concurrently never overlap", async () => {
   const workspace = makeTempDir();
   saveState(workspace, { jobs: [] });
-  const stateDir = resolveStateDir(workspace);
-  const lockDir = path.join(stateDir, "state.lock");
-  const holderFile = path.join(lockDir, "holder.json");
-  const dead = run(process.execPath, ["-e", "process.exit(0)"], { env: process.env });
-  const holder = { pid: dead.pid, token: `${dead.pid}-gone`, startedAt: new Date().toISOString() };
-  fs.mkdirSync(lockDir, { recursive: true });
-  fs.writeFileSync(holderFile, JSON.stringify(holder), "utf8");
+  const counter = path.join(workspace, "counter.json");
+  fs.writeFileSync(counter, "0", "utf8");
 
-  // Another breaker owns this generation's takeover.
-  const tomb = path.join(stateDir, `state.lock.tomb-${holder.token}`);
-  fs.mkdirSync(tomb);
+  const rounds = 100;
+  const worker = `
+    import fs from "node:fs";
+    import { withStateLock } from ${STATE_MODULE_URL};
+    const workspace = ${JSON.stringify(workspace)};
+    const counter = ${JSON.stringify(counter)};
+    for (let round = 0; round < ${rounds}; round += 1) {
+      withStateLock(workspace, () => {
+        const value = Number.parseInt(fs.readFileSync(counter, "utf8"), 10);
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1);
+        fs.writeFileSync(counter, String(value + 1), "utf8");
+      });
+    }
+  `;
 
-  breakStaleLock(lockDir, holder);
-  assert.equal(fs.existsSync(holderFile), true, "a breaker that lost the fence must not touch the lock");
-
-  // The winner finished and dropped its tombstone.
-  fs.rmdirSync(tomb);
-  breakStaleLock(lockDir, holder);
-  assert.equal(fs.existsSync(lockDir), false, "the breaker that wins the fence takes the lock over");
-  assert.equal(fs.existsSync(tomb), false, "a finished break must not leave its tombstone behind");
-
-  // And the workspace is usable again.
-  upsertJob(workspace, { id: "job-after-takeover", status: "queued" });
-  assert.deepEqual(listJobs(workspace).map((job) => job.id), ["job-after-takeover"]);
+  const [first, second] = await Promise.all([collectExit(runModule(worker)), collectExit(runModule(worker))]);
+  assert.equal(first.code, 0, first.stderr);
+  assert.equal(second.code, 0, second.stderr);
+  assert.equal(Number.parseInt(fs.readFileSync(counter, "utf8"), 10), rounds * 2, "an overlap lost increments");
 });
 
-// A breaker that dies mid-break must not fence off its generation forever.
-test("a tombstone left behind by a dead breaker is reclaimed", () => {
+// A holder that died with its ticket in the directory releases it to the next
+// acquirer immediately — its PID proves it is gone.
+test("a ticket whose holder is gone is removed and the waiter acquires at once", () => {
   const workspace = makeTempDir();
   saveState(workspace, { jobs: [] });
-  const stateDir = resolveStateDir(workspace);
-  const lockDir = path.join(stateDir, "state.lock");
-  const dead = run(process.execPath, ["-e", "process.exit(0)"], { env: process.env });
-  const holder = { pid: dead.pid, token: `${dead.pid}-gone`, startedAt: new Date().toISOString() };
-  fs.mkdirSync(lockDir, { recursive: true });
-  fs.writeFileSync(path.join(lockDir, "holder.json"), JSON.stringify(holder), "utf8");
-
-  const tomb = path.join(stateDir, `state.lock.tomb-${holder.token}`);
-  fs.mkdirSync(tomb);
-  const longAgo = new Date(Date.now() - 60000);
-  fs.utimesSync(tomb, longAgo, longAgo);
-
-  breakStaleLock(lockDir, holder);
-
-  assert.equal(fs.existsSync(lockDir), false, "an abandoned tombstone must not block the takeover");
-  assert.equal(fs.existsSync(tomb), false, "the reclaimed tombstone must not be left behind");
-});
-
-// The tombstone is a fence, so it needs the same protection the lock has: a
-// breaker that is merely slow — descheduled, stuck in a syscall — must not lose
-// its fence to a stopwatch. Losing it means two processes breaking the same
-// generation, which is how a successor's live lock gets renamed away.
-test("a tombstone whose owner is alive is never reclaimed, however old it is", () => {
-  const workspace = makeTempDir();
-  saveState(workspace, { jobs: [] });
-  const stateDir = resolveStateDir(workspace);
-  const lockDir = path.join(stateDir, "state.lock");
-  const dead = run(process.execPath, ["-e", "process.exit(0)"], { env: process.env });
-  const holder = { pid: dead.pid, token: `${dead.pid}-gone`, startedAt: new Date().toISOString() };
-  fs.mkdirSync(lockDir, { recursive: true });
-  fs.writeFileSync(path.join(lockDir, "holder.json"), JSON.stringify(holder), "utf8");
-
-  // The breaker that owns this generation is alive and has been working on it
-  // for longer than any timeout would allow.
-  const tomb = path.join(stateDir, `state.lock.tomb-${holder.token}`);
-  fs.mkdirSync(tomb);
-  const owner = { pid: process.pid, token: `${process.pid}-breaker`, startedAt: new Date(Date.now() - 600000).toISOString() };
-  fs.writeFileSync(path.join(tomb, "owner.json"), JSON.stringify(owner), "utf8");
-  const longAgo = new Date(Date.now() - 600000);
-  fs.utimesSync(tomb, longAgo, longAgo);
-
-  breakStaleLock(lockDir, holder);
-
-  assert.equal(fs.existsSync(path.join(lockDir, "holder.json")), true, "a second breaker must not break the lock");
-  assert.deepEqual(
-    JSON.parse(fs.readFileSync(path.join(tomb, "owner.json"), "utf8")),
-    owner,
-    "a live breaker's tombstone must not be taken, nor its owner replaced"
-  );
-});
-
-// The other half of the same rule: an owner that is provably gone releases the
-// fence at once, with no waiting at all — the lock behind it is still stale and
-// somebody has to reclaim it.
-test("a tombstone whose owner is gone is reclaimed at once", () => {
-  const workspace = makeTempDir();
-  saveState(workspace, { jobs: [] });
-  const stateDir = resolveStateDir(workspace);
-  const lockDir = path.join(stateDir, "state.lock");
-  const dead = run(process.execPath, ["-e", "process.exit(0)"], { env: process.env });
-  const holder = { pid: dead.pid, token: `${dead.pid}-gone`, startedAt: new Date().toISOString() };
-  fs.mkdirSync(lockDir, { recursive: true });
-  fs.writeFileSync(path.join(lockDir, "holder.json"), JSON.stringify(holder), "utf8");
-
-  // Freshly created, but its owner died mid-break.
-  const tomb = path.join(stateDir, `state.lock.tomb-${holder.token}`);
-  fs.mkdirSync(tomb);
-  fs.writeFileSync(
-    path.join(tomb, "owner.json"),
-    JSON.stringify({ pid: dead.pid, token: `${dead.pid}-breaker`, startedAt: new Date().toISOString() }),
-    "utf8"
-  );
+  const lockDir = lockDirFor(workspace);
+  const gone = deadPid();
+  const ticket = seedLockEntry(lockDir, `1.${gone}-gone.ticket`, gone);
 
   const started = Date.now();
-  breakStaleLock(lockDir, holder);
+  assert.equal(withStateLock(workspace, () => "ok"), "ok");
 
-  assert.ok(Date.now() - started < 2000, "a dead breaker must not cost the next one a grace period");
-  assert.equal(fs.existsSync(lockDir), false, "the stale lock must be taken over");
-  assert.equal(fs.existsSync(tomb), false, "the breaker must drop its own tombstone");
+  assert.ok(Date.now() - started < 1000, `a dead holder must not cost a grace period, took ${Date.now() - started} ms`);
+  assert.equal(fs.existsSync(ticket), false, "the dead holder's ticket must be cleared");
+});
+
+// The opposite rule, and the one that keeps two writers apart: a holder that is
+// still running keeps its ticket however long it has been working — a slow holder
+// and a stuck one are indistinguishable from out here. The waiter gives up and
+// says exactly which process to look at.
+test("a ticket held by a live process is never removed and the waiter times out naming it", () => {
+  const workspace = makeTempDir();
+  saveState(workspace, { jobs: [] });
+  const lockDir = lockDirFor(workspace);
+  const ticket = seedLockEntry(lockDir, `1.${process.pid}-live.ticket`, process.pid, new Date(Date.now() - 600000).toISOString());
+
+  assert.throws(
+    () => withStateLock(workspace, () => "stolen", { waitMs: 200 }),
+    (error) =>
+      /state lock/i.test(error.message) &&
+      error.message.includes(`pid ${process.pid}`) &&
+      error.message.includes(ticket) &&
+      /pid reuse/.test(error.message)
+  );
+  assert.equal(fs.existsSync(ticket), true, "a live holder's ticket must survive");
+});
+
+// A process killed between announcing its choice and taking a number leaves a
+// `choosing` file behind. Every acquirer waits for those, so one that nobody will
+// ever come back for would wedge the workspace.
+test("a choosing file left by a dead process does not block the next acquirer", () => {
+  const workspace = makeTempDir();
+  saveState(workspace, { jobs: [] });
+  const lockDir = lockDirFor(workspace);
+  const gone = deadPid();
+  const chooser = seedLockEntry(lockDir, `choosing.${gone}-crashed`, gone);
+
+  const started = Date.now();
+  assert.equal(withStateLock(workspace, () => "ok"), "ok");
+
+  assert.ok(Date.now() - started < 1000, `a dead chooser must not cost a grace period, took ${Date.now() - started} ms`);
+  assert.equal(fs.existsSync(chooser), false, "the crashed chooser's file must be cleared");
+});
+
+// Bakery order: a waiter that arrived while the lock was held is served before one
+// that arrives later, and a latecomer can never take a lower number than a waiter
+// already in line.
+test("a latecomer queues behind the waiter that was already in line", async () => {
+  const workspace = makeTempDir();
+  saveState(workspace, { jobs: [] });
+  const trace = path.join(workspace, "trace.log");
+
+  const participant = (name, holdMs) => `
+    import fs from "node:fs";
+    import { withStateLock } from ${STATE_MODULE_URL};
+    withStateLock(${JSON.stringify(workspace)}, () => {
+      fs.appendFileSync(${JSON.stringify(trace)}, "enter ${name}" + "\\n");
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ${holdMs});
+      fs.appendFileSync(${JSON.stringify(trace)}, "leave ${name}" + "\\n");
+    });
+  `;
+
+  const holder = collectExit(runModule(participant("holder", 900)));
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  const early = collectExit(runModule(participant("early", 50)));
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  const late = collectExit(runModule(participant("late", 50)));
+
+  for (const finished of await Promise.all([holder, early, late])) {
+    assert.equal(finished.code, 0, finished.stderr);
+  }
+
+  const steps = fs.readFileSync(trace, "utf8").trim().split("\n");
+  assert.deepEqual(
+    steps,
+    ["enter holder", "leave holder", "enter early", "leave early", "enter late", "leave late"],
+    `the queue was not served in order: ${steps.join(" | ")}`
+  );
+});
+
+// Two acquirers can take the same number — they read the tickets at the same
+// moment — so the number alone cannot decide. The token breaks the tie, and both
+// tickets are judged the same way: the dead one goes, the live one holds the line.
+test("tickets that tie on a number are ordered and judged individually", () => {
+  const workspace = makeTempDir();
+  saveState(workspace, { jobs: [] });
+  const lockDir = lockDirFor(workspace);
+  const gone = deadPid();
+  const abandoned = seedLockEntry(lockDir, `3.${gone}-aaa.ticket`, gone);
+  const live = seedLockEntry(lockDir, `3.${process.pid}-zzz.ticket`, process.pid);
+
+  assert.throws(
+    () => withStateLock(workspace, () => "stolen", { waitMs: 300 }),
+    (error) => error.message.includes(`pid ${process.pid}`) && error.message.includes(live)
+  );
+  assert.equal(fs.existsSync(abandoned), false, "the dead ticket in the tie must be cleared");
+  assert.equal(fs.existsSync(live), true, "the live ticket in the tie must survive");
 });
