@@ -220,9 +220,10 @@ function statMtimeMs(target) {
 // A live owner is never evicted, whatever the clock says: from out here a slow
 // process and a stuck one look identical, and evicting either puts two writers in
 // the critical section. A dead one releases its place at once; an entry nothing
-// can be read from is debris after a short grace; one whose PID cannot be checked
-// (EPERM, or no PID at all) after a long one. A stuck live owner is the operator's
-// call — the timeout error names it.
+// can be read from is debris after a short grace; one that carries no usable PID
+// to check after a long one. (A PID that exists but belongs to another user reads
+// as alive, which is the safe answer.) A stuck live owner is the operator's call —
+// the timeout error names it.
 function isLockEntryAbandoned(entryPath) {
   const owner = readJsonOrNull(entryPath);
   if (!owner) {
@@ -242,14 +243,23 @@ function isLockEntryAbandoned(entryPath) {
   return Number.isFinite(since) ? Date.now() - since > LOCK_STALE_MS : true;
 }
 
-function readLockEntries(lockDir) {
+// A queue that cannot be read is not an empty queue: answering a listing failure
+// with "nobody is ahead of me" would put two processes in the critical section.
+// Every error propagates and fails the acquisition. The one exception is a missing
+// directory on the first read — possible only before this acquisition has anything
+// of its own in it — which is created and read once more.
+function readLockEntries(lockDir, { createMissing = false } = {}) {
   const choosing = [];
   const tickets = [];
-  let names = [];
+  let names;
   try {
     names = fs.readdirSync(lockDir);
-  } catch {
-    return { choosing, tickets };
+  } catch (error) {
+    if (error.code !== "ENOENT" || !createMissing) {
+      throw error;
+    }
+    fs.mkdirSync(lockDir, { recursive: true });
+    names = fs.readdirSync(lockDir);
   }
 
   for (const name of names) {
@@ -298,13 +308,19 @@ function ticketIsBefore(left, right) {
 }
 
 function lockTimeoutError(lockDir, blockers, waitMs) {
-  const tickets = blockers.filter((entry) => entry.number !== undefined);
-  const lowest = tickets.sort((left, right) => (ticketIsBefore(left, right) ? -1 : 1))[0] ?? blockers[0];
+  const lowest =
+    blockers
+      .filter((entry) => entry.number !== undefined)
+      .sort((left, right) => (ticketIsBefore(left, right) ? -1 : 1))[0] ?? blockers[0];
+  if (!lowest) {
+    return new Error(`Timed out after ${waitMs} ms waiting for the Codex state lock (${lockDir}).`);
+  }
+  // The blocker may be a ticket or a client still choosing its number.
   const entryPath = path.join(lockDir, lowest.name);
   const pid = readJsonOrNull(entryPath)?.pid ?? "unknown";
   return new Error(
-    `Timed out after ${waitMs} ms waiting for the Codex state lock. It is held by pid ${pid} (ticket ${entryPath}). ` +
-      `Stop that process if it is stuck; if pid ${pid} is not a Codex process (pid reuse), remove the ticket file.`
+    `Timed out after ${waitMs} ms waiting for the Codex state lock. It is held by pid ${pid} (entry ${entryPath}). ` +
+      `Stop that process if it is stuck; if pid ${pid} is not a Codex process (pid reuse), remove that entry file.`
   );
 }
 
@@ -321,22 +337,44 @@ function acquireTicket(lockDir, waitMs) {
   writeLockEntry(lockDir, choosingName, token, owner);
   let ticket;
   try {
-    const highest = readLockEntries(lockDir).tickets.reduce((max, entry) => Math.max(max, entry.number), 0);
+    const highest = readLockEntries(lockDir, { createMissing: true }).tickets.reduce(
+      (max, entry) => Math.max(max, entry.number),
+      0
+    );
     ticket = { number: highest + 1, token, name: `${highest + 1}.${token}${LOCK_TICKET_SUFFIX}` };
     writeLockEntry(lockDir, ticket.name, token, owner);
   } finally {
+    // The choosing file must go before the wait, not after it: two acquirers that
+    // waited for each other's choosing files would deadlock.
     unlinkLockEntry(lockDir, choosingName);
   }
 
-  waitForTurn(lockDir, ticket, waitMs);
+  try {
+    waitForTurn(lockDir, ticket, waitMs);
+  } catch (error) {
+    // We are not holding the lock, so our ticket must leave the queue — this
+    // process is alive, so nothing would ever judge it abandoned and everyone
+    // behind it would wait on an acquisition that was given up. Only our own
+    // entries are touched, whatever went wrong.
+    unlinkLockEntry(lockDir, ticket.name);
+    throw error;
+  }
   return ticket;
 }
 
 function waitForTurn(lockDir, ticket, waitMs) {
   const deadline = Date.now() + waitMs;
+  let blockers = [];
   for (;;) {
+    // First statement in the loop, so no path can skip the bound: an entry that is
+    // judged abandoned but cannot actually be unlinked (a permission problem on a
+    // foreign entry) would otherwise be re-judged and re-unlinked forever.
+    if (Date.now() >= deadline) {
+      throw lockTimeoutError(lockDir, blockers, waitMs);
+    }
+
     const { choosing, tickets } = readLockEntries(lockDir);
-    const blockers = [
+    blockers = [
       // Everyone still choosing may yet take a number below ours.
       ...choosing.filter((entry) => entry.token !== ticket.token),
       ...tickets.filter((entry) => entry.token !== ticket.token && ticketIsBefore(entry, ticket))
@@ -352,18 +390,11 @@ function waitForTurn(lockDir, ticket, waitMs) {
         cleared = true;
       }
     }
-    if (cleared) {
-      continue;
+    // Clearing something is the only reason to look again immediately; it may skip
+    // the poll interval and nothing else.
+    if (!cleared) {
+      sleepSync(LOCK_POLL_MS);
     }
-
-    if (Date.now() >= deadline) {
-      // Our own ticket must not outlive the wait: this process is alive, so
-      // nothing would ever judge it abandoned, and everyone behind us would
-      // queue on a lock we are no longer trying to take.
-      unlinkLockEntry(lockDir, ticket.name);
-      throw lockTimeoutError(lockDir, blockers, waitMs);
-    }
-    sleepSync(LOCK_POLL_MS);
   }
 }
 

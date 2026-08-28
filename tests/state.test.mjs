@@ -449,3 +449,59 @@ test("tickets that tie on a number are ordered and judged individually", () => {
   assert.equal(fs.existsSync(abandoned), false, "the dead ticket in the tie must be cleared");
   assert.equal(fs.existsSync(live), true, "the live ticket in the tie must survive");
 });
+
+// A queue that cannot be read is not an empty queue. Answering a listing failure
+// with "nobody is ahead of me" is fail-open: a directory that allows creating
+// files but not listing them (or a transient I/O error) would put two processes in
+// the critical section at once.
+test(
+  "a lock directory that cannot be listed fails the acquisition, not the queue",
+  { skip: process.platform === "win32" || process.getuid?.() === 0 },
+  () => {
+    const workspace = makeTempDir();
+    saveState(workspace, { jobs: [] });
+    const lockDir = lockDirFor(workspace);
+    const foreign = seedLockEntry(lockDir, `1.${process.pid}-live.ticket`, process.pid);
+
+    let ran = false;
+    // Write and search allowed, read denied: files can still be created and
+    // unlinked, but the directory cannot be listed.
+    fs.chmodSync(lockDir, 0o300);
+    try {
+      assert.throws(() => withStateLock(workspace, () => {
+        ran = true;
+      }, { waitMs: 200 }), /EACCES/);
+    } finally {
+      fs.chmodSync(lockDir, 0o700);
+    }
+
+    assert.equal(ran, false, "the callback must not run when the queue cannot be read");
+    assert.equal(fs.existsSync(foreign), true, "a foreign ticket must not be touched");
+    assert.deepEqual(
+      fs.readdirSync(lockDir),
+      [path.basename(foreign)],
+      "a failed acquisition must take its own entries back out of the queue"
+    );
+  }
+);
+
+// A blocker that is judged abandoned but cannot actually be unlinked used to be a
+// hot loop with no exit: clearing an entry skipped the deadline check, so the
+// waiter span the CPU forever instead of giving up. (Unlink can only ever fail on
+// a foreign entry — a permission or filesystem problem, modelled here by a
+// directory, which `unlink` refuses on every POSIX platform.)
+test("a blocker that cannot be removed still ends at the deadline", { timeout: 10000 }, () => {
+  const workspace = makeTempDir();
+  saveState(workspace, { jobs: [] });
+  const lockDir = lockDirFor(workspace);
+  const stuck = path.join(lockDir, `1.${deadPid()}-unremovable.ticket`);
+  fs.mkdirSync(stuck);
+  const longAgo = new Date(Date.now() - 600000);
+  fs.utimesSync(stuck, longAgo, longAgo);
+
+  const started = Date.now();
+  assert.throws(() => withStateLock(workspace, () => "never", { waitMs: 300 }), /state lock/i);
+
+  assert.ok(Date.now() - started < 5000, `the wait must end at its own deadline, took ${Date.now() - started} ms`);
+  assert.deepEqual(fs.readdirSync(lockDir), [path.basename(stuck)], "the waiter must take its own entries back out");
+});
