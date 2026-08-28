@@ -403,6 +403,29 @@ test("SKILL.md execution rules describe the single-call flow, not the old two-st
   assert.doesNotMatch(runtimeSkill, /task "<raw arguments>"/);
 });
 
+// `task --await` reports the job's outcome; `result` reports whether a record
+// could be retrieved. Automation cannot act on a published contract that claims
+// both return 0 for a failed job one line after saying `--await` returns 1.
+test("README keeps the task --await and result exit-code contracts apart", () => {
+  const readme = fs.readFileSync(path.join(ROOT, "README.md"), "utf8");
+
+  assert.match(
+    readme,
+    /Exit code is 0 when the job completed, 1 when it failed or was cancelled, and 3 when the wait times out/,
+    "the task --await contract (0/1/3) must stay stated"
+  );
+  assert.match(
+    readme,
+    /`result` exits 0 for any terminal record \(completed, failed or cancelled\) and 3 while the job is still active/,
+    "the result contract must be stated separately"
+  );
+  assert.doesNotMatch(
+    readme,
+    /`result` and `task --await` exit 0 for \*\*any\*\* terminal record/,
+    "the two contracts must not be merged back into one claim"
+  );
+});
+
 test("README documents the fork's own install commands", () => {
   const readme = fs.readFileSync(path.join(ROOT, "README.md"), "utf8");
 
