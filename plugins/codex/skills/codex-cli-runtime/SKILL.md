@@ -33,6 +33,7 @@ Command selection:
 - If the forwarded request includes `--model`, normalize `spark` to `gpt-5.3-codex-spark` and pass it through to `task`.
 - If the forwarded request includes `--effort`, pass it through to `task`.
 - If the forwarded request includes `--config key=value`, pass every occurrence through to `task` unchanged.
+- If the forwarded request includes `--turn-timeout-ms <ms>`, pass it through to `task` unchanged; it bounds a single Codex turn (also settable via `CODEX_TURN_TIMEOUT_MS`) and is carried into the background worker with the job, so it applies whether the request resolves synchronously or through the exit-3 retry.
 - The invoking command always resolves resume before delegating and hands you a literal `--resume-last` or `--fresh` flag already decided — pass it straight through in `<flags>`; never infer it yourself, never call `task-resume-candidate`.
 - `--config key=value` (repeatable) forwards a `config.toml` override to the Codex thread (`thread/start.config`), e.g. `--config model_provider=ollama`. On `--resume-last` the plugin opens a fresh app-server session (cold resume) so `--config` overrides, sandbox and approval policy take effect; model and effort for the resumed turn are sent on the turn, never on the resume request.
 - `--effort`: accepted values are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra`. Not every model supports every value; Codex validates the value against the reasoning levels the selected model advertises.

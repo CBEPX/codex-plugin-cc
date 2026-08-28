@@ -165,7 +165,11 @@ Ask Codex to redesign the database connection to be more resilient.
 - model aliases: `spark` -> `gpt-5.3-codex-spark`, `sol` -> `gpt-5.6-sol`, `luna` -> `gpt-5.6-luna`, `terra` -> `gpt-5.6-terra`, `mini` -> `gpt-5.4-mini`
 - `--config key=value` (repeatable, also on `/codex:review` and `/codex:adversarial-review`) forwards a `config.toml` override to the Codex thread, e.g. `--config model_provider=ollama`. On `--resume-last` the plugin opens a fresh app-server session (cold resume) so `--config` overrides, sandbox and approval policy take effect; model and effort for the resumed turn are sent on the turn, never on the resume request.
 - follow-up rescue requests can continue the latest Codex task in the repo
-- under the hood, `scripts/codex-companion.mjs task` also accepts `--await [--await-timeout-ms <ms>]` (launch the same tracked background job, then wait for it; default 540000 ms, exit 3 with a `result <id> --wait` hint if it is still running) and `--prompt-stdin` (stdin is the prompt verbatim, so it cannot be combined with `--args-stdin`, `--prompt-file` or prompt text). `result <id> --wait [--timeout-ms <ms>]` waits with the same contract, and a plain `result <id>` on a still-running job now prints that hint and exits 3 instead of failing. The detached worker outlives the companion only when the companion returns on its own (exit 3); a host process-tree kill — e.g. Claude Code's Bash timeout — also kills the worker, so keep `--await-timeout-ms` below the host limit (default 540000 < 600000).
+- under the hood, `/codex:rescue` and the `codex-rescue` agent are each a single `scripts/codex-companion.mjs task --await --prompt-stdin <flags>` call: `--await [--await-timeout-ms <ms>]` launches the same tracked background job as `--background`, then waits for it (default 540000 ms), and `--prompt-stdin` reads the prompt as stdin verbatim (so it cannot be combined with `--args-stdin`, `--prompt-file`, or prompt text on the command line). Exit code is 0 when the job completed, 1 when it failed or was cancelled, and 3 when the wait times out while the job is still queued or running — exit 3 prints a `Re-run: node "<abs>" result <id> --wait --timeout-ms 540000` hint, which is the only follow-up call the rescue flow makes.
+- `result <id> --wait [--timeout-ms <ms>]` waits with the same contract and the same exit codes; a plain `result <id>` on a still-running job prints that hint and exits 3 instead of failing (fixes upstream #498/#524, which reported "No job found" for a running job). `result` and `task --await` exit 0 for **any** terminal record, including a failed or cancelled one — the exit code there means "a result was retrieved", not "the job succeeded". `--json` on either returns `{ job, storedJob }` (or, on a timeout, the `status --json` snapshot plus a `resumeCommand` field).
+- The detached worker outlives the companion only when the companion returns on its own (exit 3); a host process-tree kill — e.g. Claude Code's Bash timeout — also kills the worker, so keep `--await-timeout-ms` below the host limit (default 540000 < 600000).
+- `--turn-timeout-ms <ms>` (or `CODEX_TURN_TIMEOUT_MS`, also on `/codex:review` and `/codex:adversarial-review`) bounds a single Codex turn: on expiry it interrupts the turn and returns a structured failed result ("turn timed out after `<ms>` ms") instead of hanging. Default is `0` (unbounded). The budget travels with a `--background`/`--await` job, so a detached worker enforces it too.
+- if a background job's session ends while `CODEX_COMPANION_BROKER_IDLE_TIMEOUT_MS=0`, the shared broker that keeps running for that job never self-terminates on its own — its normal idle exit is disabled in that configuration, so the broker only goes away once the job finishes (or is reaped as dead) and a later `SessionEnd` runs.
 
 ### `/codex:transfer`
 
@@ -209,7 +213,11 @@ Examples:
 ```bash
 /codex:result
 /codex:result task-abc123
+/codex:result task-abc123 --wait
+/codex:result task-abc123 --wait --timeout-ms 60000
 ```
+
+On a job that already has a terminal record (completed, failed, or cancelled), `/codex:result` exits 0 and shows it — the exit code reports that a result was retrieved, not whether the job succeeded. On a job that is still queued or running, a plain `/codex:result <id>` prints a `Re-run: … result <id> --wait` hint and exits 3 instead of failing; add `--wait [--timeout-ms <ms>]` (default 540000 ms) to block until the job reaches a terminal status instead of returning immediately. `--json` returns `{ job, storedJob }` (or, on a `--wait` timeout, the `status --json` snapshot plus a `resumeCommand` field).
 
 ### `/codex:cancel`
 

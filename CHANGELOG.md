@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.2.0 — 2026-08-28
+
+### Merged from upstream pull requests
+- #355 `SessionEnd` now terminates only the ending session's own foreground jobs; a workspace with an active background job keeps its shared broker alive across `SessionEnd` instead of tearing it down out from under the worker, and the hook only clears its own broker-session record when the endpoint still matches (a replacement broker's record survives).
+- #425 a PID-liveness reaper marks a `queued`/`running` job `failed` ("worker exited before completing") once its worker process is confirmed dead (`kill(pid, 0)` reports `ESRCH`), deletes the job's private one-shot request payload, and clears `requestFile`; a `queued` job with no recorded PID yet gets a 30 s grace window before it is reaped, covering a worker that died between spawn and the PID being recorded.
+
+### Fork changes
+- `task --await [--await-timeout-ms <ms>]` launches the same tracked job record as `--background`, then waits for it: exit 0 when the job completed, 1 when it failed or was cancelled, 3 when the default 540000 ms wait elapses while the job is still queued or running (prints a `Re-run: node "<abs>" result <id> --wait --timeout-ms 540000` hint).
+- `--prompt-stdin` takes the prompt as raw stdin, stripping exactly one trailing newline and nothing else; the mutual exclusion against `--args-stdin`, `--prompt-file`, and a positional prompt is checked on the raw argv before any stdin is read, so a bad combination fails fast instead of blocking on stdin.
+- `result <id> [--wait [--timeout-ms <ms>]]` exits 0 for any terminal job record — completed, failed, or cancelled alike, since this is retrieval, not a pass/fail signal — and exits 3 with the same resumable hint when the job is still active and `--wait` was not given; `--json` returns `{ job, storedJob }`.
+- Fixed upstream #498/#524: `result <id>` on a still-`queued`/`running` job used to throw "No job found for `<id>`"; it now reports the job's real status plus the `result … --wait` hint, exit 3.
+- `--await-timeout-ms` and `result --timeout-ms` are validated as finite positive integers (rejects `0`, negatives, fractional, and non-numeric values).
+- Worker-survival caveat: the detached worker outlives the companion only when the companion returns on its own via exit 3 — a host process-tree kill (e.g. Claude Code's Bash tool timeout) kills the worker too, so keep `--await-timeout-ms` below the host's own timeout.
+- The worker's PID is now recorded in the job record right after spawn (`updateJobPid`, patches only the `pid` field), so a `cancel` issued while a job is still `queued` has a process to signal; `cancel` also releases the job's private one-shot request payload itself, since a cancelled job is terminal and the reaper never revisits it.
+- `SessionEnd` now reaps dead background workers before deciding whether an active background job should keep the broker alive, so a hard-killed (e.g. OOM/`SIGKILL`) worker can no longer pin a broker and its job's private payload alive indefinitely.
+- `/codex:rescue` and the `codex-rescue` agent are now a single `node … task --await --prompt-stdin <flags> <<'CODEX_PROMPT_<random>'` call each, replacing the old two-Bash-call `mktemp`/`trap`/`status --wait`-poll-loop dance; the per-call random delimiter suffix now only has one heredoc to protect (the request prose) since flags travel on the command line and there is no second `--args-stdin` heredoc anymore; on exit 3 the only allowed follow-up is re-running the printed `Re-run:` hint for that same job.
+- The resume decision (`task-resume-candidate --json` + one `AskUserQuestion`) is now made once, before the synchronous/`--background` split, so both paths get the same explicit `--resume-last`/`--fresh` flag; a `--background` handoff never resumes silently — the agent runs fresh unless it is handed an explicit `--resume-last` from that shared decision.
+- `rescue.md`'s `allowed-tools` is back to `Bash(node:*), AskUserQuestion, Agent` (widened to bare `Bash` in 1.1.0 only to support the removed two-Bash-call flow).
+- `--turn-timeout-ms <ms>` (or `CODEX_TURN_TIMEOUT_MS`) on `task`, `review`, and `adversarial-review` bounds a single Codex turn: on expiry it sends `turn/interrupt` and returns a structured failed result ("turn timed out after `<ms>` ms") instead of hanging or throwing; default is `0` (unbounded, unchanged behavior); the budget is persisted into `--background`/`--await` job requests so detached workers run under the same limit.
+- Documented: with `CODEX_COMPANION_BROKER_IDLE_TIMEOUT_MS=0`, a broker kept alive by an active background job across `SessionEnd` never exits on its own — the idle self-terminate safety net from #457 is disabled in that configuration.
+- Known limitations: `kill(pid, 0)` reads a zombie process as alive and cannot detect PID reuse, so the reaper can occasionally misjudge a dead worker's liveness (documented in `lib/tracked-jobs.mjs`); a `turn/start` call that never answers is still unbounded — `--turn-timeout-ms` only covers the window after `turn/start` resolves.
+
 ## 1.1.1 — 2026-08-28
 
 - Broker idle self-terminate (upstream #457): the shared Codex runtime exits after 30 minutes without a connected client (`CODEX_COMPANION_BROKER_IDLE_TIMEOUT_MS` / `--idle-timeout`), so idle brokers and their app-server children no longer accumulate (#543).

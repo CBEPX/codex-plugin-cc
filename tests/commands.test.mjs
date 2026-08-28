@@ -22,6 +22,7 @@ test("review command uses AskUserQuestion and background Bash while staying revi
   assert.match(source, /```typescript/);
   assert.match(source, /review --args-stdin <<'CODEX_ARGS'/);
   assert.match(source, /\[--scope auto\|working-tree\|branch\]/);
+  assert.match(source, /\[--turn-timeout-ms <ms>\]/);
   assert.match(source, /run_in_background:\s*true/);
   assert.match(source, /command:\s*`node "\$\{CLAUDE_PLUGIN_ROOT\}\/scripts\/codex-companion\.mjs" review --args-stdin <<'CODEX_ARGS'\n\$ARGUMENTS\nCODEX_ARGS`/);
   assert.match(source, /description:\s*"Codex review"/);
@@ -50,6 +51,7 @@ test("adversarial review command uses AskUserQuestion and background Bash while 
   assert.match(source, /```typescript/);
   assert.match(source, /adversarial-review --args-stdin <<'CODEX_ARGS'/);
   assert.match(source, /\[--scope auto\|working-tree\|branch\].*\[focus \.\.\.\]/);
+  assert.match(source, /\[--turn-timeout-ms <ms>\]/);
   assert.match(source, /run_in_background:\s*true/);
   assert.match(source, /command:\s*`node "\$\{CLAUDE_PLUGIN_ROOT\}\/scripts\/codex-companion\.mjs" adversarial-review --args-stdin <<'CODEX_ARGS'\n\$ARGUMENTS\nCODEX_ARGS`/);
   assert.match(source, /description:\s*"Codex adversarial review"/);
@@ -109,6 +111,7 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(rescue, /--resume\|--fresh/);
   assert.match(rescue, /--model <model\|spark\|sol\|luna\|terra\|mini>/);
   assert.match(rescue, /--effort <none\|minimal\|low\|medium\|high\|xhigh\|max\|ultra>/);
+  assert.match(rescue, /\[--turn-timeout-ms <ms>\]/);
   assert.match(rescue, /task-resume-candidate --json/);
   assert.match(rescue, /AskUserQuestion.*Continue current Codex thread/s);
   assert.match(rescue, /Start a new Codex thread/);
@@ -200,6 +203,7 @@ test("transfer, result, and cancel commands are exposed as deterministic runtime
   assert.match(transfer, /codex-companion\.mjs" transfer --args-stdin <<'CODEX_ARGS'/);
   assert.match(transfer, /codex resume <session-id>/);
   assert.match(result, /disable-model-invocation:\s*true/);
+  assert.match(result, /argument-hint:\s*'\[job-id\] \[--wait\] \[--timeout-ms <ms>\]'/);
   assert.match(result, /codex-companion\.mjs" result --args-stdin <<'CODEX_ARGS'/);
   assert.match(cancel, /disable-model-invocation:\s*true/);
   assert.match(cancel, /codex-companion\.mjs" cancel --args-stdin <<'CODEX_ARGS'/);
