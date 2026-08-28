@@ -3,7 +3,7 @@
 ## 1.2.0 — 2026-08-28
 
 ### Merged from upstream pull requests
-- #355 `SessionEnd` now terminates only the ending session's own foreground jobs; a workspace with an active background job keeps its shared broker alive across `SessionEnd` instead of tearing it down out from under the worker, and the hook only clears its own broker-session record when the endpoint still matches (a replacement broker's record survives).
+- #355 `SessionEnd` now terminates only the ending session's own foreground jobs; a workspace with any active job keeps its shared broker alive across `SessionEnd` instead of tearing it down out from under the worker, and the hook only clears its own broker-session record when the endpoint still matches (a replacement broker's record survives).
 - #425 a PID-liveness reaper marks a `queued`/`running` job `failed` ("worker exited before completing") once its worker process is confirmed dead (`kill(pid, 0)` reports `ESRCH`), deletes the job's private one-shot request payload, and clears `requestFile`; a `queued` job with no recorded PID yet gets a 30 s grace window before it is reaped, covering a worker that died between spawn and the PID being recorded.
 
 ### Fork changes
@@ -22,6 +22,8 @@
 - Documented: with `CODEX_COMPANION_BROKER_IDLE_TIMEOUT_MS=0`, a broker kept alive by an active background job across `SessionEnd` never exits on its own — the idle self-terminate safety net from #457 is disabled in that configuration.
 - Known limitations: `kill(pid, 0)` reads a zombie process as alive and cannot detect PID reuse, so the reaper can occasionally misjudge a dead worker's liveness (documented in `lib/tracked-jobs.mjs`); a `turn/start` call that never answers is still unbounded — `--turn-timeout-ms` only covers the window after `turn/start` resolves.
 - `task --await` jobs are recorded as background jobs (they survive SessionEnd and keep the broker while active, bounded by the reaper and the idle timeout).
+- `SessionEnd` no longer shuts the shared broker down while **any** job in the workspace is still `queued`/`running` — the check used to count only jobs flagged `background: true`, so another Claude session's foreground run (which survives this session's own-jobs-only cleanup) had its runtime pulled out from under it. The check runs on the state left behind by that cleanup and, as before, reaps dead workers first so a killed worker cannot pin the broker.
+- `review`/`adversarial-review` now persist `--background` on the job record, so a review dispatched to outlive its session (`nohup … --background &`) keeps its record — and with it `/codex:status` and `/codex:result` — after that session ends.
 
 ## 1.1.1 — 2026-08-28
 

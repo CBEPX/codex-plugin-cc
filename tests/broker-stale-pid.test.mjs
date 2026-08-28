@@ -202,6 +202,107 @@ test("session end shuts down the live broker it owns and clears its record", asy
   }
 });
 
+// The broker is per-workspace, so a foreground job of ANOTHER Claude session is
+// talking to it too. That job survives this session's cleanup (own jobs only)
+// but used to be invisible to the active-job check, which only counted
+// `background: true` — so this hook tore the shared runtime out from under a
+// live foreign turn.
+test("session end keeps the broker while another session's foreground job is running", async (t) => {
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const workspace = makeTempDir();
+  const sessionDir = makeTempDir("cxc-");
+  const endpoint = createBrokerEndpoint(sessionDir);
+  const child = spawnOwnedBroker(workspace, { binDir, sessionDir, endpoint });
+
+  // Stands in for the other session's live foreground worker.
+  const foreignWorker = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+    cwd: workspace,
+    detached: true,
+    stdio: "ignore"
+  });
+  foreignWorker.unref();
+
+  t.after(() => {
+    for (const pid of [foreignWorker.pid, child.pid]) {
+      try {
+        process.kill(-pid, "SIGKILL");
+      } catch {
+        try {
+          process.kill(pid, "SIGKILL");
+        } catch {
+          // Already gone.
+        }
+      }
+    }
+    clearBrokerSession(workspace);
+  });
+
+  const stateDir = resolveStateDir(workspace);
+  fs.mkdirSync(path.join(stateDir, "jobs"), { recursive: true });
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    `${JSON.stringify(
+      {
+        version: 1,
+        config: { stopReviewGate: false },
+        jobs: [
+          {
+            id: "task-foreign-foreground",
+            status: "running",
+            phase: "running",
+            title: "Codex Task",
+            jobClass: "task",
+            sessionId: "sess-other",
+            pid: foreignWorker.pid,
+            logFile: null,
+            createdAt: "2026-03-18T15:30:00.000Z",
+            updatedAt: "2026-03-18T15:31:00.000Z"
+          },
+          // The ending session's own finished job: makes the cleanup rewrite run.
+          {
+            id: "task-own-done",
+            status: "completed",
+            phase: "done",
+            title: "Codex Task",
+            jobClass: "task",
+            sessionId: "sess-current",
+            pid: null,
+            logFile: null,
+            createdAt: "2026-03-18T15:20:00.000Z",
+            updatedAt: "2026-03-18T15:21:00.000Z"
+          }
+        ]
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+
+  assert.equal(await waitForBrokerEndpoint(endpoint, 3000), true);
+
+  const cleanup = runSessionEndHook(workspace, { env: buildEnv(binDir), sessionId: "sess-current" });
+  assert.equal(cleanup.status, 0, cleanup.stderr);
+
+  assert.equal(
+    loadBrokerSession(workspace)?.endpoint,
+    endpoint,
+    "SessionEnd must not tear down a broker another session's job is using"
+  );
+  assert.equal(isAlive(child.pid), true, "the shared broker process must survive a foreign active job");
+  assert.equal(isAlive(foreignWorker.pid), true, "the foreign session's worker must not be signalled");
+
+  const jobs = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8")).jobs;
+  assert.deepEqual(
+    jobs.map((job) => job.id),
+    ["task-foreign-foreground"],
+    "the foreign job record must survive while the ending session's own job is pruned"
+  );
+  assert.equal(jobs[0].status, "running");
+  assert.equal(jobs[0].pid, foreignWorker.pid);
+});
+
 // A background job is dispatched to outlive its session, and it talks to Codex
 // through the broker: SessionEnd must leave both alone, and the broker's own
 // idle timer — not the hook — is what finally reclaims it.

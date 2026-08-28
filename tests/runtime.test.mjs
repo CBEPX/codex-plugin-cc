@@ -2299,6 +2299,38 @@ test("session end preserves background jobs and their broker so workers survive 
   assert.equal(fs.existsSync(backgroundLog), true, "background log preserved");
 });
 
+// `--background` on a review means what it means on a task: the job is
+// dispatched to outlive the session that started it. The flag was parsed and
+// then dropped, so SessionEnd pruned the review's record — and with it the
+// only way to read the review back with `/codex:result`.
+test("an adversarial review dispatched with --background survives its own session's SessionEnd", () => {
+  const repo = seededRepo();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello world\n");
+  const env = { ...buildEnv(binDir), CODEX_COMPANION_SESSION_ID: "sess-current" };
+
+  const review = run("node", [SCRIPT, "adversarial-review", "--background"], { cwd: repo, env });
+  assert.equal(review.status, 0, review.stderr);
+
+  const stateFile = path.join(resolveStateDir(repo), "state.json");
+  const recorded = JSON.parse(fs.readFileSync(stateFile, "utf8")).jobs[0];
+  assert.equal(recorded.background, true, "a --background review must be recorded as a background job");
+
+  const cleanup = run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: repo,
+    env,
+    input: JSON.stringify({ hook_event_name: "SessionEnd", session_id: "sess-current", cwd: repo })
+  });
+  assert.equal(cleanup.status, 0, cleanup.stderr);
+
+  assert.deepEqual(
+    JSON.parse(fs.readFileSync(stateFile, "utf8")).jobs.map((job) => job.id),
+    [recorded.id],
+    "the background review record must survive the dispatching session's SessionEnd"
+  );
+});
+
 test("stop hook runs a stop-time review task and blocks on findings when the review gate is enabled", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();

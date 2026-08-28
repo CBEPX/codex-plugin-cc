@@ -732,7 +732,7 @@ function getJobKindLabel(kind, jobClass) {
   return jobClass === "review" ? "review" : "rescue";
 }
 
-function createCompanionJob({ prefix, kind, title, workspaceRoot, jobClass, summary, write = false }) {
+function createCompanionJob({ prefix, kind, title, workspaceRoot, jobClass, summary, write = false, background = false }) {
   return createJobRecord({
     id: generateJobId(prefix),
     kind,
@@ -741,7 +741,10 @@ function createCompanionJob({ prefix, kind, title, workspaceRoot, jobClass, summ
     workspaceRoot,
     jobClass,
     summary,
-    write
+    write,
+    // Marks a job SessionEnd must leave alone — and whose record it must keep,
+    // so `result` still works after the dispatching session is gone.
+    ...(background ? { background: true } : {})
   });
 }
 
@@ -976,7 +979,10 @@ async function handleReviewCommand(argv, config) {
     title: metadata.title,
     workspaceRoot,
     jobClass: "review",
-    summary: metadata.summary
+    summary: metadata.summary,
+    // A `--background` review is dispatched (under `nohup`/`&`) to outlive the
+    // session that started it, so its record has to outlive it too.
+    background: Boolean(options.background)
   });
   await runForegroundCommand(
     job,

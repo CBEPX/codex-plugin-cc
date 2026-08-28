@@ -102,7 +102,11 @@ function cleanupSessionJobs(cwd, sessionId) {
   });
 }
 
-function hasActiveBackgroundJobs(cwd) {
+// Read AFTER cleanupSessionJobs: the state it saved is the one that decides.
+// Every kind of job counts, from every session — a foreground job of another
+// Claude session survives this session's cleanup and is talking to the same
+// shared broker, so tearing the broker down here would break its live turn.
+function hasActiveWorkspaceJobs(cwd) {
   if (!cwd) {
     return false;
   }
@@ -116,7 +120,7 @@ function hasActiveBackgroundJobs(cwd) {
   // and trusting that record would keep this broker — and every later session's —
   // alive forever, with the dead job's private payload still on disk.
   return reapDeadJobs(workspaceRoot, state.jobs).some(
-    (job) => job.background && (job.status === "queued" || job.status === "running")
+    (job) => job.status === "queued" || job.status === "running"
   );
 }
 
@@ -145,20 +149,16 @@ async function handleSessionEnd(input) {
 
   cleanupSessionJobs(cwd, input.session_id || process.env[SESSION_ID_ENV]);
 
-  // Detached background workers depend on the broker for codex app-server
-  // calls. If any background jobs are still active in this workspace, leave
-  // the broker running — a later SessionEnd (or the workers themselves) will
-  // tear it down when nothing depends on it anymore.
-  //
-  // The broker is per-workspace, not per-session, so the check deliberately
-  // spans every session's background jobs: tearing it down here would break
-  // another session's still-running worker.
+  // Every job in this workspace — background worker or another session's
+  // foreground run — reaches Codex through the same broker. If any of them is
+  // still active, leave the broker running; a later SessionEnd (or the broker
+  // itself) tears it down once nothing depends on it anymore.
   //
   // What keeps this bounded is the broker's own idle self-terminate (#457):
-  // once the last worker disconnects it exits and clears its own record. With
+  // once the last client disconnects it exits and clears its own record. With
   // `CODEX_COMPANION_BROKER_IDLE_TIMEOUT_MS=0` that safety net is off, and a
-  // broker kept alive here for a background job never exits on its own.
-  if (hasActiveBackgroundJobs(cwd)) {
+  // broker kept alive here for an active job never exits on its own.
+  if (hasActiveWorkspaceJobs(cwd)) {
     return;
   }
 
