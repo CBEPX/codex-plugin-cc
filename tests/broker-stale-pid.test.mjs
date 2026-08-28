@@ -746,6 +746,7 @@ test("session end stays inside its budget when a busy broker then goes silent", 
     assert.ok(elapsed < budgetMs + 2000, `the hook must stay inside its budget, took ${elapsed} ms: ${cleanup.stderr.trim()}`);
     assert.match(cleanup.stderr, /busyRetries=\d+/, "the decision line must report the retries");
     assert.match(cleanup.stderr, /leaving it running/, "the hook must log the decision it made");
+    assert.doesNotMatch(cleanup.stderr, /ignored/, "an override below the ceiling must be honoured, not clamped");
     assert.equal(loadBrokerSession(workspace)?.endpoint, endpoint, "an unconfirmed broker keeps its record");
     assert.equal(fs.existsSync(pidFile), true, "an unconfirmed broker keeps its pid file");
   } finally {
@@ -755,4 +756,92 @@ test("session end stays inside its budget when a busy broker then goes silent", 
     stub.close();
     clearBrokerSession(workspace);
   }
+});
+
+// The budget's ceiling is not negotiable from the environment: `hooks.json`'s
+// timeout is a fixed number, so an override above the ceiling would push the
+// deadline past the point where Claude Code kills the hook — reintroducing exactly
+// the failure the budget prevents.
+test("a SessionEnd budget override above the ceiling is ignored", async () => {
+  const workspace = makeTempDir();
+  const sessionDir = makeTempDir("cxc-");
+  const endpoint = createBrokerEndpoint(sessionDir);
+  const pidFile = path.join(sessionDir, "broker.pid");
+  fs.writeFileSync(pidFile, "999999\n", "utf8");
+  saveBrokerSession(workspace, { endpoint, pidFile, logFile: path.join(sessionDir, "broker.log"), sessionDir, pid: null });
+
+  const sockets = [];
+  const stub = await listenStub(endpoint, (socket) => sockets.push(socket));
+
+  try {
+    const started = Date.now();
+    const cleanup = await runSessionEndHookAsync(workspace, {
+      env: { ...process.env, CODEX_COMPANION_SESSION_END_BUDGET_MS: "20000" }
+    });
+    const elapsed = Date.now() - started;
+
+    assert.equal(cleanup.status, 0, cleanup.stderr);
+    assert.match(
+      cleanup.stderr,
+      /budget override 20000 ignored: above the 12000 ms ceiling/,
+      "an override above the ceiling must be refused, with a reason"
+    );
+    assert.ok(elapsed < 14000, `the effective budget must stay at the ceiling, took ${elapsed} ms`);
+    assert.match(cleanup.stderr, /leaving it running/, "the hook must still log its decision");
+    assert.equal(loadBrokerSession(workspace)?.endpoint, endpoint, "an unconfirmed broker keeps its record");
+  } finally {
+    for (const socket of sockets) {
+      socket.destroy();
+    }
+    stub.close();
+    clearBrokerSession(workspace);
+  }
+});
+
+// Reaping costs one lock acquisition per dead job, so a wedged lock holder used to
+// cost the hook that bound N times over — and a wait that expires throws, which
+// escaped as a crash with no decision at all. The waits are clamped to what is left
+// of the budget, and a lock this hook cannot take is reported, not fatal.
+test("session end reports a wedged state lock instead of dying on it", async () => {
+  const workspace = makeTempDir();
+  const stateDir = resolveStateDir(workspace);
+  fs.mkdirSync(path.join(stateDir, "jobs"), { recursive: true });
+
+  const deadJobs = [1, 2, 3].map((index) => {
+    const finished = run(process.execPath, ["-e", "process.exit(0)"], { env: process.env });
+    return {
+      id: `task-dead-${index}`,
+      status: "running",
+      phase: "running",
+      pid: finished.pid,
+      background: true,
+      updatedAt: "2026-03-24T20:05:00.000Z"
+    };
+  });
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    `${JSON.stringify({ version: 1, config: { stopReviewGate: false }, jobs: deadJobs }, null, 2)}\n`,
+    "utf8"
+  );
+
+  // A live holder: never evictable, so every acquisition can only time out.
+  const lockDir = path.join(stateDir, "state.lock.d");
+  fs.mkdirSync(lockDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(lockDir, `1.${process.pid}-wedged.ticket`),
+    `${JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() })}\n`,
+    "utf8"
+  );
+
+  const budgetMs = 3000;
+  const started = Date.now();
+  const cleanup = await runSessionEndHookAsync(workspace, {
+    env: { ...process.env, CODEX_COMPANION_SESSION_END_BUDGET_MS: String(budgetMs) }
+  });
+  const elapsed = Date.now() - started;
+
+  assert.equal(cleanup.status, 0, `a lock this hook cannot take must not fail it: ${cleanup.stderr.trim()}`);
+  assert.ok(elapsed < budgetMs + 2000, `the hook must stay inside its budget, took ${elapsed} ms`);
+  assert.match(cleanup.stderr, /budgetExhausted=true/, "the decision line must say the budget decided it");
+  assert.match(cleanup.stderr, /state lock/i, "the decision line must name the lock");
 });

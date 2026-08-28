@@ -31,7 +31,9 @@ const BROKER_BUSY_POLL_MS = 100;
 // added up they can exceed any single bound, so each step is clamped to what is
 // left of this budget and the hook reports what it decided instead of being killed
 // mid-decision. KEEP hooks.json's SessionEnd timeout ABOVE this — the pair is
-// asserted by `tests/commands.test.mjs` and documented in the README.
+// asserted by `tests/commands.test.mjs` and documented in the README. The env
+// override can only shorten this ceiling, never raise it, so the pair holds
+// whatever the environment says.
 const SESSION_END_BUDGET_MS = 12000;
 const SESSION_END_BUDGET_ENV = "CODEX_COMPANION_SESSION_END_BUDGET_MS";
 const STATE_LOCK_STEP_MS = 5000;
@@ -39,9 +41,22 @@ const BROKER_HANDSHAKE_STEP_MS = 5000;
 // Below this there is no point starting another bounded step.
 const MIN_STEP_MS = 100;
 
+// The override may only ever SHORTEN the budget. `hooks.json`'s timeout is a fixed
+// number that cannot be raised from the environment, so an override above the
+// ceiling would put the deadline past the point where Claude Code kills the hook —
+// the very failure the budget exists to prevent.
 function resolveSessionEndBudgetMs(env = process.env) {
   const configured = Number(env[SESSION_END_BUDGET_ENV]);
-  return Number.isFinite(configured) && configured > 0 ? configured : SESSION_END_BUDGET_MS;
+  if (!Number.isFinite(configured) || configured <= 0) {
+    return SESSION_END_BUDGET_MS;
+  }
+  if (configured > SESSION_END_BUDGET_MS) {
+    process.stderr.write(
+      `[codex] SessionEnd budget override ${configured} ignored: above the ${SESSION_END_BUDGET_MS} ms ceiling.\n`
+    );
+    return SESSION_END_BUDGET_MS;
+  }
+  return configured;
 }
 const PLUGIN_DATA_ENV = "CLAUDE_PLUGIN_DATA";
 
@@ -136,7 +151,7 @@ function cleanupSessionJobs(cwd, sessionId, lockWaitMs) {
 // Every kind of job counts, from every session — a foreground job of another
 // Claude session survives this session's cleanup and is talking to the same
 // shared broker, so tearing the broker down here would break its live turn.
-function activeWorkspaceJobs(cwd, lockWaitMs) {
+function activeWorkspaceJobs(cwd, lockWaitMs, remainingMs) {
   if (!cwd) {
     return [];
   }
@@ -149,7 +164,7 @@ function activeWorkspaceJobs(cwd, lockWaitMs) {
   // Reap first: a worker killed outright (SIGKILL, OOM) leaves `running` behind,
   // and trusting that record would keep this broker — and every later session's —
   // alive forever, with the dead job's private payload still on disk.
-  return reapDeadJobs(workspaceRoot, state.jobs, { lockWaitMs })
+  return reapDeadJobs(workspaceRoot, state.jobs, { lockWaitMs, remainingMs })
     .filter((job) => job.status === "queued" || job.status === "running")
     .map((job) => `${job.id}:${job.status}`);
 }
@@ -180,7 +195,22 @@ async function handleSessionEnd(input) {
   const sessionDir = brokerSession?.sessionDir ?? null;
   const pid = brokerSession?.pid ?? null;
 
-  cleanupSessionJobs(cwd, input.session_id || process.env[SESSION_ID_ENV], stepBudget(STATE_LOCK_STEP_MS));
+  let activeJobs;
+  try {
+    cleanupSessionJobs(cwd, input.session_id || process.env[SESSION_ID_ENV], stepBudget(STATE_LOCK_STEP_MS));
+    activeJobs = activeWorkspaceJobs(cwd, stepBudget(STATE_LOCK_STEP_MS), remainingMs);
+  } catch (error) {
+    // A lock this hook could not take says nothing about the broker, and a
+    // SessionEnd that dies here would take its decision with it: report and leave
+    // everything alone. Anything else is a real fault and still fails the hook.
+    if (!/state lock/i.test(error instanceof Error ? error.message : String(error))) {
+      throw error;
+    }
+    process.stderr.write(
+      `[codex] SessionEnd could not take the state lock (budgetExhausted=true lock=${error.message}); leaving the broker running.\n`
+    );
+    return;
+  }
 
   // Every job in this workspace — background worker or another session's
   // foreground run — reaches Codex through the same broker. If any of them is
@@ -191,7 +221,6 @@ async function handleSessionEnd(input) {
   // once the last client disconnects it exits and clears its own record. With
   // `CODEX_COMPANION_BROKER_IDLE_TIMEOUT_MS=0` that safety net is off, and a
   // broker kept alive here for an active job never exits on its own.
-  const activeJobs = activeWorkspaceJobs(cwd, stepBudget(STATE_LOCK_STEP_MS));
   if (activeJobs.length > 0) {
     process.stderr.write(`[codex] Workspace jobs still active (${activeJobs.join(", ")}); leaving the broker running.\n`);
     return;
@@ -220,15 +249,15 @@ async function handleSessionEnd(input) {
     // is left alone, exactly as before.
     const retriesEndAt = Date.now() + BROKER_BUSY_RETRY_MS;
     while (shutdown.busy === true && Date.now() < retriesEndAt && remainingMs() >= MIN_STEP_MS) {
-      await new Promise((resolve) => setTimeout(resolve, Math.min(BROKER_BUSY_POLL_MS, stepBudget(BROKER_BUSY_POLL_MS))));
+      await new Promise((resolve) => setTimeout(resolve, stepBudget(BROKER_BUSY_POLL_MS)));
       shutdown = await sendBrokerShutdown(brokerEndpoint, { timeoutMs: stepBudget(BROKER_HANDSHAKE_STEP_MS) });
       busyRetries += 1;
     }
     if (shutdown.busy !== false) {
       process.stderr.write(
         shutdown.busy === true
-          ? `[codex] Shared broker is still serving another session (busyRetries=${busyRetries}); leaving it running.\n`
-          : `[codex] Shared broker did not confirm it is idle (busyRetries=${busyRetries}); leaving it running.\n`
+          ? `[codex] Shared broker is still serving another session (busyRetries=${busyRetries} budgetExhausted=${remainingMs() < MIN_STEP_MS}); leaving it running.\n`
+          : `[codex] Shared broker did not confirm it is idle (busyRetries=${busyRetries} budgetExhausted=${remainingMs() < MIN_STEP_MS}); leaving it running.\n`
       );
       return;
     }

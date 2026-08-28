@@ -340,10 +340,29 @@ function isQueuedWithoutWorker(job, pid) {
 // zombie as alive and cannot see a recycled pid, so that phantom `running` entry
 // would block resume on its thread for as long as anything held that pid. Pid
 // liveness is only consulted for jobs whose own file still says they are active.
-/** @param {{ lockWaitMs?: number }} [options] Bounds the reaper's own state-lock wait. */
+// Below this there is no point starting another lock wait.
+const REAP_MIN_STEP_MS = 100;
+
+/**
+ * @param {{ lockWaitMs?: number, remainingMs?: () => number }} [options] Bounds the
+ * reaper's own state-lock waits. Each dead job costs one acquisition, so a caller
+ * working to a deadline passes `remainingMs` and every wait is clamped to what is
+ * left of it; once that is spent the remaining jobs are left for the next run
+ * rather than reaped past the caller's budget.
+ */
 export function reapDeadJobs(workspaceRoot, jobs, options = {}) {
-  const { lockWaitMs } = options;
+  const { lockWaitMs, remainingMs } = options;
+  const waitFor = () => {
+    if (!remainingMs) {
+      return lockWaitMs;
+    }
+    const left = Math.max(0, remainingMs());
+    return lockWaitMs === undefined ? left : Math.min(lockWaitMs, left);
+  };
   return jobs.map((job) => {
+    if (remainingMs && remainingMs() < REAP_MIN_STEP_MS) {
+      return job;
+    }
     if (job.status !== "running" && job.status !== "queued") {
       return job;
     }
@@ -351,13 +370,13 @@ export function reapDeadJobs(workspaceRoot, jobs, options = {}) {
     if (stored && stored.status !== "running" && stored.status !== "queued") {
       // Terminal on disk: markJobDead keeps the real result and reconciles it
       // into the index rather than failing the job.
-      return markJobDead(workspaceRoot, job, DEAD_WORKER_MESSAGE, lockWaitMs);
+      return markJobDead(workspaceRoot, job, DEAD_WORKER_MESSAGE, waitFor());
     }
     // The queued record carries no pid of its own — the parent records it in an
     // atomic sidecar instead of rewriting the worker's job file.
     const pid = resolveJobPid(workspaceRoot, job);
     if (isPidAlive(pid) === false || isQueuedWithoutWorker(job, pid)) {
-      return markJobDead(workspaceRoot, job, DEAD_WORKER_MESSAGE, lockWaitMs);
+      return markJobDead(workspaceRoot, job, DEAD_WORKER_MESSAGE, waitFor());
     }
     return job;
   });
