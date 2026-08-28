@@ -248,7 +248,23 @@ function markJobDead(workspaceRoot, jobSummary, errorMessage) {
   const stored = fs.existsSync(jobFile) ? readJobFile(jobFile) : null;
   const base = stored ?? jobSummary;
   if (base.status !== "running" && base.status !== "queued") {
-    // The job finished between the caller's read and now — keep the real result.
+    // The job finished between the caller's read and now — keep the real result,
+    // and put it in the index too: a worker that died between its terminal
+    // `writeJobFile` and its `upsertJob` leaves an active index entry that
+    // `assertThreadIsFree` reads as a phantom running job, blocking every later
+    // resume of that thread.
+    upsertJob(workspaceRoot, {
+      id: jobSummary.id,
+      status: base.status,
+      phase: base.phase ?? null,
+      errorMessage: base.errorMessage ?? null,
+      threadId: base.threadId ?? null,
+      turnId: base.turnId ?? null,
+      resolved: base.resolved ?? null,
+      requestFile: base.requestFile ?? null,
+      pid: null,
+      completedAt: base.completedAt ?? null
+    });
     return base;
   }
   const completedAt = nowIso();

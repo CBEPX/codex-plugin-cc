@@ -45,6 +45,7 @@ import { BROKER_BUSY_RPC_CODE, BROKER_ENDPOINT_ENV, CodexAppServerClient } from 
 import { loadBrokerSession } from "./broker-lifecycle.mjs";
 import { binaryAvailable } from "./process.mjs";
 import { listJobs } from "./state.mjs";
+import { reapDeadJobs } from "./tracked-jobs.mjs";
 
 const SERVICE_NAME = "claude_code_codex_plugin";
 const TASK_THREAD_PREFIX = "Codex Companion Task";
@@ -1267,8 +1268,11 @@ export async function importExternalAgentSession(cwd, options = {}) {
 // Two concurrent turns on one thread interleave their history. The
 // session-scoped resume-candidate lookup cannot see jobs from other Claude
 // sessions, so the thread itself is checked here, where every resume passes.
+// Reaped, not raw: a job whose worker is gone — or whose terminal record only
+// reached its job file — is not holding the thread, and its stale index entry
+// would block the resume forever.
 function assertThreadIsFree(cwd, threadId, excludeJobId = null) {
-  const busy = listJobs(cwd).find(
+  const busy = reapDeadJobs(cwd, listJobs(cwd)).find(
     (job) =>
       job.id !== excludeJobId &&
       job.threadId === threadId &&

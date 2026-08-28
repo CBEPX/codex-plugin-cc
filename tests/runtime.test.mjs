@@ -3007,6 +3007,71 @@ test("a resume refuses to start a second turn on a thread another job is still u
   assert.equal(fakeState.lastTurnStart.prompt, "follow up");
 });
 
+// The crash window between a worker's terminal `writeJobFile` and its
+// `upsertJob`: the job file is terminal, the index still says running. The
+// reaper handed the terminal file back to its caller but left the index alone,
+// so the raw `listJobs()` behind `assertThreadIsFree` kept seeing a phantom
+// running job and blocked every later resume of that thread.
+test("a terminal job file reconciles the state index and unblocks resume", () => {
+  const repo = seededRepo();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const env = { ...buildEnv(binDir), CODEX_COMPANION_SESSION_ID: "sess-current" };
+
+  const first = run("node", [SCRIPT, "task", "first"], { cwd: repo, env });
+  assert.equal(first.status, 0, first.stderr);
+
+  const deadWorker = run(process.execPath, ["-e", ""]);
+  assert.equal(deadWorker.status, 0);
+
+  const stateDir = resolveStateDir(repo);
+  const statePath = path.join(stateDir, "state.json");
+  const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  state.jobs.push({
+    id: "task-crash-window",
+    status: "running",
+    phase: "running",
+    title: "Codex Task",
+    jobClass: "task",
+    sessionId: "sess-other",
+    threadId: "thr_1",
+    pid: deadWorker.pid,
+    summary: "Other session task that died after writing its result",
+    updatedAt: "2026-03-24T20:05:00.000Z"
+  });
+  fs.writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+  fs.writeFileSync(
+    path.join(stateDir, "jobs", "task-crash-window.json"),
+    `${JSON.stringify(
+      {
+        id: "task-crash-window",
+        status: "completed",
+        phase: "done",
+        pid: null,
+        threadId: "thr_1",
+        turnId: "turn_9",
+        result: { status: 0, finalMessage: "done" },
+        rendered: "done\n",
+        completedAt: "2026-03-24T20:06:00.000Z"
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+
+  // Resume first: only a reaped/reconciled job list can tell this thread is free.
+  const resumed = run("node", [SCRIPT, "task", "--resume-last", "follow up"], { cwd: repo, env });
+  assert.equal(resumed.status, 0, resumed.stderr);
+
+  const reconciled = JSON.parse(fs.readFileSync(statePath, "utf8")).jobs.find((job) => job.id === "task-crash-window");
+  assert.equal(reconciled.status, "completed", "the terminal job file must be reconciled into the state index");
+  assert.equal(reconciled.pid, null);
+
+  const status = run("node", [SCRIPT, "status", "--json"], { cwd: repo, env });
+  assert.equal(status.status, 0, status.stderr);
+});
+
 test("task --prompt-file wins over --args-stdin and keeps the prompt byte-exact", () => {
   const repo = seededRepo();
   const binDir = makeTempDir();
