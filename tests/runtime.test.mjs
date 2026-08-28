@@ -3378,6 +3378,37 @@ test("an unacknowledged interrupt is reported and closes a direct app-server", (
   assert.match(latest.errorMessage, /may still be running in the shared runtime/);
 });
 
+// The other degraded shape: the app-server answers the interrupt and dies before
+// any terminal notification. Nothing can arrive after that, and the acknowledgement
+// window used to be an unref'd timer with no exit awareness — so the companion
+// waited on a promise nothing would settle and could exit before writing the job's
+// terminal record, leaving it `running` forever.
+test("a transport that exits after the interrupt still writes a terminal record", () => {
+  const repo = seededRepo();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+
+  const seeded = run("node", [SCRIPT, "task", "initial task"], { cwd: repo, env: buildEnv(binDir) });
+  assert.equal(seeded.status, 0, seeded.stderr);
+
+  const env = buildEnv(binDir, { FAKE_CODEX_TURN_DELAY_MS: "20000", FAKE_CODEX_EXIT_AFTER_INTERRUPT: "1" });
+  const started = Date.now();
+  const result = run("node", [SCRIPT, "task", "--resume-last", "--turn-timeout-ms", "500", "--json", "stall please"], {
+    cwd: repo,
+    env
+  });
+  const elapsed = Date.now() - started;
+
+  assert.equal(result.status, 1, result.stderr);
+  assert.ok(elapsed < 9000, `a dead transport must end the acknowledgement wait early, took ${elapsed} ms`);
+
+  const status = run("node", [SCRIPT, "status", "--json"], { cwd: repo, env: buildEnv(binDir) });
+  assert.equal(status.status, 0, status.stderr);
+  const latest = JSON.parse(status.stdout).latestFinished;
+  assert.equal(latest.status, "failed", "the job must not be left running");
+  assert.match(latest.errorMessage, /turn timed out after 500 ms; interrupt not acknowledged/);
+});
+
 test("task --turn-timeout-ms survives into the detached background worker", () => {
   const repo = seededRepo();
   const binDir = makeTempDir();

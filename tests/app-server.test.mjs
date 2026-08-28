@@ -1,7 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { AppServerClientBase } from "../plugins/codex/scripts/lib/app-server.mjs";
+import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
+import { makeTempDir } from "./helpers.mjs";
+import { AppServerClientBase, CodexAppServerClient } from "../plugins/codex/scripts/lib/app-server.mjs";
 
 /** Minimal client that records the JSON-RPC messages it would send. */
 class CapturingClient extends AppServerClientBase {
@@ -88,4 +90,31 @@ test("permission approval requests grant nothing for the turn", () => {
     params: { threadId: "t1", permissions: { network: { enabled: true } } }
   });
   assert.deepEqual(client.sent, [{ id: 25, result: { permissions: {}, scope: "turn" } }]);
+});
+
+// `close()` is what the turn timeout uses to kill a runaway turn on a transport
+// it owns, so it must never become the second hang: an app-server that ignores
+// SIGTERM (or is wedged in a tool call) used to leave it awaiting process exit
+// forever. TERM, then KILL, then give up on the process rather than the caller.
+test("close() bounds an app-server that ignores SIGTERM", { timeout: 8000 }, async (t) => {
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const client = await CodexAppServerClient.connect(binDir, {
+    disableBroker: true,
+    env: buildEnv(binDir, { FAKE_CODEX_IGNORE_SIGTERM: "1" })
+  });
+  t.after(() => {
+    try {
+      client.proc.kill("SIGKILL");
+    } catch {
+      // Already gone, which is the point of the test.
+    }
+  });
+
+  const started = Date.now();
+  await client.close();
+  const elapsed = Date.now() - started;
+
+  assert.ok(elapsed < 6000, `close() must be bounded, took ${elapsed} ms`);
+  assert.equal(client.proc.signalCode, "SIGKILL", "a SIGTERM-immune app-server must be killed outright");
 });

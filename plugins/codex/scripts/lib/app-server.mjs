@@ -222,6 +222,15 @@ export class AppServerClientBase {
   }
 }
 
+// Closing a direct app-server is a teardown step, not a negotiation: the turn
+// timeout calls it precisely because the child is misbehaving. Ask (stdin EOF),
+// then tell (SIGTERM), then insist (SIGKILL), and in the worst case return to the
+// caller anyway — a leaked child process is a smaller problem than a companion
+// that never finishes writing the job record.
+const CLOSE_TERM_MS = 50;
+const CLOSE_KILL_MS = 2000;
+const CLOSE_DEADLINE_MS = 5000;
+
 class SpawnedCodexAppServerClient extends AppServerClientBase {
   constructor(cwd, options = {}) {
     super(cwd, options);
@@ -271,6 +280,23 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
     this.notify("initialized", {});
   }
 
+  // On Windows with shell: true the direct child is cmd.exe, so the whole tree
+  // has to go — `taskkill /T /F` is the only escalation available there.
+  terminateChild(signal) {
+    if (!this.proc || this.proc.exitCode !== null || this.proc.signalCode !== null) {
+      return;
+    }
+    try {
+      if (process.platform === "win32") {
+        terminateProcessTree(this.proc.pid);
+      } else {
+        this.proc.kill(signal);
+      }
+    } catch {
+      // Best-effort teardown: never throw on the way out.
+    }
+  }
+
   async close() {
     if (this.closed) {
       await this.exitPromise;
@@ -283,28 +309,29 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
       this.readline.close();
     }
 
-    if (this.proc && !this.proc.killed) {
+    const timers = [];
+    if (this.proc && this.proc.exitCode === null && this.proc.signalCode === null) {
       this.proc.stdin.end();
-      setTimeout(() => {
-        if (this.proc && !this.proc.killed && this.proc.exitCode === null) {
-          // On Windows with shell: true, the direct child is cmd.exe.
-          // Use terminateProcessTree to kill the entire tree including
-          // the grandchild node process.
-          if (process.platform === "win32") {
-            try {
-              terminateProcessTree(this.proc.pid);
-            } catch {
-              // Best-effort cleanup inside an unref'd timer — swallow errors
-              // to avoid crashing the host process during shutdown.
-            }
-          } else {
-            this.proc.kill("SIGTERM");
-          }
-        }
-      }, 50).unref?.();
+      timers.push(setTimeout(() => this.terminateChild("SIGTERM"), CLOSE_TERM_MS));
+      timers.push(setTimeout(() => this.terminateChild("SIGKILL"), CLOSE_KILL_MS));
     }
 
-    await this.exitPromise;
+    let deadlineTimer = null;
+    try {
+      await Promise.race([
+        this.exitPromise,
+        new Promise((resolve) => {
+          deadlineTimer = setTimeout(resolve, CLOSE_DEADLINE_MS);
+        })
+      ]);
+    } finally {
+      for (const timer of timers) {
+        clearTimeout(timer);
+      }
+      if (deadlineTimer) {
+        clearTimeout(deadlineTimer);
+      }
+    }
   }
 
   sendMessage(message) {

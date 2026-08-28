@@ -311,6 +311,19 @@ if (CLOSE_DELAY_MS > 0) {
   });
 }
 
+// Test knob: exit the moment the interrupt is answered and never send the
+// turn's terminal notification, the way an app-server that dies (or is killed)
+// mid-turn does.
+const EXIT_AFTER_INTERRUPT = process.env.FAKE_CODEX_EXIT_AFTER_INTERRUPT === "1";
+
+// Test knob: an app-server that survives stdin EOF and ignores SIGTERM, so only
+// SIGKILL can end it. The interval is what keeps the process alive once stdin
+// is gone.
+if (process.env.FAKE_CODEX_IGNORE_SIGTERM === "1") {
+  process.on("SIGTERM", () => {});
+  setInterval(() => {}, 1000);
+}
+
 rl.on("line", (line) => {
   if (!line.trim()) {
     return;
@@ -659,6 +672,11 @@ rl.on("line", (line) => {
 	          turnId: message.params.turnId
 	        };
 	        saveState(state);
+	        if (EXIT_AFTER_INTERRUPT) {
+	          send({ id: message.id, result: {} });
+	          setTimeout(() => process.exit(0), 10);
+	          break;
+	        }
 	        const pending = IGNORE_INTERRUPT ? null : interruptibleTurns.get(message.params.turnId);
 	        if (pending) {
 	          clearTimeout(pending.timer);

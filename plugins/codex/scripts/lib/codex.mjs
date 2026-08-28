@@ -635,17 +635,23 @@ const TURN_INTERRUPT_GRACE_MS = 2000;
 const TURN_INTERRUPT_ACK_MS = 10000;
 
 // Resolves true once the turn reached a terminal notification (which is what
-// runs `completeTurn`), false if the runtime stayed silent for the grace period.
-function waitForTurnAcknowledgement(state, timeoutMs) {
+// runs `completeTurn`), false if the runtime stayed silent for the whole window
+// or died without sending one.
+function waitForTurnAcknowledgement(client, state, timeoutMs) {
   if (state.completed) {
     return Promise.resolve(true);
   }
   let timer = null;
   return Promise.race([
     state.completion.then(() => true),
+    // A transport that is gone is an answer too: no notification can follow it,
+    // so waiting out the rest of the window would only delay the terminal record.
+    client.exitPromise.then(() => state.completed),
     new Promise((resolve) => {
+      // Deliberately referenced: this timer is the only thing keeping the process
+      // alive once a dead transport has released its handles, and the job still
+      // has to be written terminal before we exit.
       timer = setTimeout(() => resolve(false), timeoutMs);
-      timer.unref?.();
     })
   ]).finally(() => {
     if (timer) {
@@ -688,7 +694,7 @@ async function failTurnOnTimeout(client, state, timeoutMs) {
   // interrupt (and notifications are still buffered), so this window only ever
   // expires — the report then says the turn may still be running, which is the
   // truth. `completeTurn` already ran if the notification arrived.
-  if (await waitForTurnAcknowledgement(state, TURN_INTERRUPT_ACK_MS)) {
+  if (await waitForTurnAcknowledgement(client, state, TURN_INTERRUPT_ACK_MS)) {
     return;
   }
 
