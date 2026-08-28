@@ -6,15 +6,18 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-import { makeTempDir } from "./helpers.mjs";
+import { makeTempDir, run } from "./helpers.mjs";
 import {
   consumeJobRequestFile,
+  listJobs,
   resolveJobFile,
   resolveJobLogFile,
   resolveJobRequestFile,
   resolveStateDir,
   resolveStateFile,
   saveState,
+  upsertJob,
+  withStateLock,
   writeJobRequestFile
 } from "../plugins/codex/scripts/lib/state.mjs";
 
@@ -200,4 +203,95 @@ test("concurrent writers never leave a torn state.json for a reader", async () =
   await new Promise((resolve) => writer.on("exit", resolve));
   assert.equal(writerStderr, "");
   assert.ok(reads > 100, `expected the reader to race the writer, got ${reads} reads`);
+});
+
+const STATE_MODULE_URL = JSON.stringify(pathToFileURL(STATE_MODULE).href);
+
+function runModule(source) {
+  return spawn(process.execPath, ["--input-type=module", "-e", source], {
+    env: process.env,
+    stdio: ["ignore", "ignore", "pipe"]
+  });
+}
+
+function collectExit(child) {
+  let stderr = "";
+  child.stderr.on("data", (chunk) => {
+    stderr += chunk;
+  });
+  return new Promise((resolve) => child.on("exit", (code) => resolve({ code, stderr })));
+}
+
+// `updateState` reads, mutates and writes without serialization, and `saveState`
+// deletes the artifacts of every job that is in the file it read but not in the
+// snapshot it is about to write. A second process that creates a job inside that
+// window is therefore not just lost from the index: its job file, private request
+// payload, PID sidecar and log are deleted under it.
+test("a job created during another process's read-modify-write survives it", async () => {
+  const workspace = makeTempDir();
+  saveState(workspace, { jobs: [{ id: "job-a", status: "completed", updatedAt: "2026-03-18T15:00:00.000Z" }] });
+
+  const holder = runModule(`
+    import { updateState } from ${STATE_MODULE_URL};
+    updateState(${JSON.stringify(workspace)}, () => {
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1500);
+    });
+  `);
+  const holderExit = collectExit(holder);
+
+  // Let the holder get past its read and into the slow part of its mutation.
+  await new Promise((resolve) => setTimeout(resolve, 400));
+
+  const enqueue = run(process.execPath, [
+    "--input-type=module",
+    "-e",
+    `
+    import { upsertJob, writeJobFile, writeJobRequestFile } from ${STATE_MODULE_URL};
+    const workspace = ${JSON.stringify(workspace)};
+    writeJobFile(workspace, "job-b", { id: "job-b", status: "queued" });
+    writeJobRequestFile(workspace, "job-b", { prompt: "hello" });
+    upsertJob(workspace, { id: "job-b", status: "queued" });
+    `
+  ], { env: process.env });
+  assert.equal(enqueue.status, 0, enqueue.stderr);
+
+  const finished = await holderExit;
+  assert.equal(finished.code, 0, finished.stderr);
+
+  const ids = listJobs(workspace).map((job) => job.id).sort();
+  assert.deepEqual(ids, ["job-a", "job-b"], "neither writer may lose the other's job");
+  assert.equal(fs.existsSync(resolveJobFile(workspace, "job-b")), true, "the new job's file must not be pruned");
+  assert.equal(fs.existsSync(resolveJobRequestFile(workspace, "job-b")), true, "the new job's payload must not be pruned");
+});
+
+// A holder that dies with the lock held (SIGKILL, OOM, host reboot) must not
+// wedge the workspace: the next writer proves the owner is gone and takes over.
+test("a state lock whose owner is gone is taken over", () => {
+  const workspace = makeTempDir();
+  saveState(workspace, { jobs: [] });
+  const dead = run(process.execPath, ["-e", "process.exit(0)"], { env: process.env });
+  const lockDir = path.join(resolveStateDir(workspace), "state.lock");
+  fs.mkdirSync(lockDir, { recursive: true });
+  fs.writeFileSync(path.join(lockDir, "owner.json"), JSON.stringify({ pid: dead.pid, at: new Date().toISOString() }), "utf8");
+
+  const started = Date.now();
+  upsertJob(workspace, { id: "job-after-crash", status: "queued" });
+
+  assert.ok(Date.now() - started < 3000, "a dead holder must not cost the full lock wait");
+  assert.deepEqual(listJobs(workspace).map((job) => job.id), ["job-after-crash"]);
+});
+
+// The bounded wait is what keeps a wedged holder from hanging every command in
+// the workspace: the writer reports the lock instead of blocking forever.
+test("withStateLock gives up when a live holder never releases", () => {
+  const workspace = makeTempDir();
+  saveState(workspace, { jobs: [] });
+  const lockDir = path.join(resolveStateDir(workspace), "state.lock");
+  fs.mkdirSync(lockDir, { recursive: true });
+  fs.writeFileSync(path.join(lockDir, "owner.json"), JSON.stringify({ pid: process.pid, at: new Date().toISOString() }), "utf8");
+
+  assert.throws(
+    () => withStateLock(workspace, () => "never runs", { waitMs: 150 }),
+    /state lock/i
+  );
 });

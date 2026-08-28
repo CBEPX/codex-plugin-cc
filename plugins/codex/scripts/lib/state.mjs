@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { isPidAlive } from "./process.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
 const STATE_VERSION = 1;
@@ -103,7 +104,128 @@ function removeFileIfExists(filePath) {
   }
 }
 
+// Every workspace command reads `state.json`, changes it and writes it back, and
+// `saveState` deletes the artifacts of every job that was in the file it read but
+// is not in the snapshot it writes. Unserialized, a process whose snapshot went
+// stale therefore does not merely lose another process's job from the index — it
+// deletes that job's file, private payload, PID sidecar and log. `mkdir` is the
+// one filesystem primitive that is atomic on every platform we run on, so the
+// lock is a directory; the owner file inside it is what makes a crashed holder
+// recognisable.
+// ponytail: one lock per workspace, no reader/writer split — every mutation is a
+// few file writes, so a shared-read lock would only add ways to get it wrong.
+const LOCK_DIR_NAME = "state.lock";
+const LOCK_OWNER_FILE = "owner.json";
+const LOCK_WAIT_MS = 5000;
+const LOCK_POLL_MS = 25;
+const LOCK_STALE_MS = 30000;
+
+// Locks this process already holds: a locked section may call another one
+// (`updateState` → `saveState`) and must not deadlock against itself.
+const heldLocks = new Map();
+
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function readLockOwner(lockDir) {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(lockDir, LOCK_OWNER_FILE), "utf8"));
+  } catch {
+    // Either the holder died between the mkdir and the owner file, or it is
+    // writing that file right now — only the lock's age can tell those apart.
+    return null;
+  }
+}
+
+function isLockStale(lockDir) {
+  const owner = readLockOwner(lockDir);
+  if (isPidAlive(owner?.pid) === false) {
+    return true;
+  }
+  const claimedAt = Date.parse(owner?.at ?? "");
+  const heldSince = Number.isFinite(claimedAt) ? claimedAt : statMtimeMs(lockDir);
+  return Number.isFinite(heldSince) ? Date.now() - heldSince > LOCK_STALE_MS : true;
+}
+
+function statMtimeMs(target) {
+  try {
+    return fs.statSync(target).mtimeMs;
+  } catch {
+    return Number.NaN;
+  }
+}
+
+function releaseLock(lockDir) {
+  try {
+    fs.rmSync(lockDir, { recursive: true, force: true });
+  } catch {
+    // A lock we cannot remove is taken over by the next writer once it goes stale.
+  }
+}
+
+function acquireLock(lockDir, waitMs) {
+  const deadline = Date.now() + waitMs;
+  for (;;) {
+    try {
+      fs.mkdirSync(lockDir);
+      fs.writeFileSync(path.join(lockDir, LOCK_OWNER_FILE), `${JSON.stringify({ pid: process.pid, at: nowIso() })}\n`, "utf8");
+      return;
+    } catch (error) {
+      if (error.code !== "EEXIST") {
+        throw error;
+      }
+    }
+
+    if (Date.now() >= deadline) {
+      throw new Error(
+        `Timed out after ${waitMs} ms waiting for the Codex state lock (${lockDir}). Remove that directory if no Codex command is running.`
+      );
+    }
+    if (isLockStale(lockDir)) {
+      releaseLock(lockDir);
+    } else {
+      sleepSync(LOCK_POLL_MS);
+    }
+  }
+}
+
+// Runs `fn` — which must be synchronous — as the only writer of this workspace's
+// state, across processes. Re-read whatever you are about to change inside it:
+// anything read before the call may already be stale.
+export function withStateLock(cwd, fn, options = {}) {
+  ensureStateDir(cwd);
+  const lockDir = path.join(resolveStateDir(cwd), LOCK_DIR_NAME);
+  const depth = heldLocks.get(lockDir) ?? 0;
+  if (depth > 0) {
+    heldLocks.set(lockDir, depth + 1);
+    try {
+      return fn();
+    } finally {
+      heldLocks.set(lockDir, depth);
+    }
+  }
+
+  acquireLock(lockDir, options.waitMs ?? LOCK_WAIT_MS);
+  heldLocks.set(lockDir, 1);
+  try {
+    return fn();
+  } finally {
+    heldLocks.delete(lockDir);
+    releaseLock(lockDir);
+  }
+}
+
+// The prune below is a diff against what is on disk right now, so both halves —
+// the read and the write — belong inside the lock. `state` is the caller's
+// snapshot: anything it did not carry over is treated as deleted, which is only
+// safe because no other process can have added to the file since the caller
+// re-read it under this same lock.
 export function saveState(cwd, state) {
+  return withStateLock(cwd, () => saveStateLocked(cwd, state));
+}
+
+function saveStateLocked(cwd, state) {
   const previousJobs = loadState(cwd).jobs;
   ensureStateDir(cwd);
   const nextJobs = pruneJobs(state.jobs ?? []);
@@ -131,10 +253,15 @@ export function saveState(cwd, state) {
   return nextState;
 }
 
+// Read, change and write as one indivisible step: the read has to happen inside
+// the lock, or the snapshot handed to `mutate` can already be missing a job
+// another process just added — which `saveState` would then delete.
 export function updateState(cwd, mutate) {
-  const state = loadState(cwd);
-  mutate(state);
-  return saveState(cwd, state);
+  return withStateLock(cwd, () => {
+    const state = loadState(cwd);
+    mutate(state);
+    return saveStateLocked(cwd, state);
+  });
 }
 
 export function generateJobId(prefix = "job") {
@@ -174,11 +301,15 @@ export function updateJobPid(cwd, jobId, pid) {
   writeJobPidFile(cwd, jobId, pid);
   // The index is patch-based, so it cannot lose a field — but a worker that
   // already reported `running` wrote its own pid there, and that record is the
-  // newer one. A job that is gone from the index needs no pid at all.
-  const indexed = listJobs(cwd).find((job) => job.id === jobId);
-  if (indexed?.status === "queued") {
-    upsertJob(cwd, { id: jobId, pid });
-  }
+  // newer one. A job that is gone from the index needs no pid at all. The read
+  // and the patch share one lock: between them the worker could otherwise report
+  // `running`, and the patch would put this stale pid over its own.
+  withStateLock(cwd, () => {
+    const indexed = listJobs(cwd).find((job) => job.id === jobId);
+    if (indexed?.status === "queued") {
+      upsertJob(cwd, { id: jobId, pid });
+    }
+  });
 }
 
 export function listJobs(cwd) {

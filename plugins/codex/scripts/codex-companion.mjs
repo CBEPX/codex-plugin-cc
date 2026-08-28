@@ -37,6 +37,7 @@ import {
   setConfig,
   updateJobPid,
   upsertJob,
+  withStateLock,
   writeJobFile,
   writeJobRequestFile
 } from "./lib/state.mjs";
@@ -1304,13 +1305,6 @@ async function handleCancel(argv) {
   terminateProcessTree(resolveJobPid(workspaceRoot, job) ?? Number.NaN);
   appendLogLine(job.logFile, "Cancelled by user.");
 
-  // A worker cancelled inside the queued window may never have consumed its
-  // private payload, and a cancelled job is terminal — the reaper will never
-  // look at it again — so the 0600 file (possibly holding `--config` secrets)
-  // has to be released here.
-  removeJobRequestFile(workspaceRoot, job.id);
-  removeJobPidFile(workspaceRoot, job.id);
-
   const completedAt = nowIso();
   const nextJob = {
     ...job,
@@ -1322,19 +1316,31 @@ async function handleCancel(argv) {
     errorMessage: "Cancelled by user."
   };
 
-  writeJobFile(workspaceRoot, job.id, {
-    ...existing,
-    ...nextJob,
-    cancelledAt: completedAt
-  });
-  upsertJob(workspaceRoot, {
-    id: job.id,
-    status: "cancelled",
-    phase: "cancelled",
-    pid: null,
-    requestFile: null,
-    errorMessage: "Cancelled by user.",
-    completedAt
+  // Deleting the artifacts and writing the terminal record is one step: another
+  // process's `saveState` prune works off a diff of the index, so a cancel split
+  // across that write can have the record it just wrote pruned away — or the
+  // payload it just deleted counted as still owned.
+  withStateLock(workspaceRoot, () => {
+    // A worker cancelled inside the queued window may never have consumed its
+    // private payload, and a cancelled job is terminal — the reaper will never
+    // look at it again — so the 0600 file (possibly holding `--config` secrets)
+    // has to be released here.
+    removeJobRequestFile(workspaceRoot, job.id);
+    removeJobPidFile(workspaceRoot, job.id);
+    writeJobFile(workspaceRoot, job.id, {
+      ...(readStoredJob(workspaceRoot, job.id) ?? existing),
+      ...nextJob,
+      cancelledAt: completedAt
+    });
+    upsertJob(workspaceRoot, {
+      id: job.id,
+      status: "cancelled",
+      phase: "cancelled",
+      pid: null,
+      requestFile: null,
+      errorMessage: "Cancelled by user.",
+      completedAt
+    });
   });
 
   const payload = {

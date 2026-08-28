@@ -13,7 +13,7 @@ import {
   sendBrokerShutdown,
   teardownBrokerSession
 } from "./lib/broker-lifecycle.mjs";
-import { loadState, resolveJobPid, resolveStateFile, saveState } from "./lib/state.mjs";
+import { loadState, resolveJobPid, resolveStateFile, saveState, withStateLock } from "./lib/state.mjs";
 import { reapDeadJobs } from "./lib/tracked-jobs.mjs";
 import { TRANSCRIPT_PATH_ENV } from "./lib/claude-session-transfer.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
@@ -72,33 +72,39 @@ function cleanupSessionJobs(cwd, sessionId) {
     return;
   }
 
-  const state = loadState(workspaceRoot);
-  const sessionJobs = state.jobs.filter((job) => job.sessionId === sessionId);
-  if (sessionJobs.length === 0) {
-    return;
-  }
+  // One locked read-modify-write: the jobs this decides to stop and the list it
+  // writes back have to come from the same snapshot, or another session's job —
+  // created between the read and the write — is dropped from the index and its
+  // files are pruned with it.
+  withStateLock(workspaceRoot, () => {
+    const state = loadState(workspaceRoot);
+    const sessionJobs = state.jobs.filter((job) => job.sessionId === sessionId);
+    if (sessionJobs.length === 0) {
+      return;
+    }
 
-  for (const job of sessionJobs) {
-    // Background jobs are explicitly dispatched to outlive the session that
-    // started them. Leave them running and leave their state entry intact so
-    // any session in the workspace can still poll for status/results.
-    if (job.background) {
-      continue;
+    for (const job of sessionJobs) {
+      // Background jobs are explicitly dispatched to outlive the session that
+      // started them. Leave them running and leave their state entry intact so
+      // any session in the workspace can still poll for status/results.
+      if (job.background) {
+        continue;
+      }
+      const stillRunning = job.status === "queued" || job.status === "running";
+      if (!stillRunning) {
+        continue;
+      }
+      try {
+        terminateProcessTree(resolveJobPid(workspaceRoot, job) ?? Number.NaN);
+      } catch {
+        // Ignore teardown failures during session shutdown.
+      }
     }
-    const stillRunning = job.status === "queued" || job.status === "running";
-    if (!stillRunning) {
-      continue;
-    }
-    try {
-      terminateProcessTree(resolveJobPid(workspaceRoot, job) ?? Number.NaN);
-    } catch {
-      // Ignore teardown failures during session shutdown.
-    }
-  }
 
-  saveState(workspaceRoot, {
-    ...state,
-    jobs: state.jobs.filter((job) => job.sessionId !== sessionId || job.background)
+    saveState(workspaceRoot, {
+      ...state,
+      jobs: state.jobs.filter((job) => job.sessionId !== sessionId || job.background)
+    });
   });
 }
 

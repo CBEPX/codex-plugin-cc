@@ -75,6 +75,22 @@ export function processCommandLine(pid, options = {}) {
   return result.stdout.trim() || null;
 }
 
+// True when the PID is running, false when it is provably gone (ESRCH), null
+// when the question does not apply (no PID) — EPERM means it exists but belongs
+// to someone else. Known limitation: a zombie reads as alive, and a recycled PID
+// reads as the process that inherited it.
+export function isPidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return null;
+  }
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "ESRCH" ? false : true;
+  }
+}
+
 export function terminateProcessTree(pid, options = {}) {
   if (!Number.isFinite(pid)) {
     return { attempted: false, delivered: false, method: null };

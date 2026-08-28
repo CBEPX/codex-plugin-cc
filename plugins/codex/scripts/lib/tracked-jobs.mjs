@@ -1,6 +1,8 @@
 import fs from "node:fs";
 import process from "node:process";
 
+import { isPidAlive } from "./process.mjs";
+
 import {
   readJobFile,
   removeJobPidFile,
@@ -9,6 +11,7 @@ import {
   resolveJobLogFile,
   resolveJobPid,
   upsertJob,
+  withStateLock,
   writeJobFile
 } from "./state.mjs";
 
@@ -230,20 +233,15 @@ export async function runTrackedJob(job, runner, options = {}) {
   }
 }
 
-function isPidAlive(pid) {
-  if (!Number.isInteger(pid) || pid <= 0) {
-    return null;
-  }
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    // ESRCH: no such process. EPERM: exists but not ours — treat as alive.
-    return error?.code === "ESRCH" ? false : true;
-  }
+// Reconciles a job the caller believes is dead. Everything here — the job file
+// it trusts, the index entry it rewrites, the artifacts it deletes — has to move
+// as one step, or a concurrent writer's prune can delete the files this just
+// wrote (or resurrect the ones it deleted).
+function markJobDead(workspaceRoot, jobSummary, errorMessage) {
+  return withStateLock(workspaceRoot, () => markJobDeadLocked(workspaceRoot, jobSummary, errorMessage));
 }
 
-function markJobDead(workspaceRoot, jobSummary, errorMessage) {
+function markJobDeadLocked(workspaceRoot, jobSummary, errorMessage) {
   const jobFile = resolveJobFile(workspaceRoot, jobSummary.id);
   const stored = fs.existsSync(jobFile) ? readJobFile(jobFile) : null;
   const base = stored ?? jobSummary;
