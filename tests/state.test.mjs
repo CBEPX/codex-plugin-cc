@@ -505,3 +505,91 @@ test("a blocker that cannot be removed still ends at the deadline", { timeout: 1
   assert.ok(Date.now() - started < 5000, `the wait must end at its own deadline, took ${Date.now() - started} ms`);
   assert.deepEqual(fs.readdirSync(lockDir), [path.basename(stuck)], "the waiter must take its own entries back out");
 });
+
+// `statSync` failing is not "the entry is infinitely old". When the entry's own
+// content cannot be read either, a swallowed stat error left the age comparison
+// with NaN, which read as "abandoned" — so the waiter unlinked a live holder's
+// ticket and walked into the critical section behind it.
+function withStatFailure(targetPath, error, run) {
+  const real = fs.statSync;
+  fs.statSync = (candidate, ...rest) => {
+    if (String(candidate) === targetPath) {
+      throw Object.assign(new Error(`${error}: injected, stat '${candidate}'`), { code: error });
+    }
+    return real.call(fs, candidate, ...rest);
+  };
+  try {
+    return run();
+  } finally {
+    fs.statSync = real;
+  }
+}
+
+test("a stat failure on a foreign entry fails the acquisition instead of evicting it", () => {
+  const workspace = makeTempDir();
+  saveState(workspace, { jobs: [] });
+  const lockDir = lockDirFor(workspace);
+  // Present but unreadable, so the decision falls to the entry's age.
+  const foreign = path.join(lockDir, `1.${process.pid}-live.ticket`);
+  fs.writeFileSync(foreign, "{ not json", "utf8");
+
+  let ran = false;
+  assert.throws(
+    () =>
+      withStatFailure(foreign, "EIO", () =>
+        withStateLock(workspace, () => {
+          ran = true;
+        }, { waitMs: 200 })
+      ),
+    /EIO/
+  );
+
+  assert.equal(ran, false, "the callback must not run when an entry cannot be judged");
+  assert.equal(fs.existsSync(foreign), true, "a foreign entry must not be evicted on a stat failure");
+  assert.deepEqual(fs.readdirSync(lockDir), [path.basename(foreign)], "the waiter must take its own entries back out");
+});
+
+// The one stat error that is an answer: the entry was released between the listing
+// and the look, so it is simply not in the queue any more. Modelled truthfully —
+// the file really is removed as the waiter reaches for it.
+test("an entry that vanishes between listing and stat is not a blocker", () => {
+  const workspace = makeTempDir();
+  saveState(workspace, { jobs: [] });
+  const lockDir = lockDirFor(workspace);
+  const foreign = path.join(lockDir, `1.${process.pid}-live.ticket`);
+  fs.writeFileSync(foreign, "{ not json", "utf8");
+
+  const realStat = fs.statSync;
+  fs.statSync = (candidate, ...rest) => {
+    if (String(candidate) === foreign) {
+      fs.rmSync(foreign, { force: true });
+    }
+    return realStat.call(fs, candidate, ...rest);
+  };
+
+  let ran = false;
+  try {
+    withStateLock(workspace, () => {
+      ran = true;
+    }, { waitMs: 1000 });
+  } finally {
+    fs.statSync = realStat;
+  }
+
+  assert.equal(ran, true, "a vanished entry must not hold up the queue");
+  assert.deepEqual(fs.readdirSync(lockDir), [], "the lock must be released and nothing left behind");
+});
+
+// A budget of zero is not a reason to fail an acquisition nobody is contending:
+// the wait is a bound on queueing, not on trying. It still must not queue.
+test("a zero budget takes a free lock but does not queue", () => {
+  const workspace = makeTempDir();
+  saveState(workspace, { jobs: [] });
+
+  assert.equal(withStateLock(workspace, () => "ok", { waitMs: 0 }), "ok");
+
+  const lockDir = lockDirFor(workspace);
+  const held = seedLockEntry(lockDir, `1.${process.pid}-live.ticket`, process.pid);
+  assert.throws(() => withStateLock(workspace, () => "queued", { waitMs: 0 }), /state lock/i);
+  assert.equal(fs.existsSync(held), true, "the live holder keeps its ticket");
+});

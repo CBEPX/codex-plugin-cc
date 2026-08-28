@@ -209,11 +209,38 @@ function sleepSync(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
-function statMtimeMs(target) {
+// Three answers about a foreign entry, and every other outcome is an error worth
+// failing on. `GONE` — it left the queue between the listing and the look, so it
+// blocks nobody and there is nothing to unlink. `HELD` — someone is using it.
+// `ABANDONED` — its owner is provably gone, or nothing can be learned from it and
+// it is old enough to be debris.
+const LOCK_ENTRY_GONE = "gone";
+const LOCK_ENTRY_HELD = "held";
+const LOCK_ENTRY_ABANDONED = "abandoned";
+
+// Only the entry having disappeared is an answer. Every other stat failure —
+// EACCES, EIO, ELOOP — says nothing about the owner, and guessing there is how a
+// live holder's ticket gets unlinked: swallowing the error left the age comparison
+// with NaN, which reads as infinitely old.
+function statLockEntry(entryPath) {
   try {
-    return fs.statSync(target).mtimeMs;
-  } catch {
-    return Number.NaN;
+    return fs.statSync(entryPath);
+  } catch (error) {
+    if (error.code === "ENOENT") {
+      return null;
+    }
+    throw error;
+  }
+}
+
+// Unreadable is not the same as absent: a foreign entry this process may not read
+// (another user's 0600 file, a half-written one) still holds its place until its
+// age says otherwise, so a read failure other than ENOENT is not propagated.
+function readLockEntryOwner(entryPath) {
+  try {
+    return { present: true, owner: JSON.parse(fs.readFileSync(entryPath, "utf8")) };
+  } catch (error) {
+    return error.code === "ENOENT" ? { present: false, owner: null } : { present: true, owner: null };
   }
 }
 
@@ -224,30 +251,45 @@ function statMtimeMs(target) {
 // to check after a long one. (A PID that exists but belongs to another user reads
 // as alive, which is the safe answer.) A stuck live owner is the operator's call —
 // the timeout error names it.
-function isLockEntryAbandoned(entryPath) {
-  const owner = readJsonOrNull(entryPath);
-  if (!owner) {
-    return !(Date.now() - statMtimeMs(entryPath) <= LOCK_ORPHAN_MS);
+function judgeLockEntry(entryPath) {
+  const { present, owner } = readLockEntryOwner(entryPath);
+  if (!present) {
+    return LOCK_ENTRY_GONE;
   }
 
-  const alive = isPidAlive(owner.pid);
-  if (alive === true) {
-    return false;
-  }
-  if (alive === false) {
-    return true;
+  if (owner) {
+    const alive = isPidAlive(owner.pid);
+    if (alive === true) {
+      return LOCK_ENTRY_HELD;
+    }
+    if (alive === false) {
+      return LOCK_ENTRY_ABANDONED;
+    }
   }
 
-  const startedAt = Date.parse(owner.startedAt ?? "");
-  const since = Number.isFinite(startedAt) ? startedAt : statMtimeMs(entryPath);
-  return Number.isFinite(since) ? Date.now() - since > LOCK_STALE_MS : true;
+  // Age is the only signal left, and it has to be a real one — a timestamp we
+  // could not read must never decide that somebody else's entry is stale.
+  const stats = statLockEntry(entryPath);
+  if (!stats) {
+    return LOCK_ENTRY_GONE;
+  }
+  const startedAt = owner ? Date.parse(owner.startedAt ?? "") : Number.NaN;
+  const since = Number.isFinite(startedAt) ? startedAt : stats.mtimeMs;
+  if (!Number.isFinite(since)) {
+    throw new Error(`Cannot judge the Codex state lock entry ${entryPath}: it has no usable timestamp.`);
+  }
+  // An entry that says nothing about its owner gets the short grace; one that
+  // named a PID nothing can check gets the long one.
+  const grace = owner ? LOCK_STALE_MS : LOCK_ORPHAN_MS;
+  return Date.now() - since > grace ? LOCK_ENTRY_ABANDONED : LOCK_ENTRY_HELD;
 }
 
 // A queue that cannot be read is not an empty queue: answering a listing failure
 // with "nobody is ahead of me" would put two processes in the critical section.
 // Every error propagates and fails the acquisition. The one exception is a missing
-// directory on the first read — possible only before this acquisition has anything
-// of its own in it — which is created and read once more.
+// directory on the numbering read: something removed the whole directory — and our
+// own choosing file with it — from underneath us, so it is recreated and read once
+// more rather than failing a command over someone else's `rm -rf`.
 function readLockEntries(lockDir, { createMissing = false } = {}) {
   const choosing = [];
   const tickets = [];
@@ -308,12 +350,25 @@ function ticketIsBefore(left, right) {
 }
 
 function lockTimeoutError(lockDir, blockers, waitMs) {
+  // The remembered blockers are from the last scan, and some may have been cleared
+  // since — including by this waiter. Name one that is still there, or say plainly
+  // that there is nothing left to name.
+  let visible = blockers;
+  try {
+    const names = new Set(fs.readdirSync(lockDir));
+    visible = blockers.filter((entry) => names.has(entry.name));
+  } catch {
+    // Re-listing failed (quite possibly the reason we are here): fall back to what
+    // the last scan saw.
+  }
   const lowest =
-    blockers
+    visible
       .filter((entry) => entry.number !== undefined)
-      .sort((left, right) => (ticketIsBefore(left, right) ? -1 : 1))[0] ?? blockers[0];
+      .sort((left, right) => (ticketIsBefore(left, right) ? -1 : 1))[0] ?? visible[0];
   if (!lowest) {
-    return new Error(`Timed out after ${waitMs} ms waiting for the Codex state lock (${lockDir}).`);
+    return new Error(
+      `Timed out after ${waitMs} ms waiting for the Codex state lock (${lockDir}); no blocker visible now.`
+    );
   }
   // The blocker may be a ticket or a client still choosing its number.
   const entryPath = path.join(lockDir, lowest.name);
@@ -365,13 +420,16 @@ function acquireTicket(lockDir, waitMs) {
 function waitForTurn(lockDir, ticket, waitMs) {
   const deadline = Date.now() + waitMs;
   let blockers = [];
+  let scanned = false;
   for (;;) {
-    // First statement in the loop, so no path can skip the bound: an entry that is
-    // judged abandoned but cannot actually be unlinked (a permission problem on a
-    // foreign entry) would otherwise be re-judged and re-unlinked forever.
-    if (Date.now() >= deadline) {
+    // Checked before every scan but the first, so no path can skip the bound: an
+    // entry judged abandoned that cannot actually be unlinked (a permission problem
+    // on a foreign entry) would otherwise be re-judged forever. The first scan
+    // always happens, so a lock nobody else wants is taken whatever the budget was.
+    if (scanned && Date.now() >= deadline) {
       throw lockTimeoutError(lockDir, blockers, waitMs);
     }
+    scanned = true;
 
     const { choosing, tickets } = readLockEntries(lockDir);
     blockers = [
@@ -385,10 +443,15 @@ function waitForTurn(lockDir, ticket, waitMs) {
 
     let cleared = false;
     for (const blocker of blockers) {
-      if (isLockEntryAbandoned(path.join(lockDir, blocker.name))) {
-        unlinkLockEntry(lockDir, blocker.name);
-        cleared = true;
+      const verdict = judgeLockEntry(path.join(lockDir, blocker.name));
+      if (verdict === LOCK_ENTRY_HELD) {
+        continue;
       }
+      if (verdict === LOCK_ENTRY_ABANDONED) {
+        unlinkLockEntry(lockDir, blocker.name);
+      }
+      // Gone or evicted: either way the queue moved, so look again at once.
+      cleared = true;
     }
     // Clearing something is the only reason to look again immediately; it may skip
     // the poll interval and nothing else.
