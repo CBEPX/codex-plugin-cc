@@ -19,6 +19,11 @@ import { TRANSCRIPT_PATH_ENV } from "./lib/claude-session-transfer.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
 export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
+// How long a `busy` broker is given to shed a client this hook has just reaped,
+// and how often to ask. Bounded: a broker that is really in use stays busy for the
+// whole window and keeps everything it owns.
+const BROKER_BUSY_RETRY_MS = 1000;
+const BROKER_BUSY_POLL_MS = 100;
 const PLUGIN_DATA_ENV = "CLAUDE_PLUGIN_DATA";
 
 function readHookInput() {
@@ -178,13 +183,26 @@ async function handleSessionEnd(input) {
   // Only a broker that answered "not busy" (or is provably gone) may be torn
   // down. An unanswered or unreadable handshake is not evidence of an idle
   // broker, and every step below assumes there is nothing left to talk to.
+  let busyRetries = 0;
   if (brokerEndpoint) {
-    const shutdown = await sendBrokerShutdown(brokerEndpoint);
+    let shutdown = await sendBrokerShutdown(brokerEndpoint);
+    // A `busy` answer straight after this hook reaped the workspace's jobs is
+    // usually a phantom: the broker counts every connected socket, and a worker
+    // that was just killed still has one until its close event is processed. That
+    // clears in milliseconds, so ask again for a moment before believing it. A
+    // broker that is genuinely serving someone stays busy for the whole window and
+    // is left alone, exactly as before.
+    const deadline = Date.now() + BROKER_BUSY_RETRY_MS;
+    while (shutdown.busy === true && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, BROKER_BUSY_POLL_MS));
+      shutdown = await sendBrokerShutdown(brokerEndpoint);
+      busyRetries += 1;
+    }
     if (shutdown.busy !== false) {
       process.stderr.write(
         shutdown.busy === true
-          ? "[codex] Shared broker is still serving another session; leaving it running.\n"
-          : "[codex] Shared broker did not confirm it is idle; leaving it running.\n"
+          ? `[codex] Shared broker is still serving another session (busyRetries=${busyRetries}); leaving it running.\n`
+          : `[codex] Shared broker did not confirm it is idle (busyRetries=${busyRetries}); leaving it running.\n`
       );
       return;
     }
@@ -201,7 +219,7 @@ async function handleSessionEnd(input) {
   // Every branch of this hook says what it decided: when a broker outlives a
   // SessionEnd the only question worth asking is which of these four paths ran.
   process.stderr.write(
-    `[codex] Broker teardown: endpoint=${brokerEndpoint ?? "none"} pid=${pid ?? "none"} signalled=${teardown.signalled}\n`
+    `[codex] Broker teardown: endpoint=${brokerEndpoint ?? "none"} pid=${pid ?? "none"} signalled=${teardown.signalled} busyRetries=${busyRetries}\n`
   );
 
   // A replacement broker can have started — and recorded itself — while this one

@@ -7,9 +7,9 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
-import { makeTempDir } from "./helpers.mjs";
+import { makeTempDir, run } from "./helpers.mjs";
 import { createBrokerEndpoint, parseBrokerEndpoint } from "../plugins/codex/scripts/lib/broker-endpoint.mjs";
-import { waitForBrokerEndpoint } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
+import { clearBrokerSession, loadBrokerSession, saveBrokerSession, waitForBrokerEndpoint } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const BROKER_SCRIPT = path.join(ROOT, "plugins", "codex", "scripts", "app-server-broker.mjs");
@@ -51,6 +51,17 @@ function connectClient(endpoint) {
     socket.once("connect", () => resolve(socket));
     socket.once("error", reject);
   });
+}
+
+async function waitFor(predicate, timeoutMs, message) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) {
+      return;
+    }
+    await delay(25);
+  }
+  throw new Error(message);
 }
 
 function delay(ms) {
@@ -246,7 +257,7 @@ async function openClient(endpoint) {
   return client;
 }
 
-// `hasActiveWorkspaceJobs()` in the SessionEnd hook is only a snapshot: another
+// The SessionEnd hook's `activeWorkspaceJobs()` check is only a snapshot: another
 // session can enqueue a job and connect between that check and the shutdown RPC.
 // The broker is the only place that knows whether it is actually idle, so it
 // refuses a shutdown while any other client is connected — the requester's own
@@ -378,5 +389,76 @@ test("broker exits on SIGTERM even when a client never answers the FIN", async (
     if (broker.exitCode === null && broker.signalCode === null) {
       broker.kill("SIGKILL");
     }
+  }
+});
+
+function processesMatching(pattern) {
+  const found = run("pgrep", ["-f", pattern]);
+  return found.stdout.split("\n").map((line) => line.trim()).filter(Boolean);
+}
+
+// Shutting down takes time — the app-server child has to go, then the client
+// sockets. A second trigger arriving in that window (another signal, or a
+// `broker/shutdown` already in the queue) used to be answered with an immediate
+// `return`, and *its* caller then exited the process: out from under the child
+// still being killed, the sockets still being closed, and the endpoint, pid file
+// and ownership record still on disk.
+test("a second shutdown trigger does not exit before the first has cleaned up", async () => {
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const workspace = makeTempDir();
+  const sessionDir = makeTempDir("cxc-");
+  const endpoint = createBrokerEndpoint(sessionDir);
+  const endpointPath = parseBrokerEndpoint(endpoint).path;
+  const pidFile = path.join(sessionDir, "broker.pid");
+  saveBrokerSession(workspace, { endpoint, pidFile, logFile: path.join(sessionDir, "broker.log"), sessionDir, pid: null });
+
+  const broker = spawn(
+    process.execPath,
+    [BROKER_SCRIPT, "serve", "--endpoint", endpoint, "--cwd", workspace, "--pid-file", pidFile, "--idle-timeout", "60000"],
+    {
+      cwd: workspace,
+      // The app-server lingers after stdin closes and ignores SIGTERM, so closing
+      // it is slow enough for a second trigger to land mid-shutdown.
+      env: buildEnv(binDir, { FAKE_CODEX_CLOSE_DELAY_MS: "1500" }),
+      stdio: ["ignore", "pipe", "pipe"]
+    }
+  );
+
+  let halfOpen = null;
+  try {
+    assert.equal(await waitForBrokerEndpoint(endpoint, 3000), true);
+    await waitFor(() => processesMatching(binDir).length > 0, 3000, "the fake app-server never started");
+
+    halfOpen = net.createConnection({ path: endpointPath, allowHalfOpen: true });
+    await new Promise((resolve, reject) => {
+      halfOpen.once("connect", resolve);
+      halfOpen.once("error", reject);
+    });
+
+    broker.kill("SIGTERM");
+    await delay(150);
+    broker.kill("SIGTERM");
+
+    const exited = await waitForExit(broker, { timeoutMs: 10000 });
+    assert.equal(exited.code, 0, "the broker must exit cleanly, once");
+
+    assert.deepEqual(processesMatching(binDir), [], "the app-server child must be gone before the broker exits");
+    assert.equal(fs.existsSync(endpointPath), false, "the endpoint socket must be removed");
+    assert.equal(fs.existsSync(pidFile), false, "the pid file must be removed");
+    assert.equal(loadBrokerSession(workspace), null, "the ownership record must be cleared");
+  } finally {
+    halfOpen?.destroy();
+    if (broker.exitCode === null && broker.signalCode === null) {
+      broker.kill("SIGKILL");
+    }
+    for (const pid of processesMatching(binDir)) {
+      try {
+        process.kill(Number(pid), "SIGKILL");
+      } catch {
+        // Already gone.
+      }
+    }
+    clearBrokerSession(workspace);
   }
 });

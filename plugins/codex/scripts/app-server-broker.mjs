@@ -109,7 +109,11 @@ async function main() {
   let activeStreamThreadIds = null;
   const sockets = new Set();
   let idleTimer = null;
-  let shuttingDown = false;
+  // One shutdown, one exit. Both are memoized: every trigger — either signal, the
+  // `broker/shutdown` RPC, the idle timeout — joins the same teardown and the
+  // process leaves only when that teardown is done.
+  let shutdownPromise = null;
+  let exitPromise = null;
 
   function disarmIdleTimer() {
     if (idleTimer) {
@@ -129,9 +133,7 @@ async function main() {
     }
     idleTimer = setTimeout(() => {
       idleTimer = null;
-      shutdown(server)
-        .catch(() => {})
-        .finally(() => process.exit(0));
+      void shutdownAndExit(server);
     }, idleTimeoutMs);
   }
 
@@ -184,13 +186,30 @@ async function main() {
   // first await instead of after it: a client accepted in that window would be
   // served the broker-local `initialize` and then fail its first real RPC with
   // "codex app-server client is closed", which callers do not retry.
-  async function shutdown(server) {
-    if (shuttingDown) {
-      return;
+  function shutdown(server) {
+    if (!shutdownPromise) {
+      shutdownPromise = runShutdown(server);
     }
-    shuttingDown = true;
+    return shutdownPromise;
+  }
+
+  // The one place the process is allowed to leave from. A trigger that arrives
+  // while the teardown is running joins it instead of exiting out from under it —
+  // which used to orphan the app-server child and leave the endpoint, the pid file
+  // and the ownership record behind.
+  function shutdownAndExit(server) {
+    if (!exitPromise) {
+      exitPromise = shutdown(server)
+        .catch((error) => {
+          process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+        })
+        .then(() => process.exit(0));
+    }
+    return exitPromise;
+  }
+
+  async function runShutdown(server) {
     disarmIdleTimer();
-    clearOwnSessionRecord();
     const serverClosed = new Promise((resolve) => server.close(resolve));
     for (const socket of sockets) {
       socket.end();
@@ -210,6 +229,9 @@ async function main() {
     for (const socket of sockets) {
       socket.destroy();
     }
+    // Last: stop advertising this broker. Doing it first would leave the record
+    // gone while the process is still serving its own teardown.
+    clearOwnSessionRecord();
     if (listenTarget.kind === "unix" && fs.existsSync(listenTarget.path)) {
       fs.unlinkSync(listenTarget.path);
     }
@@ -221,7 +243,7 @@ async function main() {
   appClient.setNotificationHandler(routeNotification);
 
   const server = net.createServer((socket) => {
-    if (shuttingDown) {
+    if (shutdownPromise) {
       // Already accepted before the listener finished closing: reset it so the
       // client retries or reports a connection error instead of half-working.
       socket.destroy();
@@ -289,8 +311,7 @@ async function main() {
             continue;
           }
           send(socket, { id: message.id, result: {} });
-          await shutdown(server);
-          process.exit(0);
+          await shutdownAndExit(server);
         }
 
         if (message.id === undefined) {
@@ -365,14 +386,12 @@ async function main() {
     });
   });
 
-  process.on("SIGTERM", async () => {
-    await shutdown(server);
-    process.exit(0);
+  process.on("SIGTERM", () => {
+    void shutdownAndExit(server);
   });
 
-  process.on("SIGINT", async () => {
-    await shutdown(server);
-    process.exit(0);
+  process.on("SIGINT", () => {
+    void shutdownAndExit(server);
   });
 
   server.listen(listenTarget.path, () => {

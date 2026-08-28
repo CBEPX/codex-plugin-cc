@@ -162,6 +162,31 @@ function runSessionEndHook(workspace, { env = process.env, sessionId = null } = 
   });
 }
 
+// `run` is spawnSync, which blocks this process's event loop — an in-process stub
+// server could never accept the hook's connection. Anything that answers the hook
+// from within the test has to run it asynchronously.
+function runSessionEndHookAsync(workspace, { env = process.env, sessionId = null } = {}) {
+  const child = spawn("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: workspace,
+    env: sessionId ? { ...env, CODEX_COMPANION_SESSION_ID: sessionId } : env,
+    stdio: ["pipe", "pipe", "pipe"]
+  });
+  child.stdin.end(
+    JSON.stringify({ hook_event_name: "SessionEnd", cwd: workspace, ...(sessionId ? { session_id: sessionId } : {}) })
+  );
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => {
+    stdout += chunk;
+  });
+  child.stderr.on("data", (chunk) => {
+    stderr += chunk;
+  });
+  return new Promise((resolve) => child.on("exit", (status) => resolve({ status, stdout, stderr })));
+}
+
 async function waitUntil(predicate, { timeoutMs = 8000, intervalMs = 100 } = {}) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
@@ -597,10 +622,78 @@ test("session end leaves everything alone when the broker never answers", { time
   const stub = await listenStub(endpoint, (socket) => sockets.push(socket));
 
   try {
-    const cleanup = runSessionEndHook(workspace);
+    const cleanup = await runSessionEndHookAsync(workspace);
     assert.equal(cleanup.status, 0, cleanup.stderr);
     assert.equal(loadBrokerSession(workspace)?.endpoint, endpoint, "an unconfirmed broker must keep its record");
     assert.equal(fs.existsSync(pidFile), true, "an unconfirmed broker must not be torn down");
+  } finally {
+    for (const socket of sockets) {
+      socket.destroy();
+    }
+    stub.close();
+    clearBrokerSession(workspace);
+  }
+});
+
+// The broker counts every connected socket as a client, and a worker that was
+// just SIGKILLed still has one until its close event is processed. A SessionEnd
+// that reaped that very worker and then believed the resulting `busy` answer left
+// the broker running for nothing — the phantom clears milliseconds later.
+test("session end retries a busy answer that is about to clear", async () => {
+  const workspace = makeTempDir();
+  const sessionDir = makeTempDir("cxc-");
+  const endpoint = createBrokerEndpoint(sessionDir);
+  const pidFile = path.join(sessionDir, "broker.pid");
+  fs.writeFileSync(pidFile, "999999\n", "utf8");
+  saveBrokerSession(workspace, { endpoint, pidFile, logFile: path.join(sessionDir, "broker.log"), sessionDir, pid: null });
+
+  const started = Date.now();
+  const sockets = [];
+  const stub = await listenStub(endpoint, (socket) => {
+    sockets.push(socket);
+    socket.once("data", () => {
+      const stillBusy = Date.now() - started < 300;
+      socket.write(`${JSON.stringify({ id: 1, result: stillBusy ? { busy: true } : {} })}\n`);
+    });
+  });
+
+  try {
+    const cleanup = await runSessionEndHookAsync(workspace);
+    assert.equal(cleanup.status, 0, cleanup.stderr);
+    assert.equal(loadBrokerSession(workspace), null, `a busy answer that clears must not stop the teardown: ${cleanup.stderr.trim()}`);
+    assert.equal(fs.existsSync(pidFile), false, "the pid file must be removed");
+    assert.match(cleanup.stderr, /busyRetries=[1-9]/, "the decision line must report the retries");
+  } finally {
+    for (const socket of sockets) {
+      socket.destroy();
+    }
+    stub.close();
+    clearBrokerSession(workspace);
+  }
+});
+
+// The other side of the same rule: a broker that is genuinely busy stays busy, and
+// the retry window changes nothing about leaving it alone.
+test("session end still leaves a persistently busy broker alone", async () => {
+  const workspace = makeTempDir();
+  const sessionDir = makeTempDir("cxc-");
+  const endpoint = createBrokerEndpoint(sessionDir);
+  const pidFile = path.join(sessionDir, "broker.pid");
+  fs.writeFileSync(pidFile, "999999\n", "utf8");
+  saveBrokerSession(workspace, { endpoint, pidFile, logFile: path.join(sessionDir, "broker.log"), sessionDir, pid: null });
+
+  const sockets = [];
+  const stub = await listenStub(endpoint, (socket) => {
+    sockets.push(socket);
+    socket.once("data", () => socket.write(`${JSON.stringify({ id: 1, result: { busy: true } })}\n`));
+  });
+
+  try {
+    const cleanup = await runSessionEndHookAsync(workspace);
+    assert.equal(cleanup.status, 0, cleanup.stderr);
+    assert.equal(loadBrokerSession(workspace)?.endpoint, endpoint, "a busy broker keeps its record");
+    assert.equal(fs.existsSync(pidFile), true, "a busy broker keeps its pid file");
+    assert.match(cleanup.stderr, /still serving another session/);
   } finally {
     for (const socket of sockets) {
       socket.destroy();
