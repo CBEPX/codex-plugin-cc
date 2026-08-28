@@ -33,6 +33,7 @@ import {
   listJobs,
   removeJobRequestFile,
   setConfig,
+  updateJobPid,
   upsertJob,
   writeJobFile,
   writeJobRequestFile
@@ -102,9 +103,9 @@ function printUsage() {
     [
       "Usage:",
       "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
-      "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model|spark|sol|luna|terra|mini>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [--config key=value]...",
-      "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model|spark|sol|luna|terra|mini>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [--config key=value]... [focus text]",
-      "  node scripts/codex-companion.mjs task [--background|--await [--await-timeout-ms <ms>]] [--prompt-stdin] [--write] [--resume-last|--resume|--fresh] [--model <model|spark|sol|luna|terra|mini>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [--config key=value]... [prompt]",
+      "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model|spark|sol|luna|terra|mini>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [--turn-timeout-ms <ms>] [--config key=value]...",
+      "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model|spark|sol|luna|terra|mini>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [--turn-timeout-ms <ms>] [--config key=value]... [focus text]",
+      "  node scripts/codex-companion.mjs task [--background|--await [--await-timeout-ms <ms>]] [--prompt-stdin] [--write] [--resume-last|--resume|--fresh] [--model <model|spark|sol|luna|terra|mini>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [--turn-timeout-ms <ms>] [--config key=value]... [prompt]",
       "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--wait [--timeout-ms <ms>]] [--json]",
@@ -114,7 +115,10 @@ function printUsage() {
       "from stdin and tokenized here, so no shell ever sees the caller's text.",
       "`task --prompt-stdin` instead takes stdin verbatim as the prompt, so flags",
       "must be on the command line and --args-stdin cannot be combined with it.",
-      "`task --await` and `result --wait` exit 3 with a re-run hint on timeout."
+      "`task --await` and `result --wait` exit 3 with a re-run hint on timeout.",
+      "--turn-timeout-ms (or CODEX_TURN_TIMEOUT_MS) fails a single Codex turn after",
+      "that many ms — it interrupts the turn and returns a structured failed result;",
+      "unset means unbounded."
     ].join("\n")
   );
 }
@@ -519,6 +523,7 @@ async function executeReviewRun(request) {
       model: request.model,
       effort: request.effort,
       config: request.config,
+      turnTimeoutMs: request.turnTimeoutMs,
       onProgress: request.onProgress
     });
     const payload = {
@@ -549,6 +554,7 @@ async function executeReviewRun(request) {
       resolved: result.resolved,
       payload,
       rendered,
+      errorMessage: result.error?.message ?? null,
       summary: firstMeaningfulLine(result.reviewText, `${reviewName} completed.`),
       jobTitle: `Codex ${reviewName}`,
       jobClass: "review",
@@ -565,6 +571,7 @@ async function executeReviewRun(request) {
     config: request.config,
     sandbox: "read-only",
     outputSchema: readOutputSchema(REVIEW_SCHEMA),
+    turnTimeoutMs: request.turnTimeoutMs,
     onProgress: request.onProgress
   });
   const parsed = parseStructuredOutput(result.finalMessage, {
@@ -603,6 +610,7 @@ async function executeReviewRun(request) {
       targetLabel: context.target.label,
       reasoningSummary: result.reasoningSummary
     }),
+    errorMessage: result.error?.message ?? null,
     summary: parsed.parsed?.summary ?? parsed.parseError ?? firstMeaningfulLine(result.finalMessage, `${reviewName} finished.`),
     jobTitle: `Codex ${reviewName}`,
     jobClass: "review",
@@ -646,6 +654,7 @@ async function executeTaskRun(request) {
     config: request.config,
     approvalPolicy: request.write ? "on-request" : "never",
     sandbox: request.write ? "workspace-write" : "read-only",
+    turnTimeoutMs: request.turnTimeoutMs,
     onProgress: request.onProgress,
     persistThread: true,
     threadName: resumeThreadId ? null : buildPersistentTaskThreadName(request.prompt || DEFAULT_CONTINUE_PROMPT)
@@ -680,6 +689,7 @@ async function executeTaskRun(request) {
     resolved: result.resolved,
     payload,
     rendered,
+    errorMessage: failureMessage || null,
     summary: firstMeaningfulLine(rawOutput, firstMeaningfulLine(failureMessage, `${taskMetadata.title} finished.`)),
     jobTitle: taskMetadata.title,
     jobClass: "task",
@@ -759,7 +769,7 @@ function buildTaskJob(workspaceRoot, taskMetadata, write) {
   });
 }
 
-function buildTaskRequest({ cwd, model, effort, config, prompt, promptRaw, write, resumeLast, jobId }) {
+function buildTaskRequest({ cwd, model, effort, config, prompt, promptRaw, write, resumeLast, turnTimeoutMs, jobId }) {
   return {
     cwd,
     model,
@@ -769,6 +779,9 @@ function buildTaskRequest({ cwd, model, effort, config, prompt, promptRaw, write
     promptRaw,
     write,
     resumeLast,
+    // Persisted so the detached worker runs under the same budget: it is a
+    // separate process and never sees this command's flags.
+    turnTimeoutMs,
     jobId
   };
 }
@@ -879,9 +892,9 @@ function enqueueBackgroundTask(cwd, job, request) {
     ...job,
     status: "queued",
     phase: "queued",
-    // Marks the job as one SessionEnd must leave running (#355). The pid stays
-    // null: this record is written BEFORE the spawn, so `child` does not exist
-    // yet.
+    // Marks the job as one SessionEnd must leave running (#355). The pid is null
+    // here because this record is written BEFORE the spawn; `updateJobPid`
+    // patches the real one in as soon as the worker exists.
     background: true,
     pid: null,
     logFile,
@@ -908,10 +921,12 @@ function enqueueBackgroundTask(cwd, job, request) {
     throw error;
   }
 
-  // Nothing writes this record from here on: the worker owns it from the moment
-  // it starts, and `runTrackedJob` stores its own pid (the same `child.pid`) as
-  // its first act. A post-spawn patch from the parent would race the worker's
-  // own `upsertJob` and could rewind `running` back to `queued`.
+  // The record was written before the spawn, so this is the first moment the
+  // worker's pid exists. `updateJobPid` patches nothing but `pid`, and only
+  // while the job is still `queued`, so it cannot race the worker's own
+  // `running` write. Without it a `cancel` inside the queued window signals
+  // nothing and the reaper cannot tell a dead queued worker from a live one.
+  updateJobPid(job.workspaceRoot, job.id, child.pid);
 
   return {
     payload: {
@@ -927,7 +942,7 @@ function enqueueBackgroundTask(cwd, job, request) {
 
 async function handleReviewCommand(argv, config) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["base", "scope", "model", "effort", "cwd"],
+    valueOptions: ["base", "scope", "model", "effort", "cwd", "turn-timeout-ms"],
     booleanOptions: ["json", "background", "wait"],
     repeatableOptions: ["config"],
     // Only the adversarial variant takes free-form focus text; stop option
@@ -946,6 +961,7 @@ async function handleReviewCommand(argv, config) {
   const model = normalizeRequestedModel(options.model);
   const effort = normalizeReasoningEffort(options.effort);
   const configOverrides = parseConfigOverrides(options.config);
+  const turnTimeoutMs = parseTimeoutOption(options["turn-timeout-ms"], "--turn-timeout-ms");
   const focusText = positionals.join(" ").trim();
   const target = resolveReviewTarget(cwd, {
     base: options.base,
@@ -974,6 +990,7 @@ async function handleReviewCommand(argv, config) {
         config: configOverrides,
         focusText,
         reviewName: config.reviewName,
+        turnTimeoutMs,
         onProgress: progress
       }),
     { json: options.json }
@@ -989,7 +1006,7 @@ async function handleReview(argv) {
 
 async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["model", "effort", "cwd", "prompt-file", "await-timeout-ms"],
+    valueOptions: ["model", "effort", "cwd", "prompt-file", "await-timeout-ms", "turn-timeout-ms"],
     booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background", "await", "prompt-stdin"],
     repeatableOptions: ["config"],
     stopAtFirstPositional: true,
@@ -1020,6 +1037,7 @@ async function handleTask(argv) {
     throw new Error("--await-timeout-ms requires --await.");
   }
   const awaitTimeoutMs = parseTimeoutOption(options["await-timeout-ms"], "--await-timeout-ms");
+  const turnTimeoutMs = parseTimeoutOption(options["turn-timeout-ms"], "--turn-timeout-ms");
 
   const prompt = readTaskPrompt(cwd, options, positionals);
   // A `--prompt-stdin` prompt is already exactly what the caller typed; nothing
@@ -1048,6 +1066,7 @@ async function handleTask(argv) {
       promptRaw,
       write,
       resumeLast,
+      turnTimeoutMs,
       jobId: job.id
     });
     const { payload } = enqueueBackgroundTask(cwd, job, request);
@@ -1079,6 +1098,7 @@ async function handleTask(argv) {
         promptRaw,
         write,
         resumeLast,
+        turnTimeoutMs,
         jobId: job.id,
         onProgress: progress
       }),
@@ -1275,12 +1295,19 @@ async function handleCancel(argv) {
   terminateProcessTree(job.pid ?? Number.NaN);
   appendLogLine(job.logFile, "Cancelled by user.");
 
+  // A worker cancelled inside the queued window may never have consumed its
+  // private payload, and a cancelled job is terminal — the reaper will never
+  // look at it again — so the 0600 file (possibly holding `--config` secrets)
+  // has to be released here.
+  removeJobRequestFile(workspaceRoot, job.id);
+
   const completedAt = nowIso();
   const nextJob = {
     ...job,
     status: "cancelled",
     phase: "cancelled",
     pid: null,
+    requestFile: null,
     completedAt,
     errorMessage: "Cancelled by user."
   };
@@ -1295,6 +1322,7 @@ async function handleCancel(argv) {
     status: "cancelled",
     phase: "cancelled",
     pid: null,
+    requestFile: null,
     errorMessage: "Cancelled by user.",
     completedAt
   });

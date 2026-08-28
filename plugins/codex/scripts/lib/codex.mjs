@@ -609,9 +609,62 @@ function applyTurnNotification(state, message) {
   }
 }
 
+export const TURN_TIMEOUT_ENV = "CODEX_TURN_TIMEOUT_MS";
+
+// Client-side per-turn budget: `--turn-timeout-ms` > `CODEX_TURN_TIMEOUT_MS` >
+// unbounded. `TurnStartParams` has no timeout field, so this never rides on the
+// app-server RPC. Read at call time, not import time, so a value the companion
+// sets after this module was loaded still takes effect.
+export function resolveTurnTimeoutMs(value = null) {
+  const fromOption = Number(value);
+  if (Number.isFinite(fromOption) && fromOption > 0) {
+    return fromOption;
+  }
+  const fromEnv = Number(process.env[TURN_TIMEOUT_ENV]);
+  return Number.isFinite(fromEnv) && fromEnv > 0 ? fromEnv : 0;
+}
+
+// How long the interrupt may take before the turn is failed anyway: the app
+// server is already misbehaving, so this must never become a second hang.
+const TURN_INTERRUPT_GRACE_MS = 2000;
+
+// A timed-out turn is resolved as a normal failed turn — never thrown — so the
+// caller still gets its partial output, the job record still gets a result, and
+// the message reaches stdout instead of only stderr.
+async function failTurnOnTimeout(client, state, timeoutMs) {
+  if (state.completed) {
+    return;
+  }
+  state.error = { message: `turn timed out after ${timeoutMs} ms` };
+  emitProgress(state.onProgress, `Turn timed out after ${timeoutMs} ms; interrupting.`, "failed");
+
+  if (state.turnId) {
+    let graceTimer = null;
+    try {
+      await Promise.race([
+        client.request("turn/interrupt", { threadId: state.threadId, turnId: state.turnId }),
+        new Promise((resolve) => {
+          graceTimer = setTimeout(resolve, TURN_INTERRUPT_GRACE_MS);
+          graceTimer.unref?.();
+        })
+      ]);
+    } catch {
+      // The turn is being abandoned either way.
+    } finally {
+      if (graceTimer) {
+        clearTimeout(graceTimer);
+      }
+    }
+  }
+
+  completeTurn(state, { id: state.turnId ?? "timed-out-turn", status: "failed" });
+}
+
 async function captureTurn(client, threadId, startRequest, options = {}) {
   const state = createTurnCaptureState(threadId, options);
   const previousHandler = client.notificationHandler;
+  const timeoutMs = resolveTurnTimeoutMs(options.turnTimeoutMs);
+  let timeoutTimer = null;
 
   client.setNotificationHandler((message) => {
     if (!state.turnId) {
@@ -654,10 +707,20 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
 
     if (response.turn?.status && response.turn.status !== "inProgress") {
       completeTurn(state, response.turn);
+    } else if (timeoutMs > 0) {
+      // Armed only once the turn is actually running: before that there is no
+      // turnId to interrupt, and `startRequest` has its own failure paths.
+      timeoutTimer = setTimeout(() => {
+        void failTurnOnTimeout(client, state, timeoutMs);
+      }, timeoutMs);
+      timeoutTimer.unref?.();
     }
 
     return await state.completion;
   } finally {
+    if (timeoutTimer) {
+      clearTimeout(timeoutTimer);
+    }
     clearCompletionTimer(state);
     client.setNotificationHandler(previousHandler ?? null);
   }
@@ -1093,6 +1156,7 @@ export async function runAppServerReview(cwd, options = {}) {
         }),
       {
         onProgress: options.onProgress,
+        turnTimeoutMs: options.turnTimeoutMs,
         onResponse(response, state) {
           if (response.reviewThreadId) {
             state.threadIds.add(response.reviewThreadId);
@@ -1238,6 +1302,7 @@ export async function runAppServerTurn(cwd, options = {}) {
         }),
       {
         onProgress: options.onProgress,
+        turnTimeoutMs: options.turnTimeoutMs,
         onResponse() {
           if (!options.effort) {
             return;

@@ -3194,8 +3194,8 @@ test("cancelling an awaited job ends the await with exit 1 and leaves a readable
       return null;
     }
     const job = JSON.parse(fs.readFileSync(stateFile, "utf8")).jobs?.[0];
-    // Wait for the worker to own the record: cancelling a still-`queued` job has
-    // no pid to terminate, so the worker would survive and finish the turn.
+    // Wait for the worker to own the record: the turn has to be under way for
+    // the cancel to have a running turn to interrupt.
     return job && job.status === "running" && job.pid ? job.id : null;
   }, { timeoutMs: 15000 });
 
@@ -3206,4 +3206,154 @@ test("cancelling an awaited job ends the await with exit 1 and leaves a readable
   const stored = run("node", [SCRIPT, "result", jobId, "--json"], { cwd: repo, env });
   assert.equal(stored.status, 0, stored.stderr);
   assert.equal(JSON.parse(stored.stdout).job.status, "cancelled");
+});
+
+// A turn that never completes used to hang the companion until Claude Code's
+// Bash tool SIGKILLed it, leaving the job "running" and no output at all.
+test("task --turn-timeout-ms interrupts a stalled turn and fails the job with the timeout message", () => {
+  const repo = seededRepo();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  const env = buildEnv(binDir, { FAKE_CODEX_TURN_DELAY_MS: "5000" });
+
+  const started = Date.now();
+  const result = run("node", [SCRIPT, "task", "--turn-timeout-ms", "500", "--json", "stall please"], {
+    cwd: repo,
+    env
+  });
+
+  assert.equal(result.status, 1, result.stderr);
+  assert.ok(Date.now() - started < 5000, "the turn budget must fire long before the fake turn completes");
+  assert.equal(JSON.parse(result.stdout).status, 1);
+
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.ok(fakeState.lastInterrupt, "a timed-out turn must be interrupted, not abandoned");
+
+  const status = run("node", [SCRIPT, "status", "--json"], { cwd: repo, env });
+  assert.equal(status.status, 0, status.stderr);
+  const latest = JSON.parse(status.stdout).latestFinished;
+  assert.equal(latest.status, "failed");
+  assert.match(latest.errorMessage, /turn timed out after 500 ms/);
+});
+
+test("task --turn-timeout-ms survives into the detached background worker", () => {
+  const repo = seededRepo();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const env = buildEnv(binDir, { FAKE_CODEX_TURN_DELAY_MS: "5000" });
+
+  const launched = run("node", [SCRIPT, "task", "--background", "--turn-timeout-ms", "500", "--json", "stall please"], {
+    cwd: repo,
+    env
+  });
+  assert.equal(launched.status, 0, launched.stderr);
+  const { jobId } = JSON.parse(launched.stdout);
+
+  const waited = run("node", [SCRIPT, "status", jobId, "--wait", "--timeout-ms", "20000", "--json"], { cwd: repo, env });
+  assert.equal(waited.status, 0, waited.stderr);
+  const job = JSON.parse(waited.stdout).job;
+  assert.equal(job.status, "failed");
+  assert.match(job.errorMessage, /turn timed out after 500 ms/);
+});
+
+test("task without a turn budget is unbounded", () => {
+  const repo = seededRepo();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+
+  const result = run("node", [SCRIPT, "task", "--json", "take your time"], {
+    cwd: repo,
+    env: buildEnv(binDir, { FAKE_CODEX_TURN_DELAY_MS: "700" })
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(JSON.parse(result.stdout).status, 0);
+});
+
+test("CODEX_TURN_TIMEOUT_MS bounds a turn when no flag is passed", () => {
+  const repo = seededRepo();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+
+  const result = run("node", [SCRIPT, "task", "--json", "stall please"], {
+    cwd: repo,
+    env: buildEnv(binDir, { FAKE_CODEX_TURN_DELAY_MS: "5000", CODEX_TURN_TIMEOUT_MS: "500" })
+  });
+
+  assert.equal(result.status, 1, result.stderr);
+});
+
+test("task rejects a non-positive turn budget", () => {
+  const repo = seededRepo();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+
+  const result = run("node", [SCRIPT, "task", "--turn-timeout-ms", "0", "hi"], { cwd: repo, env: buildEnv(binDir) });
+
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /--turn-timeout-ms expects a positive integer/);
+});
+
+// Recording the worker pid on the queued record (so a queued job can be
+// cancelled at all) means cancel can now kill a worker *before* it consumed its
+// private one-shot payload. A cancelled job is terminal, so the reaper will
+// never look at it again — cancel has to release the file itself.
+test("cancel removes the private request payload of a job killed in the queued window", async (t) => {
+  const repo = seededRepo();
+  const stateDir = resolveStateDir(repo);
+  const jobsDir = path.join(stateDir, "jobs");
+  fs.mkdirSync(jobsDir, { recursive: true });
+
+  const secret = "sk-cancel-secret-value";
+  const requestFile = path.join(jobsDir, "task-queued.request.json");
+  fs.writeFileSync(requestFile, JSON.stringify({ prompt: "hi", config: { auth_header: secret } }), {
+    encoding: "utf8",
+    mode: 0o600
+  });
+
+  const sleeper = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+    cwd: repo,
+    detached: true,
+    stdio: "ignore"
+  });
+  sleeper.unref();
+  t.after(() => {
+    try {
+      process.kill(-sleeper.pid, "SIGKILL");
+    } catch {
+      // Already gone.
+    }
+  });
+
+  const job = {
+    id: "task-queued",
+    status: "queued",
+    phase: "queued",
+    jobClass: "task",
+    title: "Codex Task",
+    background: true,
+    pid: sleeper.pid,
+    logFile: null,
+    requestFile,
+    request: { prompt: "hi", config: { auth_header: "[redacted]" } },
+    createdAt: "2026-03-18T15:30:00.000Z",
+    updatedAt: "2026-03-18T15:30:00.000Z"
+  };
+  fs.writeFileSync(path.join(jobsDir, "task-queued.json"), `${JSON.stringify(job, null, 2)}\n`, "utf8");
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    `${JSON.stringify({ version: 1, config: { stopReviewGate: false }, jobs: [job] }, null, 2)}\n`,
+    "utf8"
+  );
+
+  const cancelled = run("node", [SCRIPT, "cancel", "task-queued", "--json"], { cwd: repo, env: process.env });
+  assert.equal(cancelled.status, 0, cancelled.stderr);
+  assert.equal(JSON.parse(cancelled.stdout).status, "cancelled");
+
+  assert.equal(fs.existsSync(requestFile), false, "the private payload must not outlive the cancelled job");
+  const stored = readPersistedJob(repo, "task-queued");
+  assert.equal(stored.status, "cancelled");
+  assert.equal(stored.requestFile, null);
+  assert.equal(fs.readFileSync(path.join(stateDir, "state.json"), "utf8").includes(secret), false);
 });

@@ -1,7 +1,14 @@
 import fs from "node:fs";
 import process from "node:process";
 
-import { readJobFile, resolveJobFile, resolveJobLogFile, upsertJob, writeJobFile } from "./state.mjs";
+import {
+  readJobFile,
+  removeJobRequestFile,
+  resolveJobFile,
+  resolveJobLogFile,
+  upsertJob,
+  writeJobFile
+} from "./state.mjs";
 
 export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
 
@@ -164,9 +171,13 @@ export async function runTrackedJob(job, runner, options = {}) {
     const execution = await runner();
     const completionStatus = execution.exitStatus === 0 ? "completed" : "failed";
     const completedAt = nowIso();
+    // A run that fails without throwing (a timed-out or interrupted turn) still
+    // has to say why: `status`/`result` read the reason off the record.
+    const errorMessage = completionStatus === "failed" ? execution.errorMessage ?? null : null;
     writeJobFile(job.workspaceRoot, job.id, {
       ...runningRecord,
       status: completionStatus,
+      errorMessage,
       threadId: execution.threadId ?? null,
       turnId: execution.turnId ?? null,
       resolved: execution.resolved ?? null,
@@ -179,6 +190,7 @@ export async function runTrackedJob(job, runner, options = {}) {
     upsertJob(job.workspaceRoot, {
       id: job.id,
       status: completionStatus,
+      errorMessage,
       threadId: execution.threadId ?? null,
       turnId: execution.turnId ?? null,
       resolved: execution.resolved ?? null,
@@ -236,12 +248,18 @@ function markJobDead(workspaceRoot, jobSummary, errorMessage) {
     return base;
   }
   const completedAt = nowIso();
+  // Nothing will ever read the private payload now, so it must not stay on disk
+  // (0600, possibly holding `--config` secrets) until the job is pruned. Only
+  // its path is cleared on the record: the values themselves are never lifted
+  // into the record or the state index, which `status`/`result` echo back.
+  removeJobRequestFile(workspaceRoot, jobSummary.id);
   const record = {
     ...base,
     status: "failed",
     phase: "failed",
     errorMessage,
     pid: null,
+    requestFile: null,
     completedAt,
     // Keep updatedAt current so the reaped job sorts newest-first in the same
     // read that recorded it — otherwise a stale updatedAt can page it out of
@@ -254,6 +272,7 @@ function markJobDead(workspaceRoot, jobSummary, errorMessage) {
     status: "failed",
     phase: "failed",
     pid: null,
+    requestFile: null,
     errorMessage,
     completedAt
   });
@@ -261,21 +280,37 @@ function markJobDead(workspaceRoot, jobSummary, errorMessage) {
   return record;
 }
 
+const DEAD_WORKER_MESSAGE = "worker exited before completing";
+
+// How long a queued job may sit without a recorded pid before it counts as dead.
+// `enqueueBackgroundTask` patches the pid in immediately after the spawn, so the
+// window is milliseconds wide in practice; the grace period only has to outlast
+// a heavily loaded machine.
+const QUEUED_WITHOUT_PID_GRACE_MS = 30000;
+
+// A worker killed between the spawn and `updateJobPid` leaves a queued record
+// with no pid at all. `isPidAlive(null)` cannot tell that apart from a record
+// that was written microseconds ago, so age decides it.
+function isQueuedWithoutWorker(job) {
+  if (job.status !== "queued" || job.pid != null) {
+    return false;
+  }
+  const createdAt = Date.parse(job.createdAt ?? "");
+  return Number.isFinite(createdAt) && Date.now() - createdAt > QUEUED_WITHOUT_PID_GRACE_MS;
+}
+
 // A worker that dies without throwing (SIGKILL, OOM, native crash) never
-// reaches runTrackedJob's catch, so its job stays "running" forever. Rewrite
-// any active job whose recorded pid is no longer alive as failed.
+// reaches runTrackedJob's catch, so its job stays "running" — or, if it died
+// before taking the record over, "queued" — forever. Rewrite any active job
+// whose worker is gone as failed. Known limitation (upstream too): `kill(pid, 0)`
+// reads a zombie as alive and cannot see a recycled pid.
 export function reapDeadJobs(workspaceRoot, jobs) {
   return jobs.map((job) => {
     if (job.status !== "running" && job.status !== "queued") {
       return job;
     }
-    if (isPidAlive(job.pid) === false) {
-      return markJobDead(
-        workspaceRoot,
-        job,
-        `worker process (pid ${job.pid}) died without recording a result — ` +
-          `likely a crash; resume with task --resume-last`
-      );
+    if (isPidAlive(job.pid) === false || isQueuedWithoutWorker(job)) {
+      return markJobDead(workspaceRoot, job, DEAD_WORKER_MESSAGE);
     }
     return job;
   });

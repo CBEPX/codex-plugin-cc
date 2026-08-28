@@ -147,6 +147,26 @@ export function upsertJob(cwd, jobPatch) {
   });
 }
 
+// The queued record is written before the worker is spawned, so its pid can only
+// be filled in afterwards — and the worker owns the record from its first line
+// (`runTrackedJob` writes `running` with the same pid). A load-mutate-save of the
+// whole record would race that and could rewind `running` back to `queued`, so
+// this patches `pid` alone and gives up as soon as the worker has taken over.
+export function updateJobPid(cwd, jobId, pid) {
+  const jobFile = resolveJobFile(cwd, jobId);
+  if (!fs.existsSync(jobFile)) {
+    return null;
+  }
+  const stored = readJobFile(jobFile);
+  if (stored.status !== "queued") {
+    return stored;
+  }
+  const patched = { ...stored, pid };
+  writeJobFile(cwd, jobId, patched);
+  upsertJob(cwd, { id: jobId, pid });
+  return patched;
+}
+
 export function listJobs(cwd) {
   return loadState(cwd).jobs;
 }

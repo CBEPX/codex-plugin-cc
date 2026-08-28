@@ -145,6 +145,15 @@ async function handleSessionEnd(input) {
   // calls. If any background jobs are still active in this workspace, leave
   // the broker running — a later SessionEnd (or the workers themselves) will
   // tear it down when nothing depends on it anymore.
+  //
+  // The broker is per-workspace, not per-session, so the check deliberately
+  // spans every session's background jobs: tearing it down here would break
+  // another session's still-running worker.
+  //
+  // What keeps this bounded is the broker's own idle self-terminate (#457):
+  // once the last worker disconnects it exits and clears its own record. With
+  // `CODEX_COMPANION_BROKER_IDLE_TIMEOUT_MS=0` that safety net is off, and a
+  // broker kept alive here for a background job never exits on its own.
   if (hasActiveBackgroundJobs(cwd)) {
     return;
   }
@@ -161,7 +170,14 @@ async function handleSessionEnd(input) {
     pid,
     killProcess: terminateProcessTree
   });
-  clearBrokerSession(cwd);
+
+  // A replacement broker can have started — and recorded itself — while this one
+  // was shutting down. Clearing unconditionally would delete the live broker's
+  // ownership record, which is exactly what the broker's own endpoint-guarded
+  // `clearOwnSessionRecord` avoids on its side.
+  if (loadBrokerSession(cwd)?.endpoint === brokerEndpoint) {
+    clearBrokerSession(cwd);
+  }
 }
 
 async function main() {
