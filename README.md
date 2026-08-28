@@ -339,12 +339,15 @@ Yes. If you already use Codex, the plugin picks up the same [configuration](#com
 
 ### A command failed with "Timed out … waiting for the Codex state lock"
 
-Every write to this workspace's job state is serialized by a lock directory, and a
-crashed holder is reclaimed automatically. A holder that is still *running* is
-never evicted — a slow writer and a stuck one look the same from outside, and
-taking the lock from a process that is mid-write is how state gets corrupted — so
-the error names the PID holding it. If that process really is stuck, stop it; the
-next command reclaims the lock on its own.
+Every write to this workspace's job state is serialized by a ticket lock: each
+command takes a numbered ticket in `state.lock.d/` and waits for the tickets ahead
+of it. A ticket whose process is gone is cleared automatically, so a crash never
+wedges the workspace. A ticket whose process is still *running* is never taken
+away — a slow writer and a stuck one look the same from outside, and taking the
+lock from a process that is mid-write is how state gets corrupted — so the error
+names that PID and the exact ticket file. If that process really is stuck, stop it
+and the next command goes through; if the PID belongs to something unrelated (PID
+reuse), delete the ticket file the error names.
 
 ### Can I keep using my current API key or base URL setup?
 
