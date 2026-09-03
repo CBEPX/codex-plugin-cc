@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Let `/codex:review`, `/codex:adversarial-review`, `/codex:rescue`, and `/codex:setup` run Grok as the guest via `--guest grok` or `CC_GUEST=grok`. The default guest remains Codex; Grok uses `--prompt-file` plus `--output-format json` and does not inherit Codex model aliases or the Codex app-server.
+
 ## 1.2.0 — 2026-08-28
 
 ### Merged from upstream pull requests

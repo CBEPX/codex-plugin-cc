@@ -7,6 +7,16 @@ import process from "node:process";
 import { fileURLToPath } from "node:url";
 
 import { parseArgs, splitRawArgumentString } from "./lib/args.mjs";
+import { resolveGuest } from "./lib/guest.mjs";
+import {
+  GROK_READ_ONLY_TOOLS,
+  getGrokAvailability,
+  getGrokAuthStatus,
+  resolveGrokEffort,
+  resolveGrokModel,
+  runGrokReview,
+  runGrokTurn,
+} from "./lib/grok-cli.mjs";
 import {
     buildPersistentTaskThreadName,
     DEFAULT_CONTINUE_PROMPT,
@@ -106,10 +116,10 @@ function printUsage() {
   console.log(
     [
       "Usage:",
-      "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
-      "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model|spark|sol|luna|terra|mini>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [--turn-timeout-ms <ms>] [--config key=value]...",
-      "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model|spark|sol|luna|terra|mini>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [--turn-timeout-ms <ms>] [--config key=value]... [focus text]",
-      "  node scripts/codex-companion.mjs task [--background|--await [--await-timeout-ms <ms>]] [--prompt-stdin] [--write] [--resume-last|--resume|--fresh] [--model <model|spark|sol|luna|terra|mini>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [--turn-timeout-ms <ms>] [--config key=value]... [prompt]",
+      "  node scripts/codex-companion.mjs setup [--guest <codex|grok>] [--enable-review-gate|--disable-review-gate] [--json]",
+      "  node scripts/codex-companion.mjs review [--wait|--background] [--guest <codex|grok>] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model|spark|sol|luna|terra|mini>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [--turn-timeout-ms <ms>] [--config key=value]...",
+      "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--guest <codex|grok>] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model|spark|sol|luna|terra|mini>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [--turn-timeout-ms <ms>] [--config key=value]... [focus text]",
+      "  node scripts/codex-companion.mjs task [--background|--await [--await-timeout-ms <ms>]] [--prompt-stdin] [--write] [--resume-last|--resume|--fresh] [--guest <codex|grok>] [--model <model|spark|sol|luna|terra|mini>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [--turn-timeout-ms <ms>] [--config key=value]... [prompt]",
       "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--wait [--timeout-ms <ms>]] [--json]",
@@ -246,6 +256,18 @@ function maybePrintCommandHelp(options) {
   return true;
 }
 
+function resolveCommandGuest(options = {}) {
+  return resolveGuest(options.guest);
+}
+
+function guestActorLabel(guest) {
+  return guest === "grok" ? "Grok" : "Codex";
+}
+
+function grokExitStatus(result) {
+  return result?.status === "completed" ? 0 : 1;
+}
+
 function resolveCommandCwd(options = {}) {
   return options.cwd ? path.resolve(process.cwd(), options.cwd) : process.cwd();
 }
@@ -277,32 +299,51 @@ function firstMeaningfulLine(text, fallback) {
   return line ?? fallback;
 }
 
-async function buildSetupReport(cwd, actionsTaken = []) {
+async function buildSetupReport(cwd, actionsTaken = [], options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
+  const guest = options.guest ?? "codex";
   const nodeStatus = binaryAvailable("node", ["--version"], { cwd });
   const npmStatus = binaryAvailable("npm", ["--version"], { cwd });
   const codexStatus = getCodexAvailability(cwd);
   const authStatus = await getCodexAuthStatus(cwd);
+  const grokStatus = getGrokAvailability(cwd);
+  const grokAuthStatus = getGrokAuthStatus(cwd);
   const config = getConfig(workspaceRoot);
+  const guestReady =
+    guest === "grok"
+      ? grokStatus.available && grokAuthStatus.loggedIn
+      : codexStatus.available && authStatus.loggedIn;
 
   const nextSteps = [];
-  if (!codexStatus.available) {
-    nextSteps.push("Install Codex with `npm install -g @openai/codex`.");
-  }
-  if (codexStatus.available && !authStatus.loggedIn && authStatus.requiresOpenaiAuth) {
-    nextSteps.push("Run `!codex login`.");
-    nextSteps.push("If browser login is blocked, retry with `!codex login --device-auth` or `!codex login --with-api-key`.");
+  if (guest === "grok") {
+    if (!grokStatus.available) {
+      nextSteps.push("Install Grok CLI.");
+    }
+    if (grokStatus.available && !grokAuthStatus.loggedIn) {
+      nextSteps.push("Run `grok login`.");
+    }
+  } else {
+    if (!codexStatus.available) {
+      nextSteps.push("Install Codex with `npm install -g @openai/codex`.");
+    }
+    if (codexStatus.available && !authStatus.loggedIn && authStatus.requiresOpenaiAuth) {
+      nextSteps.push("Run `!codex login`.");
+      nextSteps.push("If browser login is blocked, retry with `!codex login --device-auth` or `!codex login --with-api-key`.");
+    }
   }
   if (!config.stopReviewGate) {
     nextSteps.push("Optional: run `/codex:setup --enable-review-gate` to require a fresh review before stop.");
   }
 
   return {
-    ready: nodeStatus.available && codexStatus.available && authStatus.loggedIn,
+    ready: nodeStatus.available && guestReady,
+    guest,
     node: nodeStatus,
     npm: npmStatus,
     codex: codexStatus,
     auth: authStatus,
+    grok: grokStatus,
+    grokAuth: grokAuthStatus,
     sessionRuntime: getSessionRuntimeStatus(process.env, workspaceRoot),
     reviewGateEnabled: Boolean(config.stopReviewGate),
     actionsTaken,
@@ -312,12 +353,13 @@ async function buildSetupReport(cwd, actionsTaken = []) {
 
 async function handleSetup(argv) {
   const { options } = parseCommandInput(argv, {
-    valueOptions: ["cwd"],
+    valueOptions: ["cwd", "guest"],
     booleanOptions: ["json", "enable-review-gate", "disable-review-gate"]
   });
   if (maybePrintCommandHelp(options)) {
     return;
   }
+  const guest = resolveCommandGuest(options);
 
   if (options["enable-review-gate"] && options["disable-review-gate"]) {
     throw new Error("Choose either --enable-review-gate or --disable-review-gate.");
@@ -335,7 +377,7 @@ async function handleSetup(argv) {
     actionsTaken.push(`Disabled the stop-time review gate for ${workspaceRoot}.`);
   }
 
-  const finalReport = await buildSetupReport(cwd, actionsTaken);
+  const finalReport = await buildSetupReport(cwd, actionsTaken, { guest });
   outputResult(options.json ? finalReport : renderSetupReport(finalReport), options.json);
 }
 
@@ -355,6 +397,38 @@ function ensureCodexAvailable(cwd) {
   if (!availability.available) {
     throw new Error("Codex CLI is not installed or is missing required runtime support. Install it with `npm install -g @openai/codex`, then rerun `/codex:setup`.");
   }
+}
+
+function ensureGrokReady(cwd) {
+  const availability = getGrokAvailability(cwd);
+  if (!availability.available) {
+    throw new Error("Grok CLI is not installed or is missing required runtime support. Install it, then rerun `/codex:setup --guest grok`.");
+  }
+  const authStatus = getGrokAuthStatus(cwd);
+  if (!authStatus.loggedIn) {
+    throw new Error("Grok CLI is not authenticated. Run `grok login` and retry.");
+  }
+}
+
+function ensureGuestReady(guest, cwd) {
+  if (guest === "grok") {
+    ensureGrokReady(cwd);
+    return;
+  }
+  ensureCodexAvailable(cwd);
+}
+
+function buildGrokReviewPrompt(context, reviewName, focusText) {
+  if (reviewName === "Adversarial Review") {
+    return buildAdversarialReviewPrompt(context, focusText);
+  }
+  return [
+    "Review the following code changes. Provide a structured assessment.",
+    "You are running in read-only mode. Do not attempt to write, edit, or create any files.",
+    `Target: ${context.target.label}`,
+    "",
+    context.content,
+  ].join("\n");
 }
 
 function buildNativeReviewTarget(target) {
@@ -510,7 +584,67 @@ async function resolveLatestTrackedTaskThread(cwd, options = {}) {
   return findLatestTaskThread(workspaceRoot);
 }
 
+async function executeGrokReviewRun(request) {
+  ensureGrokReady(request.cwd);
+  ensureGitRepository(request.cwd);
+
+  const target = resolveReviewTarget(request.cwd, {
+    base: request.base,
+    scope: request.scope
+  });
+  const focusText = request.focusText?.trim() ?? "";
+  const reviewName = request.reviewName ?? "Review";
+  const actor = guestActorLabel("grok");
+  if (reviewName === "Review") {
+    validateNativeReviewRequest(target, focusText);
+  }
+  const context = collectReviewContext(request.cwd, target);
+  const prompt = buildGrokReviewPrompt(context, reviewName, focusText);
+  const result = await runGrokReview(request.cwd, prompt, {
+    model: request.model,
+    effort: request.effort,
+    onProgress: request.onProgress,
+  });
+  const stdout = typeof result.result === "string" ? result.result : "";
+  const payload = {
+    review: reviewName,
+    target,
+    threadId: result.sessionId,
+    guest: "grok",
+    sourceThreadId: null,
+    grok: {
+      status: result.status,
+      stderr: result.stderr,
+      stdout,
+    }
+  };
+  const rendered = [
+    `# ${actor} ${reviewName}`,
+    "",
+    `Target: ${target.label}`,
+    "",
+    stdout,
+    ""
+  ].join("\n");
+  return {
+    exitStatus: grokExitStatus(result),
+    threadId: result.sessionId,
+    turnId: null,
+    resolved: result.status === "completed",
+    payload,
+    rendered,
+    errorMessage: result.status === "completed" ? null : (result.stderr || "Grok review failed."),
+    summary: firstMeaningfulLine(stdout, `${reviewName} completed.`),
+    jobTitle: `${actor} ${reviewName}`,
+    jobClass: "review",
+    targetLabel: target.label
+  };
+}
+
 async function executeReviewRun(request) {
+  if ((request.guest ?? "codex") === "grok") {
+    return executeGrokReviewRun(request);
+  }
   ensureCodexAvailable(request.cwd);
   ensureGitRepository(request.cwd);
 
@@ -623,7 +757,80 @@ async function executeReviewRun(request) {
 }
 
 
+async function executeGrokTaskRun(request) {
+  const workspaceRoot = resolveWorkspaceRoot(request.cwd);
+  ensureGrokReady(request.cwd);
+
+  const taskMetadata = buildTaskRunMetadata({
+    prompt: request.prompt,
+    resumeLast: request.resumeLast,
+    guest: "grok",
+  });
+
+  const grokOptions = {
+    model: request.model ?? undefined,
+    effort: request.effort ?? undefined,
+    onProgress: request.onProgress,
+  };
+  if (!request.write) {
+    grokOptions.tools = GROK_READ_ONLY_TOOLS;
+  }
+  if (request.resumeLast) {
+    const latestThread = await resolveLatestTrackedTaskThread(workspaceRoot, {
+      excludeJobId: request.jobId
+    });
+    if (!latestThread) {
+      throw new Error("No previous Grok task thread was found for this repository.");
+    }
+    grokOptions.resumeSessionId = latestThread.id;
+  }
+  if (!request.prompt && !grokOptions.resumeSessionId) {
+    throw new Error("Provide a prompt, a prompt file, piped stdin, or use --resume-last.");
+  }
+
+  const prompt = request.prompt || "Continue where you left off.";
+  const result = await runGrokTurn(workspaceRoot, prompt, grokOptions);
+  const rawOutput = typeof result.finalMessage === "string" ? result.finalMessage : "";
+  const failureMessage = result.stderr ?? "";
+  const rendered = renderTaskResult(
+    {
+      rawOutput,
+      failureMessage,
+      reasoningSummary: []
+    },
+    {
+      title: taskMetadata.title,
+      jobId: request.jobId ?? null,
+      write: Boolean(request.write)
+    }
+  );
+  const payload = {
+    status: result.status,
+    threadId: result.sessionId,
+    guest: "grok",
+    rawOutput,
+    touchedFiles: Array.isArray(result.touchedFiles) ? result.touchedFiles : []
+  };
+
+  return {
+    exitStatus: grokExitStatus(result),
+    threadId: result.sessionId,
+    turnId: null,
+    resolved: result.status === "completed",
+    payload,
+    rendered,
+    errorMessage: result.status === "completed" ? null : (failureMessage || "Grok task failed."),
+    summary: firstMeaningfulLine(rawOutput, firstMeaningfulLine(failureMessage, `${taskMetadata.title} finished.`)),
+    jobTitle: taskMetadata.title,
+    jobClass: "task",
+    write: Boolean(request.write)
+  };
+}
+
 async function executeTaskRun(request) {
+  if ((request.guest ?? "codex") === "grok") {
+    return executeGrokTaskRun(request);
+  }
   const workspaceRoot = resolveWorkspaceRoot(request.cwd);
   ensureCodexAvailable(request.cwd);
 
@@ -701,23 +908,27 @@ async function executeTaskRun(request) {
   };
 }
 
-function buildReviewJobMetadata(reviewName, target) {
+function buildReviewJobMetadata(reviewName, target, guest = "codex") {
+  const actor = guestActorLabel(guest);
   return {
     kind: reviewName === "Adversarial Review" ? "adversarial-review" : "review",
-    title: reviewName === "Review" ? "Codex Review" : `Codex ${reviewName}`,
+    title: reviewName === "Review" ? `${actor} Review` : `${actor} ${reviewName}`,
     summary: `${reviewName} ${target.label}`
   };
 }
 
-function buildTaskRunMetadata({ prompt, resumeLast = false }) {
+function buildTaskRunMetadata({ prompt, resumeLast = false, guest = "codex" }) {
+  const actor = guestActorLabel(guest);
   if (!resumeLast && String(prompt ?? "").includes(STOP_REVIEW_TASK_MARKER)) {
     return {
-      title: "Codex Stop Gate Review",
-      summary: "Stop-gate review of previous Claude turn"
+      title: `${actor} Stop Gate Review`,
+      summary: guest === "grok"
+        ? "Stop-gate review of previous Grok turn"
+        : "Stop-gate review of previous Claude turn"
     };
   }
 
-  const title = resumeLast ? "Codex Resume" : "Codex Task";
+  const title = resumeLast ? `${actor} Resume` : `${actor} Task`;
   const fallbackSummary = resumeLast ? DEFAULT_CONTINUE_PROMPT : "Task";
   return {
     title,
@@ -776,7 +987,7 @@ function buildTaskJob(workspaceRoot, taskMetadata, write) {
   });
 }
 
-function buildTaskRequest({ cwd, model, effort, config, prompt, promptRaw, write, resumeLast, turnTimeoutMs, jobId }) {
+function buildTaskRequest({ cwd, model, effort, config, prompt, promptRaw, write, resumeLast, turnTimeoutMs, jobId, guest }) {
   return {
     cwd,
     model,
@@ -789,7 +1000,8 @@ function buildTaskRequest({ cwd, model, effort, config, prompt, promptRaw, write
     // Persisted so the detached worker runs under the same budget: it is a
     // separate process and never sees this command's flags.
     turnTimeoutMs,
-    jobId
+    jobId,
+    guest: guest ?? "codex"
   };
 }
 
@@ -934,7 +1146,7 @@ function enqueueBackgroundTask(cwd, job, request) {
 
 async function handleReviewCommand(argv, config) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["base", "scope", "model", "effort", "cwd", "turn-timeout-ms"],
+    valueOptions: ["base", "scope", "model", "effort", "cwd", "turn-timeout-ms", "guest"],
     booleanOptions: ["json", "background", "wait"],
     repeatableOptions: ["config"],
     // Only the adversarial variant takes free-form focus text; stop option
@@ -948,10 +1160,15 @@ async function handleReviewCommand(argv, config) {
     return;
   }
 
+  const guest = resolveCommandGuest(options);
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
-  const model = normalizeRequestedModel(options.model);
-  const effort = normalizeReasoningEffort(options.effort);
+  const model = guest === "grok"
+    ? resolveGrokModel(options.model)
+    : normalizeRequestedModel(options.model);
+  const effort = guest === "grok"
+    ? resolveGrokEffort(options.effort)
+    : normalizeReasoningEffort(options.effort);
   const configOverrides = parseConfigOverrides(options.config);
   const turnTimeoutMs = parseTimeoutOption(options["turn-timeout-ms"], "--turn-timeout-ms");
   const focusText = positionals.join(" ").trim();
@@ -961,7 +1178,7 @@ async function handleReviewCommand(argv, config) {
   });
 
   config.validateRequest?.(target, focusText);
-  const metadata = buildReviewJobMetadata(config.reviewName, target);
+  const metadata = buildReviewJobMetadata(config.reviewName, target, guest);
   const job = createCompanionJob({
     prefix: "review",
     kind: metadata.kind,
@@ -986,7 +1203,8 @@ async function handleReviewCommand(argv, config) {
         focusText,
         reviewName: config.reviewName,
         turnTimeoutMs,
-        onProgress: progress
+        onProgress: progress,
+        guest
       }),
     { json: options.json }
   );
@@ -1001,7 +1219,7 @@ async function handleReview(argv) {
 
 async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["model", "effort", "cwd", "prompt-file", "await-timeout-ms", "turn-timeout-ms"],
+    valueOptions: ["model", "effort", "cwd", "prompt-file", "await-timeout-ms", "turn-timeout-ms", "guest"],
     booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background", "await", "prompt-stdin"],
     repeatableOptions: ["config"],
     stopAtFirstPositional: true,
@@ -1013,10 +1231,15 @@ async function handleTask(argv) {
     return;
   }
 
+  const guest = resolveCommandGuest(options);
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
-  const model = normalizeRequestedModel(options.model);
-  const effort = normalizeReasoningEffort(options.effort);
+  const model = guest === "grok"
+    ? resolveGrokModel(options.model)
+    : normalizeRequestedModel(options.model);
+  const effort = guest === "grok"
+    ? resolveGrokEffort(options.effort)
+    : normalizeReasoningEffort(options.effort);
   const configOverrides = parseConfigOverrides(options.config);
   // Every flag conflict is decided before the prompt is read: `--prompt-stdin`
   // blocks on an open stdin, so a usage error must never wait for EOF.
@@ -1041,14 +1264,15 @@ async function handleTask(argv) {
   const write = Boolean(options.write);
   const taskMetadata = buildTaskRunMetadata({
     prompt,
-    resumeLast
+    resumeLast,
+    guest,
   });
 
   // `--await` runs the same detached worker as `--background` — same job
   // record, so status/result/cancel work on it — and only differs in waiting for
   // it here instead of returning the queued line.
   if (options.background || options.await) {
-    ensureCodexAvailable(cwd);
+    ensureGuestReady(guest, cwd);
     requireTaskRequest(prompt, resumeLast);
 
     const job = buildTaskJob(workspaceRoot, taskMetadata, write);
@@ -1062,7 +1286,8 @@ async function handleTask(argv) {
       write,
       resumeLast,
       turnTimeoutMs,
-      jobId: job.id
+      jobId: job.id,
+      guest,
     });
     const { payload } = enqueueBackgroundTask(cwd, job, request);
     if (!options.await) {
@@ -1095,7 +1320,8 @@ async function handleTask(argv) {
         resumeLast,
         turnTimeoutMs,
         jobId: job.id,
-        onProgress: progress
+        onProgress: progress,
+        guest
       }),
     { json: options.json }
   );
