@@ -1,6 +1,6 @@
 ---
 description: Run a Codex code review against local git state
-argument-hint: '[--wait|--background] [--base <ref>] [--scope auto|working-tree|branch] [--model <model|spark|sol|luna|terra|mini>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [--turn-timeout-ms <ms>] [--config key=value]'
+argument-hint: '[--wait|--background] [--guest <codex|grok>] [--base <ref>] [--scope auto|working-tree|branch] [--model <model|spark|sol|luna|terra|mini>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [--turn-timeout-ms <ms>] [--config key=value]'
 disable-model-invocation: true
 allowed-tools: Read, Glob, Grep, Bash(node:*), Bash(git:*), AskUserQuestion
 ---
@@ -32,7 +32,8 @@ Execution mode rules:
   - `Run in background`
 
 Argument handling:
-- Preserve the user's arguments exactly.
+- Preserve the user's arguments exactly, including `--guest <codex|grok>` (default guest is codex).
+- Do not add `--guest grok` unless the user asked for Grok.
 - Do not strip `--wait` or `--background` yourself.
 - Do not add extra review instructions or rewrite the user's intent.
 - The companion script parses `--wait` and `--background`, but Claude Code's `Bash(..., run_in_background: true)` is what actually detaches the run.

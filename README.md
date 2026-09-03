@@ -90,12 +90,15 @@ Use it when you want:
 
 Use `--base <ref>` for branch review. It also supports `--wait` and `--background`. It is not steerable and does not take custom focus text. Use [`/codex:adversarial-review`](#codexadversarial-review) when you want to challenge a specific decision or risk area.
 
+`--guest` selects the runtime. The default is `codex`. Pass `--guest grok` (or set `CC_GUEST=grok`) to run Grok headless instead of Codex app-server. Grok does not inherit Codex model aliases such as `spark`; omit `--model` to use Grok's default, or pass a Grok model ID.
+
 Examples:
 
 ```bash
 /codex:review
 /codex:review --base main
 /codex:review --background
+/codex:review --guest grok
 ```
 
 This command is read-only and will not perform any changes. When run in the background you can use [`/codex:status`](#codexstatus) to check on the progress and [`/codex:cancel`](#codexcancel) to cancel the ongoing task.

@@ -1,6 +1,6 @@
 ---
 description: Check whether the local Codex CLI is ready and optionally toggle the stop-time review gate
-argument-hint: '[--enable-review-gate|--disable-review-gate]'
+argument-hint: '[--guest <codex|grok>] [--enable-review-gate|--disable-review-gate]'
 allowed-tools: Bash(node:*), Bash(npm:*), AskUserQuestion
 ---
 

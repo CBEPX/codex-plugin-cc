@@ -185,6 +185,12 @@ export function renderSetupReport(report) {
     `- npm: ${report.npm.detail}`,
     `- codex: ${report.codex.detail}`,
     `- auth: ${report.auth.detail}`,
+    ...(report.guest === "grok" && report.grok && report.grokAuth
+      ? [
+          `- grok: ${report.grok.detail}`,
+          `- grok auth: ${report.grokAuth.detail}`,
+        ]
+      : []),
     `- session runtime: ${report.sessionRuntime.label}`,
     `- review gate: ${report.reviewGateEnabled ? "enabled" : "disabled"}`,
     ""
