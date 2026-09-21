@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.2.1 — 2026-09-21
+
+### Fork changes
+- Align rescue guidance with the current Codex model family and generic `codex-prompting` skill name.
+- Keep diagnosis and investigation read-only unless the user explicitly requested file changes.
+
 ## 1.2.0 — 2026-08-28
 
 ### Merged from upstream pull requests
