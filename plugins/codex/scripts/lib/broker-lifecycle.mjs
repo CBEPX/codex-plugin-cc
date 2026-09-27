@@ -266,21 +266,22 @@ export async function ensureBrokerSession(cwd, options = {}) {
     logFile,
     env: options.env ?? process.env
   });
-  // Captured before the readiness wait, so even the teardown of a broker that
-  // never came up signals only the process it spawned.
-  const pidIdentity = getProcessIdentity(child.pid ?? Number.NaN);
+  // Recorded for later teardowns, which only trust a stored pid by identity.
+  const pidIdentity = (options.getProcessIdentityImpl ?? getProcessIdentity)(child.pid ?? Number.NaN);
 
   const ready = await waitForBrokerEndpoint(endpoint, options.timeoutMs ?? 2000);
   if (!ready) {
-    teardownBrokerSession({
-      endpoint,
-      pidFile,
-      logFile,
-      sessionDir,
-      pid: child.pid ?? null,
-      pidIdentity,
-      killProcess
-    });
+    // The pid comes from the child handle just spawned, not from a stored
+    // record: it cannot have been recycled, so it is killed without the identity
+    // check (which cannot answer on win32 at all).
+    if (Number.isInteger(child.pid)) {
+      try {
+        killProcess(child.pid);
+      } catch {
+        // Already exited.
+      }
+    }
+    teardownBrokerSession({ endpoint, pidFile, logFile, sessionDir });
     return null;
   }
 

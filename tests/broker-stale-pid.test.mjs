@@ -1100,3 +1100,26 @@ test("SessionEnd leaves a recorded broker pid alone when its identity no longer 
   assert.match(hook.stderr, /identity-mismatch/);
   clearBrokerSession(workspace);
 });
+
+// A broker this call just spawned that never becomes ready is killed through the
+// child handle: its pid cannot have been recycled, so no identity is consulted.
+test("ensureBrokerSession kills a fresh broker that never becomes ready", async () => {
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const workspace = makeTempDir();
+  const scriptPath = path.join(makeTempDir(), "never-listens.mjs");
+  fs.writeFileSync(scriptPath, "setInterval(() => {}, 1000);\n");
+  const killed = [];
+  const session = await ensureBrokerSession(workspace, { env: buildEnv(binDir), scriptPath, timeoutMs: 300, killProcess: recordingKill(killed),
+    // An identity that cannot be read (win32) must not keep the child alive.
+    getProcessIdentityImpl: () => null
+  });
+  assert.equal(session, null);
+  assert.equal(killed.length, 1, "the fresh child must be signalled");
+  assert.equal(loadBrokerSession(workspace), null);
+  const deadline = Date.now() + 5000;
+  while (isAlive(killed[0]) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.equal(isAlive(killed[0]), false, "the fresh child must be gone");
+});
