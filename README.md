@@ -375,3 +375,7 @@ goes through.
 Yes. Because the plugin uses your local Codex CLI, your existing sign-in method and config still apply.
 
 If you need to point the built-in OpenAI provider at a different endpoint, set `openai_base_url` in your [Codex config](https://developers.openai.com/codex/config-advanced/#config-and-state-locations).
+
+### Windows
+
+As of v1.3.0, kills issued from stored process records (`/codex:cancel`, `SessionEnd` cleanup, stale-broker replacement, broker teardown) are refused on Windows until process identity lands in v1.4.0. This bounds any leak by the broker idle timeout, and a turn interrupt is still sent regardless — it just cannot be followed by a forced kill on that platform yet.

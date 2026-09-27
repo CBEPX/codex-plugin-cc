@@ -1,5 +1,34 @@
 # Changelog
 
+## 1.3.0 — 2026-09-27
+
+### Fixed
+- Terminal `error` notifications end the turn as failed instead of hanging (#698, PR #710); an error with `willRetry: true` keeps the turn running; a subagent's terminal error no longer fails the main turn; `errorMessage`/summary on a silently failed turn reflect the real failure instead of raw output (#757, PR #763); `fileChange` items without `changes` no longer crash progress (#775); a `turn/start` response without `turn.id` no longer strands buffered notifications (#781).
+- A broker connect that never resolves is now bounded, and a broker request falls back to a direct app-server on `ETIMEDOUT` (#773); `status <id> --wait` exits 1 and prints a timeout line on expiry (#774), in `--json` mode too.
+- A live but wedged broker is killed before it is replaced (#753, #762, #782), its readiness probe is retried for 2 s before that (#768), and a stale or dead pid recorded from an earlier session is never signalled (#749); a freshly spawned broker that never becomes ready is killed as well.
+- `/codex:transfer` honours `CLAUDE_CONFIG_DIR` when resolving Claude session transcripts (#721).
+- The fallback state root is private (0700), per-user and per-plugin, and a symlinked root is refused (#521, #609); `broker.json` is validated before use.
+- Identity-checked kills and reaping on posix (#743): job records and the pid sidecar carry `pidIdentity` (a JSON `{pid, identity}` sidecar; the legacy bare integer is still read), and `broker.json` carries `pidIdentity` too; `cancel` reports `worker pid N left running: <reason>` when it refuses to signal a pid it cannot verify.
+
+### Added
+- `setup --review-gate-model <model|inherit> --review-gate-effort <effort|inherit>` pins the stop-time review gate's model/effort independently of your Codex config (#769).
+- The stop gate's block reason names the signal that killed the review task and always ends with the `/codex:setup --disable-review-gate` escape hatch (#589, #483).
+- Model aliases resolve against the local Codex catalogue (`$CODEX_HOME/models_cache.json`, then `codex debug models --bundled`, hardcoded fallback last); adds the `astra` alias; `--effort` is validated per resolved model (#468, #703, #485).
+- `CODEX_COMPANION_MODEL_CATALOG` overrides the catalogue source for tests.
+
+### Changed
+- `CODEX_REVIEW_GATE_MAX_ROUNDS` now defaults to 3 (was unbounded); set it to `0` explicitly to keep the pre-1.3.0 unbounded behavior (#548).
+- `hooks.json` no longer carries a top-level `description` key (#459).
+- `runCommand` reports `status: null`, not `0`, for a subprocess that timed out.
+
+### Known limitations
+- On Windows, kills issued from stored process records (cancel worker, `SessionEnd` cleanup, stale-broker replacement, broker teardown) are refused until process identity lands in v1.4.0; leaks are bounded by the broker idle timeout, and the turn interrupt is still sent regardless.
+- Foreground job records written by v1.2.x (no `pidIdentity`) are not killed at `SessionEnd` after upgrading to v1.3.0 (one-off).
+- The fallback state root under `os.tmpdir()` is keyed by plugin install path, so it is not carried over from a v1.2.x install.
+- Darwin identity checks use `ps lstart`, which has 1 s resolution.
+
+Ported with reference to upstream PRs by ALV0612, Soumya95, kevin9327, mzl9039, sylvesterkaczmarek, mittalpk, SomSamantray, weivwang.
+
 ## 1.2.1 — 2026-09-21
 
 ### Fork changes
