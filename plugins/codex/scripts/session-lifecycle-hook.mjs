@@ -3,7 +3,7 @@
 import fs from "node:fs";
 import process from "node:process";
 
-import { terminateProcessTree, terminateRecordedProcess, workerCommandLine } from "./lib/process.mjs";
+import { isPidAlive, terminateProcessTree, terminateRecordedProcess, workerCommandLine } from "./lib/process.mjs";
 import { BROKER_ENDPOINT_ENV } from "./lib/app-server.mjs";
 import {
   clearBrokerSession,
@@ -124,6 +124,10 @@ function cleanupSessionJobs(cwd, sessionId, lockWaitMs, remainingMs) {
       return;
     }
 
+    // A record is only dropped once its worker is stopped or provably gone; one
+    // this hook refused to signal, failed to signal or never reached stays, so
+    // the worker is not orphaned and `activeWorkspaceJobs` still sees it.
+    const kept = new Set();
     for (const job of sessionJobs) {
       // Background jobs are explicitly dispatched to outlive the session that
       // started them. Leave them running and leave their state entry intact so
@@ -136,22 +140,33 @@ function cleanupSessionJobs(cwd, sessionId, lockWaitMs, remainingMs) {
         continue;
       }
       // Only a pid still provably this job's process is signalled (#743), and
-      // proving it costs a probe the budget has to cover.
-      const probeMs = Math.min(IDENTITY_PROBE_MS, remainingMs());
-      if (probeMs < MIN_STEP_MS) {
-        continue;
+      // proving it costs up to two probes (a worker that leads no process group
+      // is re-proved before its own pid is signalled) the budget has to cover.
+      const probeMs = Math.min(IDENTITY_PROBE_MS, remainingMs() / 2);
+      let reason = "budget-exhausted";
+      if (probeMs >= MIN_STEP_MS) {
+        let pid;
+        try {
+          const recorded = resolveJobPid(workspaceRoot, job);
+          pid = recorded.pid;
+          const outcome = terminateRecordedProcess(pid, { identity: recorded.identity, commandLineMatch: workerCommandLine(job.id), timeoutMs: probeMs });
+          reason = outcome.reason === "no-pid" || (outcome.attempted && outcome.delivered) ? null : outcome.attempted ? "not-delivered" : outcome.reason;
+        } catch {
+          reason = "kill-failed";
+        }
+        if (reason && isPidAlive(pid) === false) {
+          reason = null;
+        }
       }
-      try {
-        const { pid, identity } = resolveJobPid(workspaceRoot, job);
-        terminateRecordedProcess(pid, { identity, commandLineMatch: workerCommandLine(job.id), timeoutMs: probeMs });
-      } catch {
-        // Ignore teardown failures during session shutdown.
+      if (reason) {
+        kept.add(job.id);
+        process.stderr.write(`[codex] SessionEnd left ${job.id} running: ${reason}\n`);
       }
     }
 
     saveState(workspaceRoot, {
       ...state,
-      jobs: state.jobs.filter((job) => job.sessionId !== sessionId || job.background)
+      jobs: state.jobs.filter((job) => job.sessionId !== sessionId || job.background || kept.has(job.id))
     });
   }, { waitMs: lockWaitMs });
 }
@@ -295,7 +310,8 @@ async function handleSessionEnd(input) {
     pid,
     pidIdentity,
     killProcess: terminateProcessTree,
-    timeoutMs: stepBudget(IDENTITY_PROBE_MS)
+    // Halved: a broker gone from its group is re-proved with a second probe.
+    timeoutMs: stepBudget(IDENTITY_PROBE_MS) / 2
   });
   // Every branch of this hook says what it decided: when a broker outlives a
   // SessionEnd the only question worth asking is which of these four paths ran.

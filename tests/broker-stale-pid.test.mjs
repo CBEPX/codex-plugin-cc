@@ -1192,3 +1192,92 @@ test("ensureBrokerSession re-verifies a legacy broker's ownership after the read
     clearBrokerSession(workspace);
   }
 });
+
+// SessionEnd may only drop a foreground job's record once its worker is stopped
+// (or provably gone). A kill it refused or never reached leaves the worker
+// running, and dropping the record would orphan it along with its files.
+function spawnWorkerStandIn(t, commandLineTail) {
+  const worker = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)", ...commandLineTail], { detached: true, stdio: "ignore" });
+  worker.unref();
+  t.after(() => {
+    try {
+      process.kill(worker.pid, "SIGKILL");
+    } catch {
+      // Already gone.
+    }
+  });
+  return worker;
+}
+
+function seedForegroundJobs(workspace, jobs) {
+  const stateDir = resolveStateDir(workspace);
+  const jobsDir = path.join(stateDir, "jobs");
+  fs.mkdirSync(jobsDir, { recursive: true });
+  for (const job of jobs) {
+    fs.writeFileSync(path.join(jobsDir, `${job.id}.request.json`), "{}\n");
+    fs.writeFileSync(path.join(jobsDir, `${job.id}.pid`), `${JSON.stringify({ pid: job.pid, identity: job.pidIdentity ?? null })}\n`);
+  }
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    `${JSON.stringify({
+      version: 1,
+      config: { stopReviewGate: false },
+      jobs: jobs.map((job) => ({
+        status: "running",
+        phase: "running",
+        title: "Codex Task",
+        jobClass: "task",
+        sessionId: "sess-current",
+        logFile: null,
+        createdAt: "2026-09-27T10:00:00.000Z",
+        updatedAt: "2026-09-27T10:01:00.000Z",
+        ...job
+      }))
+    }, null, 2)}\n`
+  );
+  return { stateDir, jobsDir };
+}
+
+test("session end keeps the record of a foreground worker it refused to signal", { skip: process.platform === "win32" }, async (t) => {
+  const workspace = makeTempDir();
+  // A companion, but not this job's worker: the legacy command-line check refuses it.
+  const foreign = spawnWorkerStandIn(t, ["codex-companion.mjs", "task-worker", "--job-id", "task-someone-else"]);
+  // A stored identity that is not the live pid's.
+  const mismatched = spawnWorkerStandIn(t, ["codex-companion.mjs", "task-worker", "--job-id", "task-own-mismatch"]);
+  const { stateDir, jobsDir } = seedForegroundJobs(workspace, [
+    { id: "task-own-legacy", pid: foreign.pid },
+    { id: "task-own-mismatch", pid: mismatched.pid, pidIdentity: "darwin:definitely-not-this|nope" }
+  ]);
+
+  const hook = runSessionEndHook(workspace, { sessionId: "sess-current" });
+  assert.equal(hook.status, 0, hook.stderr);
+  assert.match(hook.stderr, /\[codex\] SessionEnd left task-own-legacy running: identity-mismatch/);
+  assert.match(hook.stderr, /\[codex\] SessionEnd left task-own-mismatch running: identity-mismatch/);
+  assert.equal(isAlive(foreign.pid), true);
+  assert.equal(isAlive(mismatched.pid), true);
+
+  const jobs = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8")).jobs;
+  assert.deepEqual(jobs.map((job) => job.id).sort(), ["task-own-legacy", "task-own-mismatch"]);
+  const legacy = jobs.find((job) => job.id === "task-own-legacy");
+  assert.equal(legacy.status, "running");
+  assert.equal(fs.existsSync(path.join(jobsDir, "task-own-legacy.request.json")), true);
+  assert.equal(fs.existsSync(path.join(jobsDir, "task-own-legacy.pid")), true);
+  // The identity mismatch is the reaper's call afterwards (the recorded worker is
+  // gone from that pid); the record itself is never silently dropped.
+  assert.ok(jobs.find((job) => job.id === "task-own-mismatch"));
+});
+
+test("session end keeps the records of foreground jobs its budget never reached", { skip: process.platform === "win32" }, async (t) => {
+  const workspace = makeTempDir();
+  // Would be signalled if reached: the command line is this job's worker.
+  const worker = spawnWorkerStandIn(t, ["codex-companion.mjs", "task-worker", "--job-id", "task-own-unreached"]);
+  const { stateDir, jobsDir } = seedForegroundJobs(workspace, [{ id: "task-own-unreached", pid: worker.pid }]);
+
+  const hook = runSessionEndHook(workspace, { sessionId: "sess-current", env: { ...process.env, CODEX_COMPANION_SESSION_END_BUDGET_MS: "1" } });
+  assert.equal(hook.status, 0, hook.stderr);
+  assert.match(hook.stderr, /\[codex\] SessionEnd left task-own-unreached running: /);
+  assert.equal(isAlive(worker.pid), true);
+  const jobs = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8")).jobs;
+  assert.deepEqual(jobs.map((job) => [job.id, job.status]), [["task-own-unreached", "running"]]);
+  assert.equal(fs.existsSync(path.join(jobsDir, "task-own-unreached.request.json")), true);
+});

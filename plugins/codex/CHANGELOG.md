@@ -11,6 +11,7 @@
 - Identity-checked kills and reaping on posix (#743): job records and the pid sidecar carry `pidIdentity` (a JSON `{pid, identity}` sidecar; the legacy bare integer is still read), and `broker.json` carries `pidIdentity` too; when `cancel` refuses to signal a still-live pid it cannot verify, it reports `cancellation not confirmed: worker pid N left running (<reason>)`, exits 1 and leaves the job `running` (turn interrupt still sent).
 - `cancel` reports `cancelled` only when its signal reached the worker (a pid that leads no process group is signalled directly); an undelivered kill of a live worker is reported as pending (`not-delivered`), and a worker that finishes after an acknowledged cancel no longer overwrites the `cancelled` record.
 - A `running` job recorded without an identity (v1.2.x) whose pid now runs an unrelated, non-companion process is reconciled as failed instead of staying `running` forever; nothing is signalled.
+- `SessionEnd` keeps the record (and its files) of a foreground job whose worker it could not stop — a refused or undelivered kill, or a job its time budget never reached — and logs `[codex] SessionEnd left <id> running: <reason>`; only a stopped, provably gone or pid-less job's record is removed.
 
 ### Added
 - `setup --review-gate-model <model|inherit> --review-gate-effort <effort|inherit>` pins the stop-time review gate's model/effort independently of your Codex config (#769).
