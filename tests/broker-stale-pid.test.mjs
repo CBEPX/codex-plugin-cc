@@ -1328,3 +1328,19 @@ test("teardownBrokerSession tolerates a pidFile, logFile, and sessionDir the bro
   const result = teardownBrokerSession({ pidFile, logFile, sessionDir });
   assert.deepEqual(result, { signalled: false, reason: "no-pid" });
 });
+
+// The pidFile/logFile unlinks are best-effort cleanup, not a contract the hook can
+// fail on: a locked file (EPERM, notably on Windows per upstream #633/#626) or any
+// other unlink failure must not escape teardown.
+test("teardownBrokerSession swallows unlink failures on pidFile and logFile as best-effort cleanup", () => {
+  const workspace = makeTempDir();
+  // pidFile's directory does not exist at all (ENOENT on the unlink).
+  const pidFile = path.join(workspace, "missing-dir", "broker.pid");
+  // logFile's parent path component is a regular file, not a directory (ENOTDIR).
+  const regularFile = path.join(workspace, "not-a-directory");
+  fs.writeFileSync(regularFile, "");
+  const logFile = path.join(regularFile, "broker.log");
+
+  const result = teardownBrokerSession({ pidFile, logFile, sessionDir: null });
+  assert.deepEqual(result, { signalled: false, reason: "no-pid" });
+});

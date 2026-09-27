@@ -354,26 +354,22 @@ export function teardownBrokerSession({ endpoint = null, pidFile, logFile, sessi
     }
   }
 
-  // A concurrently self-cleaning broker can remove any of these between the
-  // `existsSync` check and the unlink; only ENOENT from that race is swallowed,
-  // every other error (e.g. EPERM) still surfaces as it did before.
+  // Best-effort: a self-cleaning broker or a locked file must not fail the hook.
   if (pidFile) {
     try {
       fs.unlinkSync(pidFile);
-    } catch (error) {
-      if (error?.code !== "ENOENT") {
-        throw error;
-      }
+    } catch {
+      // Ignore — missing, already removed, or not removable (e.g. EPERM/ENOTDIR;
+      // upstream #633/#626 report EPERM here on Windows).
     }
   }
 
   if (logFile) {
     try {
       fs.unlinkSync(logFile);
-    } catch (error) {
-      if (error?.code !== "ENOENT") {
-        throw error;
-      }
+    } catch {
+      // Ignore — missing, already removed, or not removable (e.g. EPERM/ENOTDIR;
+      // upstream #633/#626 report EPERM here on Windows).
     }
   }
 
