@@ -5,7 +5,11 @@ import path from "node:path";
 import { ensureAbsolutePath } from "./fs.mjs";
 
 export const TRANSCRIPT_PATH_ENV = "CODEX_COMPANION_TRANSCRIPT_PATH";
-const CLAUDE_PROJECTS_DIR = path.join(os.homedir(), ".claude", "projects");
+
+export function resolveClaudeProjectsDir(env = process.env) {
+  const configDir = env.CLAUDE_CONFIG_DIR ? path.resolve(String(env.CLAUDE_CONFIG_DIR)) : path.join(os.homedir(), ".claude");
+  return path.join(configDir, "projects");
+}
 
 function resolveUserPath(cwd, value) {
   if (value === "~") {
@@ -18,7 +22,9 @@ function resolveUserPath(cwd, value) {
 }
 
 export function resolveClaudeSessionPath(cwd, options = {}) {
-  const requestedPath = options.source || process.env[TRANSCRIPT_PATH_ENV];
+  const env = options.env ?? process.env;
+  const projectsDir = resolveClaudeProjectsDir(env);
+  const requestedPath = options.source || env[TRANSCRIPT_PATH_ENV];
   if (!requestedPath) {
     throw new Error("Could not identify the current Claude transcript. Retry with --source <path-to-claude-jsonl>.");
   }
@@ -32,13 +38,13 @@ export function resolveClaudeSessionPath(cwd, options = {}) {
   let projects;
   try {
     source = fs.realpathSync(sourcePath);
-    projects = fs.realpathSync(CLAUDE_PROJECTS_DIR);
+    projects = fs.realpathSync(projectsDir);
   } catch {
     throw new Error(`Claude session file not found: ${sourcePath}`);
   }
   const relative = path.relative(projects, source);
   if (relative === "" || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
-    throw new Error(`Codex can import Claude sessions only from ${CLAUDE_PROJECTS_DIR}: ${source}`);
+    throw new Error(`Codex can import Claude sessions only from ${projectsDir}: ${source}`);
   }
   return source;
 }

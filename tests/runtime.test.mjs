@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 import { loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
+import { resolveClaudeSessionPath, resolveClaudeProjectsDir } from "../plugins/codex/scripts/lib/claude-session-transfer.mjs";
 import {
   consumeJobRequestFile,
   readJobFile,
@@ -349,6 +350,24 @@ test("transfer rejects sources outside the Claude projects directory", () => {
 
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /only from .*\.claude.*projects/);
+});
+
+test("transfer resolves transcripts under CLAUDE_CONFIG_DIR when it is set (#721)", () => {
+  const configDir = makeTempDir();
+  const projectDir = path.join(configDir, "projects", "-tmp-repo");
+  fs.mkdirSync(projectDir, { recursive: true });
+  const transcript = path.join(projectDir, "sess.jsonl");
+  fs.writeFileSync(transcript, "{}\n");
+  const env = { CLAUDE_CONFIG_DIR: configDir };
+  assert.equal(resolveClaudeProjectsDir(env), path.join(configDir, "projects"));
+  assert.equal(resolveClaudeSessionPath(process.cwd(), { source: transcript, env }), fs.realpathSync(transcript));
+
+  const otherConfigDir = makeTempDir();
+  fs.mkdirSync(path.join(otherConfigDir, "projects"), { recursive: true });
+  assert.throws(
+    () => resolveClaudeSessionPath(process.cwd(), { source: transcript, env: { CLAUDE_CONFIG_DIR: otherConfigDir } }),
+    /can import Claude sessions only from/
+  );
 });
 
 test("task reports the actual Codex auth error when the run is rejected", () => {
