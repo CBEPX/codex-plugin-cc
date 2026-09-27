@@ -7,6 +7,7 @@ import { spawn } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { makeTempDir, run } from "./helpers.mjs";
+import { getProcessIdentity } from "../plugins/codex/scripts/lib/process.mjs";
 import {
   consumeJobRequestFile,
   listJobs,
@@ -14,9 +15,11 @@ import {
   resolveJobFile,
   resolveJobLogFile,
   resolveJobRequestFile,
+  resolveFallbackStateRoot,
   resolveStateDir,
   resolveStateFile,
   saveState,
+  STATE_LOCK_TIMEOUT_CODE,
   upsertJob,
   withStateLock,
   writeJobRequestFile
@@ -299,9 +302,9 @@ function lockDirFor(workspace) {
   return lockDir;
 }
 
-function seedLockEntry(lockDir, name, pid, startedAt = new Date().toISOString()) {
+function seedLockEntry(lockDir, name, pid, startedAt = new Date().toISOString(), identity = undefined) {
   const entry = path.join(lockDir, name);
-  fs.writeFileSync(entry, `${JSON.stringify({ pid, startedAt })}\n`, "utf8");
+  fs.writeFileSync(entry, `${JSON.stringify({ pid, startedAt, identity })}\n`, "utf8");
   return entry;
 }
 
@@ -339,6 +342,67 @@ test("two processes acquiring concurrently never overlap", async () => {
   assert.equal(first.code, 0, first.stderr);
   assert.equal(second.code, 0, second.stderr);
   assert.equal(Number.parseInt(fs.readFileSync(counter, "utf8"), 10), rounds * 2, "an overlap lost increments");
+});
+
+// A live pid whose start identity no longer matches the one the holder recorded
+// is not the holder: the OS gave the number to someone else (#743).
+test("a ticket whose pid was recycled by another process is evicted at once", { skip: process.platform === "win32" }, () => {
+  const workspace = makeTempDir();
+  saveState(workspace, { jobs: [] });
+  const lockDir = lockDirFor(workspace);
+  const ticket = seedLockEntry(lockDir, `1.${process.pid}-recycled.ticket`, process.pid, undefined, "darwin:not-this-process|nope");
+
+  const started = Date.now();
+  assert.equal(withStateLock(workspace, () => "ok", { waitMs: 2000 }), "ok");
+  assert.ok(Date.now() - started < 1500, `a recycled pid must not cost a grace period, took ${Date.now() - started} ms`);
+  assert.equal(fs.existsSync(ticket), false, "the recycled holder's ticket must be cleared");
+});
+
+test("a ticket whose recorded identity still matches its live holder is kept", { skip: process.platform === "win32" }, () => {
+  const workspace = makeTempDir();
+  saveState(workspace, { jobs: [] });
+  const lockDir = lockDirFor(workspace);
+  const ticket = seedLockEntry(lockDir, `1.${process.pid}-same.ticket`, process.pid, undefined, getProcessIdentity(process.pid));
+
+  assert.throws(() => withStateLock(workspace, () => "stolen", { waitMs: 200 }), /state lock/i);
+  assert.equal(fs.existsSync(ticket), true, "a live holder's ticket must survive");
+});
+
+// Identity probes spend the acquisition budget, they do not extend it: with
+// several live blockers whose identity is slow to read, the wait still ends near
+// its deadline instead of after one probe timeout per blocker.
+test("slow identity probes stay inside the lock wait budget", { skip: process.platform === "win32" }, () => {
+  const workspace = makeTempDir();
+  saveState(workspace, { jobs: [] });
+  const lockDir = lockDirFor(workspace);
+  for (let index = 1; index <= 4; index += 1) {
+    seedLockEntry(lockDir, `${index}.${process.pid}-slow${index}.ticket`, process.pid, undefined, `darwin:blocker-${index}|x`);
+  }
+  let probes = 0;
+  const slowIdentity = (_pid, { timeoutMs } = {}) => {
+    probes += 1;
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.min(300, timeoutMs ?? 300));
+    return null; // cannot tell: the blockers stay held
+  };
+  const started = Date.now();
+  assert.throws(
+    () => withStateLock(workspace, () => "stolen", { waitMs: 400, getProcessIdentityImpl: slowIdentity }),
+    (error) => error.code === STATE_LOCK_TIMEOUT_CODE
+  );
+  const elapsed = Date.now() - started;
+  assert.ok(probes >= 1, "the injected probe must be used");
+  assert.ok(elapsed < 900, `the wait must end near its 400 ms budget, took ${elapsed} ms`);
+});
+
+test("the lock owner record carries this process's identity", { skip: process.platform === "win32" }, () => {
+  const workspace = makeTempDir();
+  saveState(workspace, { jobs: [] });
+  const lockDir = lockDirFor(workspace);
+  const owners = withStateLock(workspace, () =>
+    fs.readdirSync(lockDir).map((name) => JSON.parse(fs.readFileSync(path.join(lockDir, name), "utf8")))
+  );
+  assert.ok(owners.length > 0);
+  assert.ok(owners.every((owner) => owner.pid === process.pid && owner.identity === getProcessIdentity(process.pid)));
 });
 
 // A holder that died with its ticket in the directory releases it to the next
@@ -787,4 +851,30 @@ test("an entry with no checkable PID holds its place for the long grace", () => 
 
   assert.equal(withStateLock(aged, () => "ok", { waitMs: 500 }), "ok");
   assert.equal(fs.existsSync(agedEntry), false, "past the long grace it is debris");
+});
+
+test("fallback state root is private to the user and namespaced per plugin root (#521/#609)", { skip: process.platform === "win32" }, () => {
+  const tmp = makeTempDir();
+  const pluginA = makeTempDir();
+  const pluginB = makeTempDir();
+  const a = resolveFallbackStateRoot({ env: {}, tmpdir: tmp, pluginRoot: pluginA });
+  const b = resolveFallbackStateRoot({ env: {}, tmpdir: tmp, pluginRoot: pluginB });
+  assert.notEqual(a, b);
+  assert.ok(a.startsWith(path.join(tmp, `codex-companion-${process.getuid()}`)));
+  assert.equal(fs.statSync(path.dirname(a)).mode & 0o077, 0);
+});
+
+test("fallback state root refuses a pre-existing world-accessible directory", { skip: process.platform === "win32" }, () => {
+  const tmp = makeTempDir();
+  const shared = path.join(tmp, `codex-companion-${process.getuid()}`);
+  fs.mkdirSync(shared, { mode: 0o755 });
+  assert.throws(() => resolveFallbackStateRoot({ env: {}, tmpdir: tmp, pluginRoot: makeTempDir() }), /Refusing to use shared state directory/);
+});
+
+test("fallback state root refuses a symlinked user directory", { skip: process.platform === "win32" }, () => {
+  const tmp = makeTempDir();
+  const target = makeTempDir();
+  fs.chmodSync(target, 0o700);
+  fs.symlinkSync(target, path.join(tmp, `codex-companion-${process.getuid()}`));
+  assert.throws(() => resolveFallbackStateRoot({ env: {}, tmpdir: tmp, pluginRoot: makeTempDir() }), /Refusing to use shared state directory/);
 });

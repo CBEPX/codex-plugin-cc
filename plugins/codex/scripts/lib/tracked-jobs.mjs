@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import process from "node:process";
 
-import { isPidAlive } from "./process.mjs";
+import { getProcessIdentity, isPidAlive, processCommandLine } from "./process.mjs";
 
 import {
   readJobFile,
@@ -160,6 +160,19 @@ function readStoredJobOrNull(workspaceRoot, jobId) {
   return readJobFile(jobFile);
 }
 
+// A cancel that was acknowledged already wrote the terminal record and released
+// the artifacts; a worker that outlives it must not replace `cancelled` with its
+// own outcome. Read and write share the lock so a cancel cannot land in between.
+function writeTerminalUnlessCancelled(workspaceRoot, jobId, logFile, write) {
+  return withStateLock(workspaceRoot, () => {
+    if (readStoredJobOrNull(workspaceRoot, jobId)?.status === "cancelled") {
+      appendLogLine(logFile, "Worker finished after the job was cancelled; the cancelled record is kept.");
+      return;
+    }
+    write();
+  });
+}
+
 export async function runTrackedJob(job, runner, options = {}) {
   const runningRecord = {
     ...job,
@@ -167,6 +180,7 @@ export async function runTrackedJob(job, runner, options = {}) {
     startedAt: nowIso(),
     phase: "starting",
     pid: process.pid,
+    pidIdentity: getProcessIdentity(process.pid),
     logFile: options.logFile ?? job.logFile ?? null
   };
   writeJobFile(job.workspaceRoot, job.id, runningRecord);
@@ -179,64 +193,73 @@ export async function runTrackedJob(job, runner, options = {}) {
     // A run that fails without throwing (a timed-out or interrupted turn) still
     // has to say why: `status`/`result` read the reason off the record.
     const errorMessage = completionStatus === "failed" ? execution.errorMessage ?? null : null;
-    writeJobFile(job.workspaceRoot, job.id, {
-      ...runningRecord,
-      status: completionStatus,
-      errorMessage,
-      threadId: execution.threadId ?? null,
-      turnId: execution.turnId ?? null,
-      resolved: execution.resolved ?? null,
-      pid: null,
-      phase: completionStatus === "completed" ? "done" : "failed",
-      completedAt,
-      result: execution.payload,
-      rendered: execution.rendered
+    const logFile = options.logFile ?? job.logFile ?? null;
+    writeTerminalUnlessCancelled(job.workspaceRoot, job.id, logFile, () => {
+      writeJobFile(job.workspaceRoot, job.id, {
+        ...runningRecord,
+        status: completionStatus,
+        errorMessage,
+        threadId: execution.threadId ?? null,
+        turnId: execution.turnId ?? null,
+        resolved: execution.resolved ?? null,
+        pid: null,
+        pidIdentity: null,
+        phase: completionStatus === "completed" ? "done" : "failed",
+        completedAt,
+        result: execution.payload,
+        rendered: execution.rendered
+      });
+      upsertJob(job.workspaceRoot, {
+        id: job.id,
+        status: completionStatus,
+        errorMessage,
+        threadId: execution.threadId ?? null,
+        turnId: execution.turnId ?? null,
+        resolved: execution.resolved ?? null,
+        summary: execution.summary,
+        phase: completionStatus === "completed" ? "done" : "failed",
+        pid: null,
+        pidIdentity: null,
+        completedAt
+      });
+      removeJobPidFile(job.workspaceRoot, job.id);
+      // Nothing revisits a terminal job, so this is the last chance to release a
+      // payload the worker never consumed (a crash before the read, or one staged
+      // by the legacy-record migration).
+      removeJobRequestFile(job.workspaceRoot, job.id);
     });
-    upsertJob(job.workspaceRoot, {
-      id: job.id,
-      status: completionStatus,
-      errorMessage,
-      threadId: execution.threadId ?? null,
-      turnId: execution.turnId ?? null,
-      resolved: execution.resolved ?? null,
-      summary: execution.summary,
-      phase: completionStatus === "completed" ? "done" : "failed",
-      pid: null,
-      completedAt
-    });
-    removeJobPidFile(job.workspaceRoot, job.id);
-    // Nothing revisits a terminal job, so this is the last chance to release a
-    // payload the worker never consumed (a crash before the read, or one staged
-    // by the legacy-record migration).
-    removeJobRequestFile(job.workspaceRoot, job.id);
-    appendLogBlock(options.logFile ?? job.logFile ?? null, "Final output", execution.rendered);
+    appendLogBlock(logFile, "Final output", execution.rendered);
     return execution;
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
-    const existing = readStoredJobOrNull(job.workspaceRoot, job.id) ?? runningRecord;
-    const completedAt = nowIso();
-    writeJobFile(job.workspaceRoot, job.id, {
-      ...existing,
-      status: "failed",
-      phase: "failed",
-      errorMessage,
-      pid: null,
-      completedAt,
-      logFile: options.logFile ?? job.logFile ?? existing.logFile ?? null
+    writeTerminalUnlessCancelled(job.workspaceRoot, job.id, options.logFile ?? job.logFile ?? null, () => {
+      const existing = readStoredJobOrNull(job.workspaceRoot, job.id) ?? runningRecord;
+      const completedAt = nowIso();
+      writeJobFile(job.workspaceRoot, job.id, {
+        ...existing,
+        status: "failed",
+        phase: "failed",
+        errorMessage,
+        pid: null,
+        pidIdentity: null,
+        completedAt,
+        logFile: options.logFile ?? job.logFile ?? existing.logFile ?? null
+      });
+      upsertJob(job.workspaceRoot, {
+        id: job.id,
+        status: "failed",
+        phase: "failed",
+        pid: null,
+        pidIdentity: null,
+        errorMessage,
+        completedAt
+      });
+      removeJobPidFile(job.workspaceRoot, job.id);
+      // Nothing revisits a terminal job, so this is the last chance to release a
+      // payload the worker never consumed (a crash before the read, or one staged
+      // by the legacy-record migration).
+      removeJobRequestFile(job.workspaceRoot, job.id);
     });
-    upsertJob(job.workspaceRoot, {
-      id: job.id,
-      status: "failed",
-      phase: "failed",
-      pid: null,
-      errorMessage,
-      completedAt
-    });
-    removeJobPidFile(job.workspaceRoot, job.id);
-    // Nothing revisits a terminal job, so this is the last chance to release a
-    // payload the worker never consumed (a crash before the read, or one staged
-    // by the legacy-record migration).
-    removeJobRequestFile(job.workspaceRoot, job.id);
     throw error;
   }
 }
@@ -271,6 +294,7 @@ function markJobDeadLocked(workspaceRoot, jobSummary, errorMessage) {
       resolved: base.resolved ?? null,
       requestFile: base.requestFile ?? null,
       pid: null,
+      pidIdentity: null,
       completedAt: base.completedAt ?? null
     });
     return base;
@@ -288,6 +312,7 @@ function markJobDeadLocked(workspaceRoot, jobSummary, errorMessage) {
     phase: "failed",
     errorMessage,
     pid: null,
+    pidIdentity: null,
     requestFile: null,
     completedAt,
     // Keep updatedAt current so the reaped job sorts newest-first in the same
@@ -301,6 +326,7 @@ function markJobDeadLocked(workspaceRoot, jobSummary, errorMessage) {
     status: "failed",
     phase: "failed",
     pid: null,
+    pidIdentity: null,
     requestFile: null,
     errorMessage,
     completedAt
@@ -342,16 +368,23 @@ function isQueuedWithoutWorker(job, pid) {
 // liveness is only consulted for jobs whose own file still says they are active.
 // Below this there is no point starting another lock wait.
 const REAP_MIN_STEP_MS = 100;
+const IDENTITY_PROBE_MS = 2000;
 
 /**
- * @param {{ lockWaitMs?: number, remainingMs?: () => number }} [options] Bounds the
+ * @param {{ lockWaitMs?: number, remainingMs?: () => number, getProcessIdentityImpl?: typeof getProcessIdentity, processCommandLineImpl?: typeof processCommandLine, platform?: string }} [options] Bounds the
  * reaper's own state-lock waits. Each dead job costs one acquisition, so a caller
  * working to a deadline passes `remainingMs` and every wait is clamped to what is
  * left of it; once that is spent the remaining jobs are left for the next run
  * rather than reaped past the caller's budget.
  */
 export function reapDeadJobs(workspaceRoot, jobs, options = {}) {
-  const { lockWaitMs, remainingMs } = options;
+  const {
+    lockWaitMs,
+    remainingMs,
+    getProcessIdentityImpl = getProcessIdentity,
+    processCommandLineImpl = processCommandLine,
+    platform = process.platform
+  } = options;
   const waitFor = () => {
     if (!remainingMs) {
       return lockWaitMs;
@@ -378,9 +411,34 @@ export function reapDeadJobs(workspaceRoot, jobs, options = {}) {
     }
     // The queued record carries no pid of its own — the parent records it in an
     // atomic sidecar instead of rewriting the worker's job file.
-    const pid = resolveJobPid(workspaceRoot, job);
+    const { pid, identity } = resolveJobPid(workspaceRoot, job);
     if (isPidAlive(pid) === false || isQueuedWithoutWorker(job, pid)) {
       return markJobDead(workspaceRoot, job, DEAD_WORKER_MESSAGE, waitFor());
+    }
+    // Alive is not enough: the pid may now belong to another process (#743).
+    // A probe that fails or times out proves nothing, so the job is left alone.
+    if (pid && identity) {
+      let actual = null;
+      try {
+        actual = getProcessIdentityImpl(pid, { timeoutMs: remainingMs ? Math.min(IDENTITY_PROBE_MS, remainingMs()) : IDENTITY_PROBE_MS });
+      } catch {
+        actual = null;
+      }
+      if (actual && actual !== identity) {
+        return markJobDead(workspaceRoot, job, `${DEAD_WORKER_MESSAGE} (pid reused: ${pid} now belongs to another process)`, waitFor());
+      }
+    } else if (pid && platform !== "win32") {
+      // A legacy record has no identity; a readable command line that is plainly
+      // not a companion is proof enough to stop waiting on it. Nothing is signalled.
+      let commandLine = null;
+      try {
+        commandLine = processCommandLineImpl(pid, { timeoutMs: remainingMs ? Math.min(IDENTITY_PROBE_MS, remainingMs()) : IDENTITY_PROBE_MS });
+      } catch {
+        commandLine = null;
+      }
+      if (typeof commandLine === "string" && commandLine && !commandLine.includes("codex-companion.mjs")) {
+        return markJobDead(workspaceRoot, job, `${DEAD_WORKER_MESSAGE} (worker pid ${pid} now belongs to an unrelated process)`, waitFor());
+      }
     }
     return job;
   });

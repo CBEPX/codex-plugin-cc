@@ -24,8 +24,7 @@ Execution rules:
 - That prompt drafting is the only Claude-side work allowed. Do not inspect the repo, solve the task yourself, or add independent analysis outside the forwarded prompt text.
 - Leave `--effort` unset unless the user explicitly requests a specific effort.
 - Leave model unset by default. Add `--model` only when the user explicitly asks for one.
-- Map `spark` to `--model gpt-5.3-codex-spark`.
-- Map `sol` to `--model gpt-5.6-sol`, `luna` to `--model gpt-5.6-luna`, `terra` to `--model gpt-5.6-terra`, `mini` to `--model gpt-5.4-mini`.
+- Pass the aliases `spark`, `astra`, `sol`, `luna`, `terra` and `mini` through as `--model <alias>` unchanged: the companion resolves each against the local Codex model catalogue (primary sort by `priority`, newest family on ties), so do not map it yourself. Pass a concrete slug through as-is.
 - Never add `--write` unless the user explicitly asked Codex to modify files.
 
 Command selection:
@@ -34,7 +33,7 @@ Command selection:
 - The detached worker outlives the companion only when the companion returns on its own (exit 3); a host process-tree kill — e.g. Claude Code's Bash timeout — also kills the worker, so keep `--await-timeout-ms` below the host limit (default 540000 < 600000).
 - There is no shell state between calls — the retry is the literal `Re-run:` hint text printed by the previous call, not a `$JOB` shell variable. If the retry itself is cut off by the Bash tool's own 10-minute timeout, re-issue the same literal id again; the job keeps running server-side.
 - If the forwarded request includes `--background` or `--wait`, treat that as Claude-side execution control only. Strip it before calling `task`, and do not treat it as part of the natural-language task text.
-- If the forwarded request includes `--model`, normalize `spark` to `gpt-5.3-codex-spark` and pass it through to `task`.
+- If the forwarded request includes `--model`, pass it through to `task` unchanged; aliases resolve in the companion.
 - If the forwarded request includes `--effort`, pass it through to `task`.
 - If the forwarded request includes `--config key=value`, pass every occurrence through to `task` unchanged.
 - If the forwarded request includes `--turn-timeout-ms <ms>`, pass it through to `task` unchanged; it bounds a single Codex turn (also settable via `CODEX_TURN_TIMEOUT_MS`) and is carried into the background worker with the job, so it applies whether the request resolves synchronously or through the exit-3 retry.

@@ -8,7 +8,10 @@ for (const name of [
   "CODEX_COMPANION_APP_SERVER_ENDPOINT",
   "CODEX_COMPANION_APP_SERVER_PID_FILE",
   "CODEX_COMPANION_APP_SERVER_LOG_FILE",
-  "CODEX_PLUGIN_CC_ARGS"
+  "CODEX_PLUGIN_CC_ARGS",
+  "CLAUDE_CONFIG_DIR"
 ]) {
   delete process.env[name];
 }
+// Never read the host's real Codex model catalogue from tests.
+process.env.CODEX_COMPANION_MODEL_CATALOG = new URL("./fixtures/models-catalog.json", import.meta.url).pathname;

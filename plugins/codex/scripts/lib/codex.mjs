@@ -15,6 +15,7 @@
  *   threadTurnIds: Map<string, string>,
  *   threadLabels: Map<string, string>,
  *   turnId: string | null,
+ *   started: boolean,
  *   bufferedNotifications: AppServerNotification[],
  *   completion: Promise<TurnCaptureState>,
  *   resolveCompletion: (state: TurnCaptureState) => void,
@@ -299,8 +300,10 @@ function describeStartedItem(state, item) {
         message: `Running command: ${shorten(item.command, 96)}`,
         phase: looksLikeVerificationCommand(item.command) ? "verifying" : "running"
       };
-    case "fileChange":
-      return { message: `Applying ${item.changes.length} file change(s).`, phase: "editing" };
+    case "fileChange": {
+      const count = Array.isArray(item.changes) ? item.changes.length : 0;
+      return { message: `Applying ${count} file change(s).`, phase: "editing" };
+    }
     case "mcpToolCall":
       return { message: `Calling ${item.server}/${item.tool}.`, phase: "investigating" };
     case "dynamicToolCall":
@@ -369,6 +372,7 @@ function createTurnCaptureState(threadId, options = {}) {
     threadTurnIds: new Map(),
     threadLabels: new Map(),
     turnId: null,
+    started: false,
     bufferedNotifications: [],
     completion,
     resolveCompletion,
@@ -559,6 +563,11 @@ function applyTurnNotification(state, message) {
     case "turn/started":
       registerThread(state, message.params.threadId);
       state.threadTurnIds.set(message.params.threadId, message.params.turn.id);
+      // A turn/start response without an id (#781) leaves this the only place
+      // the main turn is named; the timeout path needs it to interrupt.
+      if ((message.params.threadId ?? null) === state.threadId && !state.turnId) {
+        state.turnId = message.params.turn.id ?? null;
+      }
       if ((message.params.threadId ?? null) !== state.threadId) {
         state.activeSubagentTurns.add(message.params.threadId);
       }
@@ -588,10 +597,30 @@ function applyTurnNotification(state, message) {
         emitProgress(state.onProgress, update?.message, update?.phase ?? null);
       }
       break;
-    case "error":
-      state.error = message.params.error;
-      emitProgress(state.onProgress, `Codex error: ${message.params.error.message}`, "failed");
+    case "error": {
+      const error = message.params.error ?? { message: "Codex reported an error." };
+      if (message.params.willRetry === true) {
+        emitProgress(state.onProgress, `Codex error (retrying): ${error.message}`, null);
+        break;
+      }
+      const errorThreadId = message.params.threadId ?? null;
+      if (errorThreadId && errorThreadId !== state.threadId) {
+        // A subagent's terminal error ends only that subagent's turn, like its turn/completed.
+        // The protocol requires a threadId on `error`, and one without it never
+        // passes `belongsToTurn`, so it does not reach this switch at all.
+        const label = labelForThread(state, errorThreadId) ?? errorThreadId;
+        emitProgress(state.onProgress, `Subagent ${label} error: ${error.message}`, null);
+        state.activeSubagentTurns.delete(errorThreadId);
+        scheduleInferredCompletion(state);
+        break;
+      }
+      state.error = error;
+      emitProgress(state.onProgress, `Codex error: ${error.message}`, "failed");
+      // Terminal: no turn/completed follows a non-retried error (#698). completeTurn
+      // is idempotent, so a late turn/completed is harmless.
+      completeTurn(state, { id: state.turnId ?? "errored-turn", status: "failed", error });
       break;
+    }
     case "turn/completed":
       if ((message.params.threadId ?? null) !== state.threadId) {
         state.activeSubagentTurns.delete(message.params.threadId);
@@ -690,10 +719,10 @@ async function failTurnOnTimeout(client, state, timeoutMs) {
     }
   }
 
-  // Wait for the turn to actually end. With no turnId there was nothing to
-  // interrupt (and notifications are still buffered), so this window only ever
-  // expires — the report then says the turn may still be running, which is the
-  // truth. `completeTurn` already ran if the notification arrived.
+  // Wait for the turn to actually end. With no turnId — neither the turn/start
+  // response nor a turn/started notification named the turn — there was nothing
+  // to interrupt, so this window usually expires and the report says the turn
+  // may still be running, which is the truth. `completeTurn` already ran if the notification arrived.
   if (await waitForTurnAcknowledgement(client, state, TURN_INTERRUPT_ACK_MS)) {
     return;
   }
@@ -717,25 +746,25 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
   const timeoutMs = resolveTurnTimeoutMs(options.turnTimeoutMs);
   let timeoutTimer = null;
 
+  // Shared by the live handler and the buffered replay so they cannot drift:
+  // thread metadata (a subagent's thread/started) must apply before its thread
+  // id is known to belong to this turn.
+  const routeNotification = (message) => {
+    if (message.method === "thread/started" || message.method === "thread/name/updated") {
+      applyTurnNotification(state, message);
+    } else if (belongsToTurn(state, message)) {
+      applyTurnNotification(state, message);
+    } else {
+      previousHandler?.(message);
+    }
+  };
+
   client.setNotificationHandler((message) => {
-    if (!state.turnId) {
+    if (!state.started) {
       state.bufferedNotifications.push(message);
       return;
     }
-
-    if (message.method === "thread/started" || message.method === "thread/name/updated") {
-      applyTurnNotification(state, message);
-      return;
-    }
-
-    if (!belongsToTurn(state, message)) {
-        if (previousHandler) {
-          previousHandler(message);
-        }
-        return;
-    }
-
-    applyTurnNotification(state, message);
+    routeNotification(message);
   });
 
   try {
@@ -745,14 +774,9 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
     if (state.turnId) {
       state.threadTurnIds.set(state.threadId, state.turnId);
     }
+    state.started = true;
     for (const message of state.bufferedNotifications) {
-      if (belongsToTurn(state, message)) {
-        applyTurnNotification(state, message);
-      } else {
-        if (previousHandler) {
-          previousHandler(message);
-        }
-      }
+      routeNotification(message);
     }
     state.bufferedNotifications.length = 0;
 
@@ -788,7 +812,7 @@ async function withAppServer(cwd, fn, clientOptions = {}) {
     const brokerRequested = client?.transport === "broker" || Boolean(process.env[BROKER_ENDPOINT_ENV]);
     const shouldRetryDirect =
       (client?.transport === "broker" && error?.rpcCode === BROKER_BUSY_RPC_CODE) ||
-      (brokerRequested && (error?.code === "ENOENT" || error?.code === "ECONNREFUSED"));
+      (brokerRequested && (error?.code === "ENOENT" || error?.code === "ECONNREFUSED" || error?.code === "ETIMEDOUT"));
 
     if (client) {
       await client.close().catch(() => {});
@@ -1369,6 +1393,7 @@ export async function runAppServerTurn(cwd, options = {}) {
 
     return {
       status: buildResultStatus(turnState),
+      turnStatus: turnState.finalTurn?.status ?? null,
       threadId,
       turnId: turnState.turnId,
       resolved,

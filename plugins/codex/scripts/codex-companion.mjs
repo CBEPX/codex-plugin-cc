@@ -24,7 +24,8 @@ import {
 import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
 import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
-import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
+import { loadModelCatalog, resolveModelAlias, supportedEfforts } from "./lib/model-catalog.mjs";
+import { binaryAvailable, getProcessIdentity, isPidAlive, terminateRecordedProcess, workerCommandLine } from "./lib/process.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import {
   consumeJobRequestFile,
@@ -93,23 +94,16 @@ const VALID_REASONING_EFFORTS = new Set([
   "max",
   "ultra"
 ]);
-const MODEL_ALIASES = new Map([
-  ["spark", "gpt-5.3-codex-spark"],
-  ["sol", "gpt-5.6-sol"],
-  ["luna", "gpt-5.6-luna"],
-  ["terra", "gpt-5.6-terra"],
-  ["mini", "gpt-5.4-mini"]
-]);
 const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
 
 function printUsage() {
   console.log(
     [
       "Usage:",
-      "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
-      "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model|spark|sol|luna|terra|mini>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [--turn-timeout-ms <ms>] [--config key=value]...",
-      "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model|spark|sol|luna|terra|mini>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [--turn-timeout-ms <ms>] [--config key=value]... [focus text]",
-      "  node scripts/codex-companion.mjs task [--background|--await [--await-timeout-ms <ms>]] [--prompt-stdin] [--write] [--resume-last|--resume|--fresh] [--model <model|spark|sol|luna|terra|mini>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [--turn-timeout-ms <ms>] [--config key=value]... [prompt]",
+      "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--review-gate-model <model|inherit>] [--review-gate-effort <effort|inherit>] [--json]",
+      "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model|spark|astra|sol|luna|terra|mini>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [--turn-timeout-ms <ms>] [--config key=value]...",
+      "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model|spark|astra|sol|luna|terra|mini>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [--turn-timeout-ms <ms>] [--config key=value]... [focus text]",
+      "  node scripts/codex-companion.mjs task [--background|--await [--await-timeout-ms <ms>]] [--prompt-stdin] [--write] [--resume-last|--resume|--fresh] [--model <model|spark|astra|sol|luna|terra|mini>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [--turn-timeout-ms <ms>] [--config key=value]... [prompt]",
       "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--wait [--timeout-ms <ms>]] [--json]",
@@ -147,10 +141,10 @@ function normalizeRequestedModel(model) {
   if (!normalized) {
     return null;
   }
-  return MODEL_ALIASES.get(normalized.toLowerCase()) ?? normalized;
+  return resolveModelAlias(normalized, loadModelCatalog());
 }
 
-function normalizeReasoningEffort(effort) {
+function normalizeReasoningEffort(effort, model = null) {
   if (effort == null) {
     return null;
   }
@@ -162,6 +156,12 @@ function normalizeReasoningEffort(effort) {
     throw new Error(
       `Unsupported reasoning effort "${effort}". Use one of: none, minimal, low, medium, high, xhigh, max, ultra.`
     );
+  }
+  if (model) {
+    const allowed = supportedEfforts(model, loadModelCatalog());
+    if (allowed && !allowed.includes(normalized)) {
+      throw new Error(`Reasoning effort "${normalized}" is not supported by ${model}. ${model} supports: ${allowed.join(", ")}.`);
+    }
   }
   return normalized;
 }
@@ -305,6 +305,8 @@ async function buildSetupReport(cwd, actionsTaken = []) {
     auth: authStatus,
     sessionRuntime: getSessionRuntimeStatus(process.env, workspaceRoot),
     reviewGateEnabled: Boolean(config.stopReviewGate),
+    reviewGateModel: config.stopReviewGateModel ?? null,
+    reviewGateEffort: config.stopReviewGateEffort ?? null,
     actionsTaken,
     nextSteps
   };
@@ -312,7 +314,7 @@ async function buildSetupReport(cwd, actionsTaken = []) {
 
 async function handleSetup(argv) {
   const { options } = parseCommandInput(argv, {
-    valueOptions: ["cwd"],
+    valueOptions: ["cwd", "review-gate-model", "review-gate-effort"],
     booleanOptions: ["json", "enable-review-gate", "disable-review-gate"]
   });
   if (maybePrintCommandHelp(options)) {
@@ -327,12 +329,35 @@ async function handleSetup(argv) {
   const workspaceRoot = resolveCommandWorkspace(options);
   const actionsTaken = [];
 
+  // Validate everything before writing anything: a rejected effort must not
+  // leave a half-applied gate configuration behind.
+  const isInherit = (value) => String(value).trim().toLowerCase() === "inherit";
+  const modelGiven = options["review-gate-model"] != null;
+  const effortGiven = options["review-gate-effort"] != null;
+  const config = getConfig(workspaceRoot);
+  const newModel = modelGiven && !isInherit(options["review-gate-model"]) ? normalizeRequestedModel(options["review-gate-model"]) : null;
+  const effectiveModel = modelGiven ? newModel : (config.stopReviewGateModel ?? null);
+  const newEffort =
+    effortGiven && !isInherit(options["review-gate-effort"]) ? normalizeReasoningEffort(options["review-gate-effort"], effectiveModel) : null;
+  // A model-only change must still fit the effort already stored with it.
+  if (modelGiven && !effortGiven) {
+    normalizeReasoningEffort(config.stopReviewGateEffort ?? null, effectiveModel);
+  }
+
   if (options["enable-review-gate"]) {
     setConfig(workspaceRoot, "stopReviewGate", true);
     actionsTaken.push(`Enabled the stop-time review gate for ${workspaceRoot}.`);
   } else if (options["disable-review-gate"]) {
     setConfig(workspaceRoot, "stopReviewGate", false);
     actionsTaken.push(`Disabled the stop-time review gate for ${workspaceRoot}.`);
+  }
+  if (modelGiven) {
+    setConfig(workspaceRoot, "stopReviewGateModel", newModel);
+    actionsTaken.push(newModel ? `Stop-time review gate model set to ${newModel}.` : "Stop-time review gate model now inherits Codex config.");
+  }
+  if (effortGiven) {
+    setConfig(workspaceRoot, "stopReviewGateEffort", newEffort);
+    actionsTaken.push(newEffort ? `Stop-time review gate effort set to ${newEffort}.` : "Stop-time review gate effort now inherits Codex config.");
   }
 
   const finalReport = await buildSetupReport(cwd, actionsTaken);
@@ -665,7 +690,10 @@ async function executeTaskRun(request) {
   });
 
   const rawOutput = typeof result.finalMessage === "string" ? result.finalMessage : "";
-  const failureMessage = result.error?.message ?? result.stderr ?? "";
+  const turnStatus = result.turnStatus ?? null;
+  const failureMessage =
+    result.error?.message ??
+    (result.status !== 0 ? (result.stderr || `Codex turn ended with status "${turnStatus ?? "failed"}"`) : "");
   const rendered = renderTaskResult(
     {
       rawOutput,
@@ -694,7 +722,10 @@ async function executeTaskRun(request) {
     payload,
     rendered,
     errorMessage: failureMessage || null,
-    summary: firstMeaningfulLine(rawOutput, firstMeaningfulLine(failureMessage, `${taskMetadata.title} finished.`)),
+    summary:
+      result.status === 0
+        ? firstMeaningfulLine(rawOutput, `${taskMetadata.title} finished.`)
+        : firstMeaningfulLine(failureMessage, firstMeaningfulLine(rawOutput, `${taskMetadata.title} failed.`)),
     jobTitle: taskMetadata.title,
     jobClass: "task",
     write: Boolean(request.write)
@@ -889,6 +920,7 @@ function enqueueBackgroundTask(cwd, job, request) {
     // patches the real one in as soon as the worker exists.
     background: true,
     pid: null,
+    pidIdentity: null,
     logFile,
     requestFile,
     request: { ...request, config: redactConfigValues(request.config) }
@@ -918,7 +950,7 @@ function enqueueBackgroundTask(cwd, job, request) {
   // owns it — it writes an atomic `jobs/<id>.pid` sidecar plus a pid-only index
   // patch. Without it a `cancel` inside the queued window signals nothing and
   // the reaper cannot tell a dead queued worker from a live one.
-  updateJobPid(job.workspaceRoot, job.id, child.pid);
+  updateJobPid(job.workspaceRoot, job.id, child.pid, getProcessIdentity(child.pid));
 
   return {
     payload: {
@@ -951,7 +983,7 @@ async function handleReviewCommand(argv, config) {
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
   const model = normalizeRequestedModel(options.model);
-  const effort = normalizeReasoningEffort(options.effort);
+  const effort = normalizeReasoningEffort(options.effort, model);
   const configOverrides = parseConfigOverrides(options.config);
   const turnTimeoutMs = parseTimeoutOption(options["turn-timeout-ms"], "--turn-timeout-ms");
   const focusText = positionals.join(" ").trim();
@@ -1016,7 +1048,7 @@ async function handleTask(argv) {
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
   const model = normalizeRequestedModel(options.model);
-  const effort = normalizeReasoningEffort(options.effort);
+  const effort = normalizeReasoningEffort(options.effort, model);
   const configOverrides = parseConfigOverrides(options.config);
   // Every flag conflict is decided before the prompt is read: `--prompt-stdin`
   // blocks on an open stdin, so a usage error must never wait for EOF.
@@ -1183,6 +1215,16 @@ async function handleStatus(argv) {
           pollIntervalMs: options["poll-interval-ms"]
         })
       : buildSingleJobSnapshot(cwd, reference);
+    if (snapshot.waitTimedOut) {
+      const seconds = Math.max(1, Math.round(snapshot.timeoutMs / 1000));
+      outputCommandResult(
+        snapshot,
+        `${renderJobStatusReport(snapshot.job)}\nTimed out after ${seconds}s while the job was still running.\n`,
+        options.json
+      );
+      process.exitCode = 1;
+      return;
+    }
     outputCommandResult(snapshot, renderJobStatusReport(snapshot.job), options.json);
     return;
   }
@@ -1290,7 +1332,28 @@ async function handleCancel(argv) {
     );
   }
 
-  terminateProcessTree(resolveJobPid(workspaceRoot, job) ?? Number.NaN);
+  // Only a pid that is provably still this job's worker is signalled (#743).
+  const { pid, identity } = resolveJobPid(workspaceRoot, job);
+  const kill = terminateRecordedProcess(pid, { identity, commandLineMatch: workerCommandLine(job.id) });
+  // A worker we may not signal, or whose signal reached nothing, but that is
+  // still alive is not cancelled: the job stays running, and the sidecar stays
+  // so a later cancel or the reaper can still find it.
+  if (pid && (!kill.attempted || !kill.delivered) && isPidAlive(pid) === true) {
+    const reason = kill.attempted ? "not-delivered" : kill.reason;
+    const pending = `cancellation not confirmed: worker pid ${pid} left running (${reason})`;
+    appendLogLine(job.logFile, pending);
+    process.exitCode = 1;
+    outputCommandResult(
+      { jobId: job.id, status: "running", cancellationPending: true, reason },
+      `${pending}\nThe turn interrupt was sent; the job stays running until the worker exits. Re-run cancel or wait for result.\n`,
+      options.json
+    );
+    return;
+  }
+  const leftRunning = pid && !kill.attempted ? `worker pid ${pid} left running: ${kill.reason}` : null;
+  if (leftRunning) {
+    appendLogLine(job.logFile, leftRunning);
+  }
   appendLogLine(job.logFile, "Cancelled by user.");
 
   const completedAt = nowIso();
@@ -1299,6 +1362,7 @@ async function handleCancel(argv) {
     status: "cancelled",
     phase: "cancelled",
     pid: null,
+    pidIdentity: null,
     requestFile: null,
     completedAt,
     errorMessage: "Cancelled by user."
@@ -1325,6 +1389,7 @@ async function handleCancel(argv) {
       status: "cancelled",
       phase: "cancelled",
       pid: null,
+      pidIdentity: null,
       requestFile: null,
       errorMessage: "Cancelled by user.",
       completedAt
@@ -1336,10 +1401,12 @@ async function handleCancel(argv) {
     status: "cancelled",
     title: job.title,
     turnInterruptAttempted: interrupt.attempted,
-    turnInterrupted: interrupt.interrupted
+    turnInterrupted: interrupt.interrupted,
+    workerLeftRunning: leftRunning
   };
 
-  outputCommandResult(payload, renderCancelReport(nextJob), options.json);
+  const rendered = renderCancelReport(nextJob);
+  outputCommandResult(payload, leftRunning ? `${rendered}${leftRunning}\n` : rendered, options.json);
 }
 
 async function main() {

@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { renderReviewResult, renderStoredJobResult } from "../plugins/codex/scripts/lib/render.mjs";
+import { renderJobStatusReport, renderReviewResult, renderStoredJobResult } from "../plugins/codex/scripts/lib/render.mjs";
 
 test("renderReviewResult degrades gracefully when JSON is missing required review fields", () => {
   const output = renderReviewResult(
@@ -56,4 +56,14 @@ test("renderStoredJobResult prefers rendered output for structured review jobs",
   assert.doesNotMatch(output, /^\{/);
   assert.match(output, /Codex session ID: thr_123/);
   assert.match(output, /Resume in Codex: codex resume thr_123/);
+});
+
+test("renderJobStatusReport prints Error only for failed jobs whose error adds to the summary", () => {
+  const base = { id: "task-1", status: "failed", kindLabel: "rescue", title: "Codex Task" };
+  const duplicate = renderJobStatusReport({ ...base, summary: "Quota exhausted", errorMessage: " Quota exhausted\n" });
+  assert.doesNotMatch(duplicate, /Error:/);
+  const distinct = renderJobStatusReport({ ...base, summary: "Codex Task failed.", errorMessage: "Quota exhausted" });
+  assert.match(distinct, /^ {2}Error: Quota exhausted$/m);
+  const completed = renderJobStatusReport({ ...base, status: "completed", summary: "Done", errorMessage: "stale" });
+  assert.doesNotMatch(completed, /Error:/);
 });

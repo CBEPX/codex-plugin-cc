@@ -3,7 +3,7 @@
 import fs from "node:fs";
 import process from "node:process";
 
-import { terminateProcessTree } from "./lib/process.mjs";
+import { isPidAlive, terminateProcessTree, terminateRecordedProcess, workerCommandLine } from "./lib/process.mjs";
 import { BROKER_ENDPOINT_ENV } from "./lib/app-server.mjs";
 import {
   clearBrokerSession,
@@ -40,6 +40,8 @@ const STATE_LOCK_STEP_MS = 5000;
 const BROKER_HANDSHAKE_STEP_MS = 5000;
 // Below this there is no point starting another bounded step.
 const MIN_STEP_MS = 100;
+// Upper bound on one process-identity probe (`ps` on darwin).
+const IDENTITY_PROBE_MS = 2000;
 
 // The override may only ever SHORTEN the budget. `hooks.json`'s timeout is a fixed
 // number that cannot be raised from the environment, so an override above the
@@ -100,7 +102,7 @@ function appendEnvVar(name, value) {
   );
 }
 
-function cleanupSessionJobs(cwd, sessionId, lockWaitMs) {
+function cleanupSessionJobs(cwd, sessionId, lockWaitMs, remainingMs) {
   if (!cwd || !sessionId) {
     return;
   }
@@ -122,6 +124,10 @@ function cleanupSessionJobs(cwd, sessionId, lockWaitMs) {
       return;
     }
 
+    // A record is only dropped once its worker is stopped or provably gone; one
+    // this hook refused to signal, failed to signal or never reached stays, so
+    // the worker is not orphaned and `activeWorkspaceJobs` still sees it.
+    const kept = new Set();
     for (const job of sessionJobs) {
       // Background jobs are explicitly dispatched to outlive the session that
       // started them. Leave them running and leave their state entry intact so
@@ -133,16 +139,34 @@ function cleanupSessionJobs(cwd, sessionId, lockWaitMs) {
       if (!stillRunning) {
         continue;
       }
-      try {
-        terminateProcessTree(resolveJobPid(workspaceRoot, job) ?? Number.NaN);
-      } catch {
-        // Ignore teardown failures during session shutdown.
+      // Only a pid still provably this job's process is signalled (#743), and
+      // proving it costs up to two probes (a worker that leads no process group
+      // is re-proved before its own pid is signalled) the budget has to cover.
+      const probeMs = Math.floor(Math.min(IDENTITY_PROBE_MS, remainingMs() / 2));
+      let reason = "budget-exhausted";
+      if (probeMs >= MIN_STEP_MS) {
+        let pid;
+        try {
+          const recorded = resolveJobPid(workspaceRoot, job);
+          pid = recorded.pid;
+          const outcome = terminateRecordedProcess(pid, { identity: recorded.identity, commandLineMatch: workerCommandLine(job.id), timeoutMs: probeMs });
+          reason = outcome.reason === "no-pid" || (outcome.attempted && outcome.delivered) ? null : outcome.attempted ? "not-delivered" : outcome.reason;
+        } catch {
+          reason = "kill-failed";
+        }
+        if (reason && isPidAlive(pid) === false) {
+          reason = null;
+        }
+      }
+      if (reason) {
+        kept.add(job.id);
+        process.stderr.write(`[codex] SessionEnd left ${job.id} running: ${reason}\n`);
       }
     }
 
     saveState(workspaceRoot, {
       ...state,
-      jobs: state.jobs.filter((job) => job.sessionId !== sessionId || job.background)
+      jobs: state.jobs.filter((job) => job.sessionId !== sessionId || job.background || kept.has(job.id))
     });
   }, { waitMs: lockWaitMs });
 }
@@ -194,10 +218,11 @@ async function handleSessionEnd(input) {
   const logFile = brokerSession?.logFile ?? null;
   const sessionDir = brokerSession?.sessionDir ?? null;
   const pid = brokerSession?.pid ?? null;
+  const pidIdentity = brokerSession?.pidIdentity ?? null;
 
   let activeJobs;
   try {
-    cleanupSessionJobs(cwd, input.session_id || process.env[SESSION_ID_ENV], stepBudget(STATE_LOCK_STEP_MS));
+    cleanupSessionJobs(cwd, input.session_id || process.env[SESSION_ID_ENV], stepBudget(STATE_LOCK_STEP_MS), remainingMs);
     activeJobs = activeWorkspaceJobs(cwd, stepBudget(STATE_LOCK_STEP_MS), remainingMs);
   } catch (error) {
     // A lock this hook could not take says nothing about the broker, and a
@@ -283,13 +308,15 @@ async function handleSessionEnd(input) {
     logFile,
     sessionDir,
     pid,
+    pidIdentity,
     killProcess: terminateProcessTree,
-    timeoutMs: stepBudget(STATE_LOCK_STEP_MS)
+    // Halved: a broker gone from its group is re-proved with a second probe.
+    timeoutMs: Math.floor(stepBudget(IDENTITY_PROBE_MS) / 2)
   });
   // Every branch of this hook says what it decided: when a broker outlives a
   // SessionEnd the only question worth asking is which of these four paths ran.
   process.stderr.write(
-    `[codex] Broker teardown: endpoint=${brokerEndpoint ?? "none"} pid=${pid ?? "none"} signalled=${teardown.signalled} busyRetries=${busyRetries} budgetExhausted=false\n`
+    `[codex] Broker teardown: endpoint=${brokerEndpoint ?? "none"} pid=${pid ?? "none"} signalled=${teardown.signalled} reason=${teardown.reason} busyRetries=${busyRetries} budgetExhausted=false\n`
   );
 
   // A replacement broker can have started — and recorded itself — while this one

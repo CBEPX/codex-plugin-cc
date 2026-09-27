@@ -36,8 +36,8 @@ CODEX_PROMPT_<random>
 - Do not call `review`, `adversarial-review`, or `cancel`. This subagent only forwards to `task` and, on exit 3, re-runs its own job's printed `result --wait` hint.
 - Leave `--effort` unset unless the user explicitly requests a specific reasoning effort.
 - Leave model unset by default. Only add `--model` when the user explicitly asks for a specific model.
-- If the user asks for `spark`, map that to `--model gpt-5.3-codex-spark`.
-- If the user asks for a concrete model name such as `gpt-5.6-terra`, pass it through with `--model`.
+- If the user asks for a model alias (`spark`, `astra`, `sol`, `luna`, `terra` or `mini`), pass it through unchanged with `--model <alias>`; the companion resolves each against the local Codex model catalogue (primary sort by `priority`, newest family on ties), so do not map it yourself.
+- If the user asks for a concrete model name such as `gpt-6-astra`, pass it through with `--model`.
 - Treat `--effort <value>`, `--model <value>`, and `--config key=value` as runtime controls and do not include them in the task text you pass through.
 - Never add `--write` unless the user explicitly asked Codex to modify files.
 - Preserve the user's task text as-is apart from stripping routing flags.

@@ -349,7 +349,7 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
   }
 }
 
-class BrokerCodexAppServerClient extends AppServerClientBase {
+export class BrokerCodexAppServerClient extends AppServerClientBase {
   constructor(cwd, options = {}) {
     super(cwd, options);
     this.transport = "broker";
@@ -359,13 +359,27 @@ class BrokerCodexAppServerClient extends AppServerClientBase {
   async initialize() {
     await new Promise((resolve, reject) => {
       const target = parseBrokerEndpoint(this.endpoint);
-      this.socket = net.createConnection({ path: target.path });
+      const connectImpl = this.options.connectImpl ?? ((socketPath) => net.createConnection({ path: socketPath }));
+      const connectTimeoutMs = this.options.connectTimeoutMs ?? 2000;
+      this.socket = connectImpl(target.path);
       this.socket.setEncoding("utf8");
-      this.socket.on("connect", resolve);
+      // A socket stuck in `connecting` fires neither connect nor error (#773).
+      const timer = setTimeout(() => {
+        const error = Object.assign(new Error(`codex app-server broker connect timed out after ${connectTimeoutMs} ms.`), {
+          code: "ETIMEDOUT"
+        });
+        this.socket.destroy();
+        reject(error);
+      }, connectTimeoutMs);
+      this.socket.on("connect", () => {
+        clearTimeout(timer);
+        resolve();
+      });
       this.socket.on("data", (chunk) => {
         this.handleChunk(chunk);
       });
       this.socket.on("error", (error) => {
+        clearTimeout(timer);
         if (!this.exitResolved) {
           reject(error);
         }

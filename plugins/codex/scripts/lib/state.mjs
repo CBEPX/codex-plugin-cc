@@ -2,13 +2,14 @@ import { createHash, randomBytes } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
-import { isPidAlive } from "./process.mjs";
+import { getProcessIdentity, isPidAlive } from "./process.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
 const STATE_VERSION = 1;
 const PLUGIN_DATA_ENV = "CLAUDE_PLUGIN_DATA";
-const FALLBACK_STATE_ROOT_DIR = path.join(os.tmpdir(), "codex-companion");
+const SCRIPT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 const STATE_FILE_NAME = "state.json";
 const JOBS_DIR_NAME = "jobs";
 const MAX_JOBS = 50;
@@ -27,6 +28,33 @@ function defaultState() {
   };
 }
 
+export function resolveFallbackStateRoot({
+  env = process.env,
+  tmpdir = os.tmpdir(),
+  uid = typeof process.getuid === "function" ? process.getuid() : null,
+  pluginRoot = env.CLAUDE_PLUGIN_ROOT || SCRIPT_ROOT
+} = {}) {
+  let canonicalPluginRoot = pluginRoot;
+  try {
+    canonicalPluginRoot = fs.realpathSync.native(pluginRoot);
+  } catch {
+    // keep as given
+  }
+  const userDir = path.join(tmpdir, `codex-companion-${uid ?? "user"}`);
+  fs.mkdirSync(userDir, { recursive: true, mode: 0o700 });
+  if (process.platform !== "win32") {
+    // lstat: a planted symlink would pass a following stat and could be retargeted later.
+    const stats = fs.lstatSync(userDir);
+    if (!stats.isDirectory() || (uid !== null && stats.uid !== uid) || (stats.mode & 0o077) !== 0) {
+      throw new Error(
+        `Refusing to use shared state directory ${userDir}: owned by another user or group/world accessible. Set CLAUDE_PLUGIN_DATA.`
+      );
+    }
+  }
+  // ponytail: plugin identity = hash of the install root; sibling plugins/forks get separate roots (#609)
+  return path.join(userDir, createHash("sha256").update(canonicalPluginRoot).digest("hex").slice(0, 12));
+}
+
 export function resolveStateDir(cwd) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   let canonicalWorkspaceRoot = workspaceRoot;
@@ -40,7 +68,7 @@ export function resolveStateDir(cwd) {
   const slug = slugSource.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "workspace";
   const hash = createHash("sha256").update(canonicalWorkspaceRoot).digest("hex").slice(0, 16);
   const pluginDataDir = process.env[PLUGIN_DATA_ENV];
-  const stateRoot = pluginDataDir ? path.join(pluginDataDir, "state") : FALLBACK_STATE_ROOT_DIR;
+  const stateRoot = pluginDataDir ? path.join(pluginDataDir, "state") : resolveFallbackStateRoot();
   return path.join(stateRoot, `${slug}-${hash}`);
 }
 
@@ -217,6 +245,13 @@ function sleepSync(ms) {
 const LOCK_ENTRY_GONE = "gone";
 const LOCK_ENTRY_HELD = "held";
 const LOCK_ENTRY_ABANDONED = "abandoned";
+// Every identity probe is bounded by this and by what is left of the wait, so
+// probes can never push an acquisition past its deadline (the SessionEnd budget).
+const LOCK_IDENTITY_PROBE_MS = 500;
+const LOCK_IDENTITY_PROBE_MIN_MS = 50;
+// This process's own identity, per probe implementation; a failed probe is
+// cached too, so a slow `ps` is paid at most once per process.
+const selfLockIdentity = new Map();
 
 // Only the entry having disappeared is an answer. Every other stat failure —
 // EACCES, EIO, ELOOP — says nothing about the owner, and guessing there is how a
@@ -265,7 +300,7 @@ function readLockEntryOwner(entryPath) {
 // check after a long one. (A PID that exists but belongs to another user reads
 // as alive, which is the safe answer.) A stuck live owner is the operator's call —
 // the timeout error names it.
-function judgeLockEntry(entryPath) {
+function judgeLockEntry(entryPath, { deadline = Infinity, getProcessIdentityImpl = getProcessIdentity } = {}) {
   const { present, owner } = readLockEntryOwner(entryPath);
   if (!present) {
     return LOCK_ENTRY_GONE;
@@ -274,6 +309,17 @@ function judgeLockEntry(entryPath) {
   if (owner) {
     const alive = isPidAlive(owner.pid);
     if (alive === true) {
+      // A live pid that is provably another process is a recycled one (#743).
+      // An identity we cannot read proves nothing and keeps the entry.
+      // ponytail: win32 lock entries stay PID-liveness only (no identity recorded there)
+      // No time left for a probe is the same as a probe that cannot answer.
+      const remaining = deadline - Date.now();
+      if (typeof owner.identity === "string" && remaining >= LOCK_IDENTITY_PROBE_MIN_MS) {
+        const actual = getProcessIdentityImpl(owner.pid, { timeoutMs: Math.min(LOCK_IDENTITY_PROBE_MS, remaining) });
+        if (actual && actual !== owner.identity) {
+          return LOCK_ENTRY_ABANDONED;
+        }
+      }
       return LOCK_ENTRY_HELD;
     }
     if (alive === false) {
@@ -412,10 +458,13 @@ function lockTimeoutError(lockDir, blockers, waitMs) {
 // display, then stop announcing. A later acquirer is therefore always visible as
 // `choosing` to anyone still deciding, which is what stops it slipping in with a
 // lower number behind a holder's back.
-function acquireTicket(lockDir, waitMs) {
+function acquireTicket(lockDir, waitMs, getProcessIdentityImpl = getProcessIdentity) {
+  // The deadline starts before the self-probe: that probe spends the budget too.
+  const deadline = Date.now() + waitMs;
   fs.mkdirSync(lockDir, { recursive: true });
   const token = `${process.pid}-${randomBytes(8).toString("hex")}`;
-  const owner = `${JSON.stringify({ pid: process.pid, startedAt: nowIso() })}\n`;
+  const identity = process.platform === "win32" ? null : selfIdentity(getProcessIdentityImpl, waitMs);
+  const owner = `${JSON.stringify({ pid: process.pid, startedAt: nowIso(), identity })}\n`;
   const choosingName = `${LOCK_CHOOSING_PREFIX}${token}`;
 
   writeLockEntry(lockDir, choosingName, token, owner);
@@ -434,7 +483,7 @@ function acquireTicket(lockDir, waitMs) {
   }
 
   try {
-    waitForTurn(lockDir, ticket, waitMs);
+    waitForTurn(lockDir, ticket, waitMs, deadline, getProcessIdentityImpl);
   } catch (error) {
     // We are not holding the lock, so our ticket must leave the queue — this
     // process is alive, so nothing would ever judge it abandoned and everyone
@@ -446,8 +495,20 @@ function acquireTicket(lockDir, waitMs) {
   return ticket;
 }
 
-function waitForTurn(lockDir, ticket, waitMs) {
-  const deadline = Date.now() + waitMs;
+function selfIdentity(getProcessIdentityImpl, waitMs) {
+  if (selfLockIdentity.has(getProcessIdentityImpl)) {
+    return selfLockIdentity.get(getProcessIdentityImpl);
+  }
+  const timeoutMs = Math.min(LOCK_IDENTITY_PROBE_MS, waitMs);
+  if (!(timeoutMs >= LOCK_IDENTITY_PROBE_MIN_MS)) {
+    return null; // no budget for a probe this time; not cached, a later wait may have one
+  }
+  const identity = getProcessIdentityImpl(process.pid, { timeoutMs });
+  selfLockIdentity.set(getProcessIdentityImpl, identity);
+  return identity;
+}
+
+function waitForTurn(lockDir, ticket, waitMs, deadline, getProcessIdentityImpl) {
   let blockers = [];
   let scanned = false;
   for (;;) {
@@ -476,7 +537,7 @@ function waitForTurn(lockDir, ticket, waitMs) {
     // nothing but its own files.
     const verdicts = blockers.map((blocker) => ({
       blocker,
-      verdict: judgeLockEntry(path.join(lockDir, blocker.name))
+      verdict: judgeLockEntry(path.join(lockDir, blocker.name), { deadline, getProcessIdentityImpl })
     }));
 
     let evicted = false;
@@ -514,7 +575,7 @@ function withLockDir(lockDir, fn, options = {}) {
     }
   }
 
-  const ticket = acquireTicket(lockDir, options.waitMs ?? LOCK_WAIT_MS);
+  const ticket = acquireTicket(lockDir, options.waitMs ?? LOCK_WAIT_MS, options.getProcessIdentityImpl);
   heldLocks.set(lockDir, { depth: 1, ticket });
   try {
     return fn();
@@ -606,8 +667,8 @@ export function upsertJob(cwd, jobPatch) {
 // threadId and turnId. The pid goes into an atomic sidecar plus the pid-only
 // index patch, and readers fall back to the sidecar (`resolveJobPid`) only while
 // the job is still active.
-export function updateJobPid(cwd, jobId, pid) {
-  writeJobPidFile(cwd, jobId, pid);
+export function updateJobPid(cwd, jobId, pid, identity = null) {
+  writeJobPidFile(cwd, jobId, pid, identity);
   // The index is patch-based, so it cannot lose a field — but a worker that
   // already reported `running` wrote its own pid there, and that record is the
   // newer one. A job that is gone from the index needs no pid at all. The read
@@ -616,7 +677,7 @@ export function updateJobPid(cwd, jobId, pid) {
   withStateLock(cwd, () => {
     const indexed = listJobs(cwd).find((job) => job.id === jobId);
     if (indexed?.status === "queued") {
-      upsertJob(cwd, { id: jobId, pid });
+      upsertJob(cwd, { id: jobId, pid, pidIdentity: identity });
     }
   });
 }
@@ -707,18 +768,23 @@ export function resolveJobPidFile(cwd, jobId) {
   return path.join(resolveJobsDir(cwd), `${jobId}.pid`);
 }
 
-export function writeJobPidFile(cwd, jobId, pid) {
-  return writeFileAtomic(resolveJobPidFile(cwd, jobId), `${pid}\n`);
+export function writeJobPidFile(cwd, jobId, pid, identity = null) {
+  return writeFileAtomic(resolveJobPidFile(cwd, jobId), `${JSON.stringify({ pid, identity })}\n`);
 }
 
 export function removeJobPidFile(cwd, jobId) {
   removeFileIfExists(resolveJobPidFile(cwd, jobId));
 }
 
+// `{"pid":N,"identity":"..."}`, or the bare integer v1.2.x wrote.
 function readJobPidSidecar(cwd, jobId) {
   try {
-    const pid = Number.parseInt(fs.readFileSync(resolveJobPidFile(cwd, jobId), "utf8").trim(), 10);
-    return Number.isInteger(pid) && pid > 0 ? pid : null;
+    const raw = fs.readFileSync(resolveJobPidFile(cwd, jobId), "utf8").trim();
+    const parsed = raw.startsWith("{") ? JSON.parse(raw) : { pid: Number.parseInt(raw, 10), identity: null };
+    if (!Number.isInteger(parsed.pid) || parsed.pid <= 0) {
+      return null;
+    }
+    return { pid: parsed.pid, identity: typeof parsed.identity === "string" ? parsed.identity : null };
   } catch {
     return null;
   }
@@ -727,15 +793,16 @@ function readJobPidSidecar(cwd, jobId) {
 // The pid every reader (cancel, reaper, SessionEnd cleanup) should use: the
 // record's own pid once the worker has taken the record over, the sidecar during
 // the queued window before that. A terminal job never reports one — its worker
-// is gone and the sidecar may name a pid the OS has recycled.
+// is gone and the sidecar may name a pid the OS has recycled. The identity
+// recorded with the pid comes along (`null` for records from before v1.3.0).
 export function resolveJobPid(cwd, job) {
   if (job?.pid != null) {
-    return job.pid;
+    return { pid: job.pid, identity: typeof job.pidIdentity === "string" ? job.pidIdentity : null };
   }
   if (job?.status !== "queued" && job?.status !== "running") {
-    return null;
+    return { pid: null, identity: null };
   }
-  return readJobPidSidecar(cwd, job.id);
+  return readJobPidSidecar(cwd, job.id) ?? { pid: null, identity: null };
 }
 
 // The full task request can carry secrets (`--config` values such as auth

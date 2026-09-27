@@ -126,6 +126,10 @@ function pushJobDetails(lines, job, options = {}) {
   if (job.summary) {
     lines.push(`  Summary: ${job.summary}`);
   }
+  const errorText = job.errorMessage?.trim();
+  if (job.status === "failed" && errorText && errorText !== job.summary?.trim()) {
+    lines.push(`  Error: ${job.errorMessage}`);
+  }
   if (job.phase) {
     lines.push(`  Phase: ${job.phase}`);
   }
@@ -187,6 +191,7 @@ export function renderSetupReport(report) {
     `- auth: ${report.auth.detail}`,
     `- session runtime: ${report.sessionRuntime.label}`,
     `- review gate: ${report.reviewGateEnabled ? "enabled" : "disabled"}`,
+    `- review gate model/effort: ${report.reviewGateModel ?? "inherit"} / ${report.reviewGateEffort ?? "inherit"}`,
     ""
   ];
 
