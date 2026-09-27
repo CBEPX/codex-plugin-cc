@@ -4,7 +4,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
-import { makeTempDir } from "./helpers.mjs";
+import { IS_WIN, makeTempDir } from "./helpers.mjs";
 import { AppServerClientBase, BrokerCodexAppServerClient, CodexAppServerClient } from "../plugins/codex/scripts/lib/app-server.mjs";
 import { createBrokerEndpoint, parseBrokerEndpoint } from "../plugins/codex/scripts/lib/broker-endpoint.mjs";
 
@@ -99,7 +99,8 @@ test("permission approval requests grant nothing for the turn", () => {
 // it owns, so it must never become the second hang: an app-server that ignores
 // SIGTERM (or is wedged in a tool call) used to leave it awaiting process exit
 // forever. TERM, then KILL, then give up on the process rather than the caller.
-test("close() bounds an app-server that ignores SIGTERM", { timeout: 8000 }, async (t) => {
+// Windows: a SIGTERM-immune child is not modelled (kill() there is always TerminateProcess).
+test("close() bounds an app-server that ignores SIGTERM", { timeout: 8000, skip: IS_WIN }, async (t) => {
   const binDir = makeTempDir();
   installFakeCodex(binDir);
   const client = await CodexAppServerClient.connect(binDir, {
@@ -127,7 +128,8 @@ test("close() bounds an app-server that ignores SIGTERM", { timeout: 8000 }, asy
 // all. The turn timeout always closes twice — `failTurnOnTimeout` closes the
 // runaway app-server, then `withAppServer` closes it again on the way out — so
 // the one case the deadline exists for is exactly the case that hung.
-test("close() stays bounded when it is called twice", { timeout: 15000 }, async (t) => {
+// Windows: a SIGTERM-immune child is not modelled (kill() there is always TerminateProcess).
+test("close() stays bounded when it is called twice", { timeout: 15000, skip: IS_WIN }, async (t) => {
   const binDir = makeTempDir();
   installFakeCodex(binDir);
   const client = await CodexAppServerClient.connect(binDir, {

@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-import { makeTempDir, run } from "./helpers.mjs";
+import { IS_WIN, makeTempDir, run } from "./helpers.mjs";
 import { getProcessIdentity } from "../plugins/codex/scripts/lib/process.mjs";
 import {
   consumeJobRequestFile,
@@ -138,7 +138,8 @@ test("job request payloads are written owner-only and consumed exactly once", ()
 
   const requestFile = writeJobRequestFile(workspace, "task-1", payload);
   assert.equal(requestFile, resolveJobRequestFile(workspace, "task-1"));
-  assert.equal(fs.statSync(requestFile).mode & 0o777, 0o600);
+  // Windows has no POSIX mode bits; the owner-only invariant is not modelled there.
+  if (!IS_WIN) assert.equal(fs.statSync(requestFile).mode & 0o777, 0o600);
 
   assert.deepEqual(consumeJobRequestFile(workspace, "task-1"), payload);
   assert.equal(fs.existsSync(requestFile), false);
@@ -171,20 +172,23 @@ test("concurrent writers never leave a torn state.json for a reader", async () =
   saveState(workspace, { jobs });
   const stateFile = resolveStateFile(workspace);
 
-  const writer = spawn(
-    process.execPath,
-    [
-      "--input-type=module",
-      "-e",
-      `import { saveState } from ${JSON.stringify(pathToFileURL(STATE_MODULE).href)};
-       const jobs = ${JSON.stringify(jobs)};
-       const deadline = Date.now() + 2000;
-       while (Date.now() < deadline) {
-         saveState(${JSON.stringify(workspace)}, { jobs });
-       }`
-    ],
-    { env: process.env, stdio: ["ignore", "ignore", "pipe"] }
+  // The writer source is >100 KiB, over the Windows command-line limit, so it
+  // goes through a temp module instead of `-e`.
+  const writerFile = path.join(makeTempDir(), "writer.mjs");
+  fs.writeFileSync(
+    writerFile,
+    `import { saveState } from ${JSON.stringify(pathToFileURL(STATE_MODULE).href)};
+     const jobs = ${JSON.stringify(jobs)};
+     const deadline = Date.now() + 2000;
+     while (Date.now() < deadline) {
+       saveState(${JSON.stringify(workspace)}, { jobs });
+     }`
   );
+  const writer = spawn(process.execPath, [writerFile], { env: process.env, stdio: ["ignore", "ignore", "pipe"] });
+  const writerExit = new Promise((resolve, reject) => {
+    writer.on("error", reject);
+    writer.on("exit", (code, signal) => resolve({ code, signal }));
+  });
   let writerStderr = "";
   writer.stderr.on("data", (chunk) => {
     writerStderr += chunk;
@@ -204,7 +208,7 @@ test("concurrent writers never leave a torn state.json for a reader", async () =
     reads += 1;
   }
 
-  await new Promise((resolve) => writer.on("exit", resolve));
+  assert.deepEqual(await writerExit, { code: 0, signal: null }, writerStderr);
   assert.equal(writerStderr, "");
   assert.ok(reads > 100, `expected the reader to race the writer, got ${reads} reads`);
 });

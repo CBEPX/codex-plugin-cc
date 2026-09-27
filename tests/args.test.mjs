@@ -46,7 +46,7 @@ test("task --help prints usage and does not dispatch a Codex thread", () => {
   initGitRepo(repo);
   fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
 
-  const result = run("node", [SCRIPT, "task", "--help", "--cwd", repo, "--json"], {
+  const result = run(process.execPath, [SCRIPT, "task", "--help", "--cwd", repo, "--json"], {
     cwd: repo,
     env: buildEnv(binDir)
   });
@@ -70,7 +70,7 @@ test("task unknown --flag errors without dispatching a Codex thread", () => {
   initGitRepo(repo);
   fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
 
-  const result = run("node", [SCRIPT, "task", "--not-a-real-flag", "--cwd", repo], {
+  const result = run(process.execPath, [SCRIPT, "task", "--not-a-real-flag", "--cwd", repo], {
     cwd: repo,
     env: buildEnv(binDir)
   });

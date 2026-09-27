@@ -11,9 +11,9 @@
   "scripts": {
     "bump-version": "node scripts/bump-version.mjs",
     "check-version": "node scripts/bump-version.mjs --check",
-    "prebuild": "mkdir -p plugins/codex/.generated/app-server-types && codex app-server generate-ts --out plugins/codex/.generated/app-server-types",
+    "prebuild": "node -e \"require('fs').mkdirSync('plugins/codex/.generated/app-server-types',{recursive:true})\" && codex app-server generate-ts --out plugins/codex/.generated/app-server-types",
     "build": "tsc -p tsconfig.app-server.json",
-    "test": "node --import ./tests/test-env.mjs --test tests/*.test.mjs"
+    "test": "node scripts/run-tests.mjs"
   },
   "devDependencies": {
     "@types/node": "^25.5.0",

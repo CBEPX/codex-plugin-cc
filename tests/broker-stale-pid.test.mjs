@@ -8,7 +8,7 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
-import { makeTempDir, run } from "./helpers.mjs";
+import { IS_WIN, makeTempDir, run } from "./helpers.mjs";
 import { createBrokerEndpoint, parseBrokerEndpoint } from "../plugins/codex/scripts/lib/broker-endpoint.mjs";
 import {
   clearBrokerSession,
@@ -118,7 +118,7 @@ test("session end teardown does not signal a recycled pid that is not this broke
   });
 
   try {
-    const cleanup = run("node", [SESSION_HOOK, "SessionEnd"], {
+    const cleanup = run(process.execPath, [SESSION_HOOK, "SessionEnd"], {
       cwd: workspace,
       env: process.env,
       input: JSON.stringify({ hook_event_name: "SessionEnd", cwd: workspace })
@@ -155,7 +155,7 @@ function spawnOwnedBroker(workspace, { binDir, sessionDir, endpoint, env }) {
 }
 
 function runSessionEndHook(workspace, { env = process.env, sessionId = null } = {}) {
-  return run("node", [SESSION_HOOK, "SessionEnd"], {
+  return run(process.execPath, [SESSION_HOOK, "SessionEnd"], {
     cwd: workspace,
     env: sessionId ? { ...env, CODEX_COMPANION_SESSION_ID: sessionId } : env,
     input: JSON.stringify({
@@ -170,7 +170,7 @@ function runSessionEndHook(workspace, { env = process.env, sessionId = null } = 
 // server could never accept the hook's connection. Anything that answers the hook
 // from within the test has to run it asynchronously.
 function runSessionEndHookAsync(workspace, { env = process.env, sessionId = null } = {}) {
-  const child = spawn("node", [SESSION_HOOK, "SessionEnd"], {
+  const child = spawn(process.execPath, [SESSION_HOOK, "SessionEnd"], {
     cwd: workspace,
     env: sessionId ? { ...env, CODEX_COMPANION_SESSION_ID: sessionId } : env,
     stdio: ["pipe", "pipe", "pipe"]
@@ -348,7 +348,7 @@ test("session end keeps the broker while an owned background job runs, and the b
     FAKE_CODEX_TURN_DELAY_MS: "3000"
   });
 
-  const launched = run("node", [SCRIPT, "task", "--background", "--json", "keep me running"], { cwd: workspace, env });
+  const launched = run(process.execPath, [SCRIPT, "task", "--background", "--json", "keep me running"], { cwd: workspace, env });
   assert.equal(launched.status, 0, launched.stderr);
   const { jobId } = JSON.parse(launched.stdout);
 
@@ -423,7 +423,7 @@ test("session end does not clear the record of a replacement broker started duri
   });
 
   try {
-    const hook = spawn("node", [SESSION_HOOK, "SessionEnd"], { cwd: workspace, env: process.env, stdio: ["pipe", "pipe", "pipe"] });
+    const hook = spawn(process.execPath, [SESSION_HOOK, "SessionEnd"], { cwd: workspace, env: process.env, stdio: ["pipe", "pipe", "pipe"] });
     hook.stdin.end(JSON.stringify({ hook_event_name: "SessionEnd", cwd: workspace }));
     const code = await new Promise((resolve) => hook.on("exit", resolve));
 
@@ -440,7 +440,8 @@ test("session end does not clear the record of a replacement broker started duri
 // active-background check trusts that stale `running` record, every later
 // SessionEnd in the workspace takes the early return and the broker — plus its
 // app-server child — lingers forever.
-test("session end reaps a SIGKILLed background worker instead of keeping its broker alive", async (t) => {
+// Windows: the scenario kills the worker's process group with kill(-pid), which is POSIX-only.
+test("session end reaps a SIGKILLed background worker instead of keeping its broker alive", { skip: IS_WIN }, async (t) => {
   const binDir = makeTempDir();
   installFakeCodex(binDir);
   const workspace = makeTempDir();
@@ -451,7 +452,7 @@ test("session end reaps a SIGKILLed background worker instead of keeping its bro
     FAKE_CODEX_TURN_DELAY_MS: "20000"
   });
 
-  const launched = run("node", [SCRIPT, "task", "--background", "--json", "die mid-turn"], { cwd: workspace, env });
+  const launched = run(process.execPath, [SCRIPT, "task", "--background", "--json", "die mid-turn"], { cwd: workspace, env });
   assert.equal(launched.status, 0, launched.stderr);
   const { jobId } = JSON.parse(launched.stdout);
 
@@ -1095,7 +1096,7 @@ test("SessionEnd leaves a recorded broker pid alone when its identity no longer 
   const sessionDir = makeTempDir("cxc-");
   const endpoint = createBrokerEndpoint(sessionDir);
   saveBrokerSession(workspace, { endpoint, pidFile: null, logFile: null, sessionDir, pid: process.pid, pidIdentity: "darwin:definitely-not-this|nope" });
-  const hook = run("node", [SESSION_HOOK, "SessionEnd"], { cwd: workspace, env: buildEnv(binDir), input: JSON.stringify({ cwd: workspace, session_id: "sess-identity" }) });
+  const hook = run(process.execPath, [SESSION_HOOK, "SessionEnd"], { cwd: workspace, env: buildEnv(binDir), input: JSON.stringify({ cwd: workspace, session_id: "sess-identity" }) });
   assert.equal(hook.status, 0, hook.stderr);
   assert.match(hook.stderr, /signalled=false/);
   assert.match(hook.stderr, /identity-mismatch/);

@@ -1,14 +1,17 @@
+import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
 
 import { createBrokerEndpoint, parseBrokerEndpoint } from "../plugins/codex/scripts/lib/broker-endpoint.mjs";
 
 test("createBrokerEndpoint uses Unix sockets on non-Windows platforms", () => {
+  // The socket path is joined with the host's path module, so build the expectation the same way.
+  const socketPath = path.join("/tmp/cxc-12345", "broker.sock");
   const endpoint = createBrokerEndpoint("/tmp/cxc-12345", "darwin");
-  assert.equal(endpoint, "unix:/tmp/cxc-12345/broker.sock");
+  assert.equal(endpoint, `unix:${socketPath}`);
   assert.deepEqual(parseBrokerEndpoint(endpoint), {
     kind: "unix",
-    path: "/tmp/cxc-12345/broker.sock"
+    path: socketPath
   });
 });
 

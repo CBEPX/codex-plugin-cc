@@ -58,7 +58,7 @@ function makeVersionFixture() {
 test("bump-version updates every release manifest", () => {
   const root = makeVersionFixture();
 
-  const result = run("node", [SCRIPT, "--root", root, "1.2.3"], {
+  const result = run(process.execPath, [SCRIPT, "--root", root, "1.2.3"], {
     cwd: ROOT
   });
 
@@ -78,7 +78,7 @@ test("bump-version check mode reports stale metadata", () => {
     version: "1.0.3"
   });
 
-  const result = run("node", [SCRIPT, "--root", root, "--check"], {
+  const result = run(process.execPath, [SCRIPT, "--root", root, "--check"], {
     cwd: ROOT
   });
 
@@ -95,7 +95,7 @@ test("bump-version check mode reports a lockfile whose name drifted from package
   lock.packages[""].name = "@upstream/codex-plugin-cc";
   writeJson(lockPath, lock);
 
-  const result = run("node", [SCRIPT, "--root", root, "--check"], { cwd: ROOT });
+  const result = run(process.execPath, [SCRIPT, "--root", root, "--check"], { cwd: ROOT });
 
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /package-lock\.json name: expected @openai\/codex-plugin-cc, found @upstream\/codex-plugin-cc/);
@@ -105,7 +105,7 @@ test("bump-version check mode reports a lockfile whose name drifted from package
 test("bump-version check mode passes when the lockfile identity matches", () => {
   const root = makeVersionFixture();
 
-  const result = run("node", [SCRIPT, "--root", root, "--check", "1.0.2"], { cwd: ROOT });
+  const result = run(process.execPath, [SCRIPT, "--root", root, "--check", "1.0.2"], { cwd: ROOT });
 
   assert.equal(result.status, 0, result.stderr);
 });
