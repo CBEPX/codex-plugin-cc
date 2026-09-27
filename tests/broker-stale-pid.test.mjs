@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { EventEmitter } from "node:events";
 import net from "node:net";
 import path from "node:path";
 import test from "node:test";
@@ -905,3 +906,18 @@ test(
     }
   }
 );
+
+test("waitForBrokerEndpoint gives up on a socket that never connects or errors (#773)", async () => {
+  let destroyed = 0;
+  const connectImpl = () => {
+    const socket = new EventEmitter();
+    socket.destroy = () => { destroyed += 1; socket.emit("close"); };
+    socket.end = () => {};
+    return socket;
+  };
+  const started = Date.now();
+  const ready = await waitForBrokerEndpoint("unix:/nonexistent/broker.sock", 600, { connectImpl });
+  assert.equal(ready, false);
+  assert.ok(Date.now() - started < 1500, "must respect the overall timeout");
+  assert.ok(destroyed >= 1, "hung probe sockets must be destroyed");
+});

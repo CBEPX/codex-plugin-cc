@@ -204,6 +204,8 @@ Use it to:
 - see the latest completed job
 - confirm whether a task is still running
 
+`status <id> --wait [--timeout-ms <ms>]` blocks until the job reaches a terminal status; it exits 1 when the wait times out while the job is still running (with `--json` too, whose snapshot carries `waitTimedOut: true`), and the text output ends with `Timed out after <N>s while the job was still running.`
+
 ### `/codex:result`
 
 Shows the final stored Codex output for a finished job.

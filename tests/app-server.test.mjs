@@ -1,10 +1,11 @@
+import { EventEmitter } from "node:events";
 import net from "node:net";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { makeTempDir } from "./helpers.mjs";
-import { AppServerClientBase, CodexAppServerClient } from "../plugins/codex/scripts/lib/app-server.mjs";
+import { AppServerClientBase, BrokerCodexAppServerClient, CodexAppServerClient } from "../plugins/codex/scripts/lib/app-server.mjs";
 import { createBrokerEndpoint, parseBrokerEndpoint } from "../plugins/codex/scripts/lib/broker-endpoint.mjs";
 
 /** Minimal client that records the JSON-RPC messages it would send. */
@@ -175,4 +176,16 @@ test("a broker that drops the connection during initialize falls back to a direc
 
   client = await CodexAppServerClient.connect(binDir, { brokerEndpoint: endpoint, env: buildEnv(binDir) });
   assert.equal(client.transport, "direct", "a broker that hangs up must not fail the run");
+});
+
+test("broker client connect times out with ETIMEDOUT instead of hanging", async () => {
+  const connectImpl = () => {
+    const socket = new EventEmitter();
+    socket.setEncoding = () => {};
+    socket.destroy = () => socket.emit("close");
+    socket.end = () => {};
+    return socket;
+  };
+  const client = new BrokerCodexAppServerClient(process.cwd(), { brokerEndpoint: "unix:/nonexistent.sock", connectImpl, connectTimeoutMs: 200 });
+  await assert.rejects(client.initialize(), (error) => error.code === "ETIMEDOUT");
 });

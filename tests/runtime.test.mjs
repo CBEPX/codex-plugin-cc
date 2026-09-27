@@ -1595,7 +1595,8 @@ test("status --wait times out cleanly when a job is still active", () => {
     cwd: workspace
   });
 
-  assert.equal(result.status, 0, result.stderr);
+  // A timed-out wait exits 1 in JSON mode too (#774); the snapshot itself is unchanged.
+  assert.equal(result.status, 1, result.stderr);
   const payload = JSON.parse(result.stdout);
   assert.equal(payload.job.id, "task-live");
   assert.equal(payload.job.status, "running");
@@ -3739,4 +3740,20 @@ test("task completes when the turn/start response carries no turn id (#781)", ()
   assert.equal(result.error, undefined, "must not hang");
   assert.equal(result.status, 0, result.stderr);
   assert.match(JSON.parse(result.stdout).rawOutput, /./);
+});
+
+test("status --wait reports a timeout in text output and exits 1 while the job is still active (#774)", () => {
+  const repo = makeTempDir();
+  initGitRepo(repo);
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const env = buildEnv(binDir, { FAKE_CODEX_TURN_DELAY_MS: "4000" });
+  const launched = run("node", [SCRIPT, "task", "--background", "--json", "slow"], { cwd: repo, env });
+  assert.equal(launched.status, 0, launched.stderr);
+  const jobId = JSON.parse(launched.stdout).jobId;
+  const status = run("node", [SCRIPT, "status", jobId, "--wait", "--timeout-ms", "500"], { cwd: repo, env });
+  assert.equal(status.status, 1);
+  assert.match(status.stdout, /Timed out after 1s while the job was still running\./);
+  const done = run("node", [SCRIPT, "result", jobId, "--wait", "--timeout-ms", "20000"], { cwd: repo, env });
+  assert.equal(done.status, 0, done.stderr);
 });

@@ -1189,6 +1189,16 @@ async function handleStatus(argv) {
           pollIntervalMs: options["poll-interval-ms"]
         })
       : buildSingleJobSnapshot(cwd, reference);
+    if (snapshot.waitTimedOut) {
+      const seconds = Math.max(1, Math.round(snapshot.timeoutMs / 1000));
+      outputCommandResult(
+        snapshot,
+        `${renderJobStatusReport(snapshot.job)}\nTimed out after ${seconds}s while the job was still running.\n`,
+        options.json
+      );
+      process.exitCode = 1;
+      return;
+    }
     outputCommandResult(snapshot, renderJobStatusReport(snapshot.job), options.json);
     return;
   }

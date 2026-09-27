@@ -22,12 +22,30 @@ function connectToEndpoint(endpoint) {
   return net.createConnection({ path: target.path });
 }
 
-export async function waitForBrokerEndpoint(endpoint, timeoutMs = 2000) {
+const PROBE_ATTEMPT_MS = 500;
+
+export async function waitForBrokerEndpoint(endpoint, timeoutMs = 2000, options = {}) {
+  const connectImpl = options.connectImpl ?? ((socketPath) => net.createConnection({ path: socketPath }));
+  const target = parseBrokerEndpoint(endpoint);
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
+    const attemptMs = Math.max(1, Math.min(PROBE_ATTEMPT_MS, timeoutMs - (Date.now() - start)));
     const ready = await new Promise((resolve) => {
-      const socket = connectToEndpoint(endpoint);
+      const socket = connectImpl(target.path);
       let connected = false;
+      let settled = false;
+      const finish = (value) => {
+        if (!settled) {
+          settled = true;
+          clearTimeout(timer);
+          resolve(value);
+        }
+      };
+      // A socket stuck in `connecting` fires neither connect nor error (#773).
+      const timer = setTimeout(() => {
+        socket.destroy();
+        finish(false);
+      }, attemptMs);
       socket.on("connect", () => {
         connected = true;
         socket.end();
@@ -35,8 +53,8 @@ export async function waitForBrokerEndpoint(endpoint, timeoutMs = 2000) {
       // Report ready only once the probe connection is fully closed. A probe the
       // broker still sees as open is a phantom client: it holds off the idle
       // timer and makes the broker refuse a shutdown.
-      socket.on("close", () => resolve(connected));
-      socket.on("error", () => resolve(false));
+      socket.on("close", () => finish(connected));
+      socket.on("error", () => finish(false));
     });
     if (ready) {
       return true;
