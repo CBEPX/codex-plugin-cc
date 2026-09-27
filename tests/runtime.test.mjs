@@ -3788,8 +3788,10 @@ test("task rejects a non-positive turn budget", () => {
 // Recording the worker pid on the queued record (so a queued job can be
 // cancelled at all) means cancel can now kill a worker *before* it consumed its
 // private one-shot payload. A cancelled job is terminal, so the reaper will
-// never look at it again — cancel has to release the file itself.
-test("cancel removes the private request payload of a job killed in the queued window", async (t) => {
+// never look at it again — cancel has to release the file itself. The worker's
+// identity is recorded, so the kill is provable (win32 has no identity yet, and
+// there a live unprovable worker keeps the job running instead).
+test("cancel removes the private request payload of a job killed in the queued window", { skip: process.platform === "win32" }, async (t) => {
   const repo = seededRepo();
   const stateDir = resolveStateDir(repo);
   const jobsDir = path.join(stateDir, "jobs");
@@ -3824,6 +3826,7 @@ test("cancel removes the private request payload of a job killed in the queued w
     title: "Codex Task",
     background: true,
     pid: sleeper.pid,
+    pidIdentity: getProcessIdentity(sleeper.pid),
     logFile: null,
     requestFile,
     request: { prompt: "hi", config: { auth_header: "[redacted]" } },
