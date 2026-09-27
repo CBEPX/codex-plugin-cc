@@ -3659,3 +3659,56 @@ test("cancel removes the private request payload of a job killed in the queued w
   assert.equal(stored.requestFile, null);
   assert.equal(fs.readFileSync(path.join(stateDir, "state.json"), "utf8").includes(secret), false);
 });
+
+test("task fails fast when Codex sends a terminal error notification (#698)", () => {
+  const repo = makeTempDir();
+  initGitRepo(repo);
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "error-notification");
+  const result = run("node", [SCRIPT, "task", "do the thing"], {
+    cwd: repo,
+    env: buildEnv(binDir),
+    timeout: 15000
+  });
+  assert.equal(result.error, undefined, "companion must not hang until the test timeout");
+  assert.equal(result.status, 1, result.stderr);
+  assert.match(result.stdout, /Selected model is at capacity/);
+  assert.match(result.stderr, /Codex error: Selected model is at capacity/);
+});
+
+test("task keeps running through an error notification that Codex will retry", () => {
+  const repo = makeTempDir();
+  initGitRepo(repo);
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "error-notification-retry");
+  const result = run("node", [SCRIPT, "task", "--json", "do the thing"], { cwd: repo, env: buildEnv(binDir), timeout: 15000 });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(JSON.parse(result.stdout).rawOutput, /./);
+});
+
+test("task survives fileChange started items that omit changes (#775)", () => {
+  const repo = makeTempDir();
+  initGitRepo(repo);
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "file-change-no-changes");
+  const result = run("node", [SCRIPT, "task", "--json", "edit"], { cwd: repo, env: buildEnv(binDir), timeout: 15000 });
+  assert.equal(result.status, 0, result.stderr);
+  assert.doesNotMatch(result.stderr, /Cannot read properties of undefined/);
+});
+
+test("a server-side turn failure that terminates normally still records an errorMessage (#757)", () => {
+  const repo = makeTempDir();
+  initGitRepo(repo);
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "turn-failed-silently");
+  const launched = run("node", [SCRIPT, "task", "--background", "--json", "do the thing"], { cwd: repo, env: buildEnv(binDir) });
+  assert.equal(launched.status, 0, launched.stderr);
+  const jobId = JSON.parse(launched.stdout).jobId;
+  const done = run("node", [SCRIPT, "result", jobId, "--wait", "--timeout-ms", "15000", "--json"], { cwd: repo, env: buildEnv(binDir) });
+  assert.equal(done.status, 0, done.stderr);
+  const status = run("node", [SCRIPT, "status", jobId], { cwd: repo, env: buildEnv(binDir) });
+  assert.equal(status.status, 0, status.stderr);
+  assert.match(status.stdout, /\| failed \|/);
+  assert.doesNotMatch(status.stdout, /Summary: \{$/m);
+  assert.match(status.stdout, /Codex turn ended with status "failed"/);
+});

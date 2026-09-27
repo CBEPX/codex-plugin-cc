@@ -665,7 +665,10 @@ async function executeTaskRun(request) {
   });
 
   const rawOutput = typeof result.finalMessage === "string" ? result.finalMessage : "";
-  const failureMessage = result.error?.message ?? result.stderr ?? "";
+  const turnStatus = result.turnStatus ?? null;
+  const failureMessage =
+    result.error?.message ??
+    (result.status !== 0 ? (result.stderr || `Codex turn ended with status "${turnStatus ?? "failed"}"`) : "");
   const rendered = renderTaskResult(
     {
       rawOutput,
@@ -694,7 +697,10 @@ async function executeTaskRun(request) {
     payload,
     rendered,
     errorMessage: failureMessage || null,
-    summary: firstMeaningfulLine(rawOutput, firstMeaningfulLine(failureMessage, `${taskMetadata.title} finished.`)),
+    summary:
+      result.status === 0
+        ? firstMeaningfulLine(rawOutput, `${taskMetadata.title} finished.`)
+        : firstMeaningfulLine(failureMessage, firstMeaningfulLine(rawOutput, `${taskMetadata.title} failed.`)),
     jobTitle: taskMetadata.title,
     jobClass: "task",
     write: Boolean(request.write)

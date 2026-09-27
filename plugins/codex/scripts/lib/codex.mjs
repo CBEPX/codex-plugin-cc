@@ -299,8 +299,10 @@ function describeStartedItem(state, item) {
         message: `Running command: ${shorten(item.command, 96)}`,
         phase: looksLikeVerificationCommand(item.command) ? "verifying" : "running"
       };
-    case "fileChange":
-      return { message: `Applying ${item.changes.length} file change(s).`, phase: "editing" };
+    case "fileChange": {
+      const count = Array.isArray(item.changes) ? item.changes.length : 0;
+      return { message: `Applying ${count} file change(s).`, phase: "editing" };
+    }
     case "mcpToolCall":
       return { message: `Calling ${item.server}/${item.tool}.`, phase: "investigating" };
     case "dynamicToolCall":
@@ -588,10 +590,19 @@ function applyTurnNotification(state, message) {
         emitProgress(state.onProgress, update?.message, update?.phase ?? null);
       }
       break;
-    case "error":
-      state.error = message.params.error;
-      emitProgress(state.onProgress, `Codex error: ${message.params.error.message}`, "failed");
+    case "error": {
+      const error = message.params.error ?? { message: "Codex reported an error." };
+      state.error = error;
+      if (message.params.willRetry === true) {
+        emitProgress(state.onProgress, `Codex error (retrying): ${error.message}`, null);
+        break;
+      }
+      emitProgress(state.onProgress, `Codex error: ${error.message}`, "failed");
+      // Terminal: no turn/completed follows a non-retried error (#698). completeTurn
+      // is idempotent, so a late turn/completed is harmless.
+      completeTurn(state, { id: state.turnId ?? "errored-turn", status: "failed", error });
       break;
+    }
     case "turn/completed":
       if ((message.params.threadId ?? null) !== state.threadId) {
         state.activeSubagentTurns.delete(message.params.threadId);
@@ -1369,6 +1380,7 @@ export async function runAppServerTurn(cwd, options = {}) {
 
     return {
       status: buildResultStatus(turnState),
+      turnStatus: turnState.finalTurn?.status ?? null,
       threadId,
       turnId: turnState.turnId,
       resolved,

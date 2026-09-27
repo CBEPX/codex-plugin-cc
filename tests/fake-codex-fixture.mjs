@@ -513,6 +513,44 @@ rl.on("line", (line) => {
           ? structuredReviewPayload(prompt)
           : taskPayload(prompt, thread.name && thread.name.startsWith("Codex Companion Task") && prompt.includes("Continue from the current thread state"));
 
+        if (BEHAVIOR === "error-notification" || BEHAVIOR === "error-notification-retry") {
+          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+          send({
+            method: "error",
+            params: {
+              threadId: thread.id,
+              turnId,
+              willRetry: BEHAVIOR === "error-notification-retry",
+              error: { message: "Selected model is at capacity" }
+            }
+          });
+          if (BEHAVIOR === "error-notification-retry") {
+            // Codex retried and finished: the earlier error was not terminal.
+            emitTurnCompleted(thread.id, turnId, [
+              { completed: { type: "agentMessage", id: "msg_" + turnId, text: payload, phase: "final_answer" } }
+            ]);
+          }
+          // error-notification: no turn/completed ever arrives.
+          break;
+        }
+        if (BEHAVIOR === "file-change-no-changes") {
+          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+          send({ method: "item/started", params: { threadId: thread.id, turnId, item: { type: "fileChange", id: "fc_" + turnId } } });
+          emitTurnCompleted(thread.id, turnId, [
+            { completed: { type: "agentMessage", id: "msg_" + turnId, text: payload, phase: "final_answer" } }
+          ]);
+          break;
+        }
+        if (BEHAVIOR === "turn-failed-silently") {
+          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+          send({
+            method: "item/completed",
+            params: { threadId: thread.id, turnId, item: { type: "agentMessage", id: "msg_" + turnId, text: JSON.stringify({ error: "quota exhausted" }, null, 2), phase: "final_answer" } }
+          });
+          send({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(turnId, "failed") } });
+          break;
+        }
+
         if (
           BEHAVIOR === "with-subagent" ||
           BEHAVIOR === "with-late-subagent-message" ||
