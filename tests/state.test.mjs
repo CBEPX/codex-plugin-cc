@@ -14,6 +14,7 @@ import {
   resolveJobFile,
   resolveJobLogFile,
   resolveJobRequestFile,
+  resolveFallbackStateRoot,
   resolveStateDir,
   resolveStateFile,
   saveState,
@@ -787,4 +788,22 @@ test("an entry with no checkable PID holds its place for the long grace", () => 
 
   assert.equal(withStateLock(aged, () => "ok", { waitMs: 500 }), "ok");
   assert.equal(fs.existsSync(agedEntry), false, "past the long grace it is debris");
+});
+
+test("fallback state root is private to the user and namespaced per plugin root (#521/#609)", { skip: process.platform === "win32" }, () => {
+  const tmp = makeTempDir();
+  const pluginA = makeTempDir();
+  const pluginB = makeTempDir();
+  const a = resolveFallbackStateRoot({ env: {}, tmpdir: tmp, pluginRoot: pluginA });
+  const b = resolveFallbackStateRoot({ env: {}, tmpdir: tmp, pluginRoot: pluginB });
+  assert.notEqual(a, b);
+  assert.ok(a.startsWith(path.join(tmp, `codex-companion-${process.getuid()}`)));
+  assert.equal(fs.statSync(path.dirname(a)).mode & 0o077, 0);
+});
+
+test("fallback state root refuses a pre-existing world-accessible directory", { skip: process.platform === "win32" }, () => {
+  const tmp = makeTempDir();
+  const shared = path.join(tmp, `codex-companion-${process.getuid()}`);
+  fs.mkdirSync(shared, { mode: 0o755 });
+  assert.throws(() => resolveFallbackStateRoot({ env: {}, tmpdir: tmp, pluginRoot: makeTempDir() }), /Refusing to use shared state directory/);
 });

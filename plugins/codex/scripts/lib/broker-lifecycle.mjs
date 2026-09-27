@@ -142,17 +142,47 @@ function resolveBrokerStateFile(cwd) {
   return path.join(resolveStateDir(cwd), BROKER_STATE_FILE);
 }
 
+function describeBrokerRecordProblem(record) {
+  if (!record || typeof record !== "object" || Array.isArray(record)) {
+    return "not an object";
+  }
+  if (typeof record.endpoint !== "string") {
+    return "endpoint is not a string";
+  }
+  try {
+    parseBrokerEndpoint(record.endpoint);
+  } catch (error) {
+    return error.message.replace(/\.$/, "");
+  }
+  if (record.pid != null && !(Number.isInteger(record.pid) && record.pid > 0)) {
+    return "pid is not a positive integer";
+  }
+  for (const key of ["pidFile", "logFile", "sessionDir"]) {
+    if (record[key] != null && !(typeof record[key] === "string" && path.isAbsolute(record[key]))) {
+      return `${key} is not an absolute path`;
+    }
+  }
+  return null;
+}
+
 export function loadBrokerSession(cwd) {
   const stateFile = resolveBrokerStateFile(cwd);
   if (!fs.existsSync(stateFile)) {
     return null;
   }
 
+  let record;
   try {
-    return JSON.parse(fs.readFileSync(stateFile, "utf8"));
+    record = JSON.parse(fs.readFileSync(stateFile, "utf8"));
   } catch {
     return null;
   }
+  const problem = describeBrokerRecordProblem(record);
+  if (problem) {
+    process.stderr.write(`[codex] Ignoring malformed broker.json at ${stateFile}: ${problem}.\n`);
+    return null;
+  }
+  return record;
 }
 
 export function saveBrokerSession(cwd, session) {

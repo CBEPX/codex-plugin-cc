@@ -1021,3 +1021,30 @@ test("ensureBrokerSession retries the readiness probe before giving up on a slow
     clearBrokerSession(workspace);
   }
 });
+
+test("loadBrokerSession ignores a malformed record instead of trusting it", () => {
+  const workspace = makeTempDir();
+  const stateDir = resolveStateDir(workspace);
+  fs.mkdirSync(stateDir, { recursive: true });
+  const file = path.join(stateDir, "broker.json");
+  const notes = [];
+  const originalWrite = process.stderr.write;
+  process.stderr.write = (chunk) => (notes.push(String(chunk)), true);
+  try {
+    for (const bad of [
+      "[]",
+      JSON.stringify({ endpoint: "ftp://x", pid: 1 }),
+      JSON.stringify({ endpoint: "unix:/tmp/x.sock", pid: -5 }),
+      JSON.stringify({ endpoint: "unix:/tmp/x.sock", pid: 1, pidFile: "relative/broker.pid" })
+    ]) {
+      fs.writeFileSync(file, bad);
+      assert.equal(loadBrokerSession(workspace), null, bad);
+    }
+    fs.writeFileSync(file, JSON.stringify({ endpoint: "unix:/tmp/x.sock", pid: null, pidFile: null, logFile: null, sessionDir: null }));
+    assert.ok(loadBrokerSession(workspace));
+  } finally {
+    process.stderr.write = originalWrite;
+  }
+  assert.equal(notes.length, 4);
+  assert.ok(notes.every((note) => note.startsWith(`[codex] Ignoring malformed broker.json at ${file}: `)));
+});

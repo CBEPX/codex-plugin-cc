@@ -2,13 +2,14 @@ import { createHash, randomBytes } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { isPidAlive } from "./process.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
 const STATE_VERSION = 1;
 const PLUGIN_DATA_ENV = "CLAUDE_PLUGIN_DATA";
-const FALLBACK_STATE_ROOT_DIR = path.join(os.tmpdir(), "codex-companion");
+const SCRIPT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 const STATE_FILE_NAME = "state.json";
 const JOBS_DIR_NAME = "jobs";
 const MAX_JOBS = 50;
@@ -27,6 +28,32 @@ function defaultState() {
   };
 }
 
+export function resolveFallbackStateRoot({
+  env = process.env,
+  tmpdir = os.tmpdir(),
+  uid = typeof process.getuid === "function" ? process.getuid() : null,
+  pluginRoot = env.CLAUDE_PLUGIN_ROOT || SCRIPT_ROOT
+} = {}) {
+  let canonicalPluginRoot = pluginRoot;
+  try {
+    canonicalPluginRoot = fs.realpathSync.native(pluginRoot);
+  } catch {
+    // keep as given
+  }
+  const userDir = path.join(tmpdir, `codex-companion-${uid ?? "user"}`);
+  fs.mkdirSync(userDir, { recursive: true, mode: 0o700 });
+  if (process.platform !== "win32") {
+    const stats = fs.statSync(userDir);
+    if ((uid !== null && stats.uid !== uid) || (stats.mode & 0o077) !== 0) {
+      throw new Error(
+        `Refusing to use shared state directory ${userDir}: owned by another user or group/world accessible. Set CLAUDE_PLUGIN_DATA.`
+      );
+    }
+  }
+  // ponytail: plugin identity = hash of the install root; sibling plugins/forks get separate roots (#609)
+  return path.join(userDir, createHash("sha256").update(canonicalPluginRoot).digest("hex").slice(0, 12));
+}
+
 export function resolveStateDir(cwd) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   let canonicalWorkspaceRoot = workspaceRoot;
@@ -40,7 +67,7 @@ export function resolveStateDir(cwd) {
   const slug = slugSource.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "workspace";
   const hash = createHash("sha256").update(canonicalWorkspaceRoot).digest("hex").slice(0, 16);
   const pluginDataDir = process.env[PLUGIN_DATA_ENV];
-  const stateRoot = pluginDataDir ? path.join(pluginDataDir, "state") : FALLBACK_STATE_ROOT_DIR;
+  const stateRoot = pluginDataDir ? path.join(pluginDataDir, "state") : resolveFallbackStateRoot();
   return path.join(stateRoot, `${slug}-${hash}`);
 }
 
