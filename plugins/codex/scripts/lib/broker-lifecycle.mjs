@@ -276,27 +276,22 @@ export async function ensureBrokerSession(cwd, options = {}) {
   const ready = await waitForBrokerEndpoint(endpoint, options.timeoutMs ?? 2000);
   if (!ready) {
     // A child that already exited is not signalled at all: its pid may belong to
-    // someone else by now. A live one is killed through its handle, which cannot
-    // reach a recycled pid; only if that fails does the numeric (process-group)
-    // kill run, and then only after identity or command-line proof.
-    let fallback = false;
+    // someone else by now. A live, unreaped one is a detached group leader whose
+    // pid/pgid cannot be reused while our handle has not seen it exit, so its
+    // whole group is killed — a broker stuck in connect has no cleanup handlers
+    // yet and would leave its app-server child behind. The handle is the fallback.
     if (child.exitCode === null && child.signalCode === null) {
+      let delivered = false;
       try {
-        fallback = !child.kill("SIGTERM");
-      } catch {
-        fallback = true;
+        delivered = killProcess(child.pid)?.delivered !== false;
+      } catch {}
+      if (!delivered) {
+        try {
+          child.kill("SIGTERM");
+        } catch {}
       }
     }
-    teardownBrokerSession({
-      endpoint,
-      pidFile,
-      logFile,
-      sessionDir,
-      pid: fallback ? (child.pid ?? null) : null,
-      pidIdentity,
-      killProcess: fallback ? killProcess : null,
-      ownsProcess: ownsProcessImpl
-    });
+    teardownBrokerSession({ endpoint, pidFile, logFile, sessionDir });
     return null;
   }
 

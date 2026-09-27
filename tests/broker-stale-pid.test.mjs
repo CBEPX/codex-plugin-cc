@@ -1108,25 +1108,40 @@ test("ensureBrokerSession kills a fresh broker that never becomes ready", async 
   const binDir = makeTempDir();
   installFakeCodex(binDir);
   const workspace = makeTempDir();
-  const scriptPath = path.join(makeTempDir(), "never-listens.mjs");
-  fs.writeFileSync(scriptPath, "setInterval(() => {}, 1000);\n");
+  const scriptDir = makeTempDir();
+  const scriptPath = path.join(scriptDir, "never-listens.mjs");
+  const descendantPidFile = path.join(scriptDir, "descendant.pid");
+  // Like a broker stuck in connect: it has an app-server child and no cleanup
+  // handlers yet, so only a process-group kill takes the descendant down.
+  fs.writeFileSync(
+    scriptPath,
+    `import { spawn } from "node:child_process";\n` +
+      `import fs from "node:fs";\n` +
+      `const d = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });\n` +
+      `fs.writeFileSync(${JSON.stringify(descendantPidFile)}, String(d.pid));\n` +
+      `setInterval(() => {}, 1000);\n`
+  );
   const killed = [];
   const spawned = [];
+  let descendant = null;
   try {
-    const session = await ensureBrokerSession(workspace, { env: buildEnv(binDir), scriptPath, timeoutMs: 300, killProcess: recordingKill(killed),
+    const session = await ensureBrokerSession(workspace, { env: buildEnv(binDir), scriptPath, timeoutMs: 500, killProcess: recordingKill(killed),
       // An identity that cannot be read (win32) must not keep the child alive.
       getProcessIdentityImpl: (pid) => (spawned.push(pid), null)
     });
     assert.equal(session, null);
     assert.equal(spawned.length, 1);
+    assert.deepEqual(killed, [spawned[0]], "the live fresh child is killed as a process group");
     assert.equal(loadBrokerSession(workspace), null);
+    descendant = Number(fs.readFileSync(descendantPidFile, "utf8"));
     const deadline = Date.now() + 5000;
-    while (isAlive(spawned[0]) && Date.now() < deadline) {
+    while ((isAlive(spawned[0]) || isAlive(descendant)) && Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
     assert.equal(isAlive(spawned[0]), false, "the fresh child must be gone");
+    assert.equal(isAlive(descendant), false, "its app-server descendant must be gone too");
   } finally {
-    for (const pid of spawned) { try { process.kill(pid, "SIGKILL"); } catch {} }
+    for (const pid of [...spawned, descendant].filter(Boolean)) { try { process.kill(pid, "SIGKILL"); } catch {} }
   }
 });
 
