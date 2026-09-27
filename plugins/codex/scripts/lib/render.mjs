@@ -126,7 +126,8 @@ function pushJobDetails(lines, job, options = {}) {
   if (job.summary) {
     lines.push(`  Summary: ${job.summary}`);
   }
-  if (job.status === "failed" && job.errorMessage) {
+  const errorText = job.errorMessage?.trim();
+  if (job.status === "failed" && errorText && errorText !== job.summary?.trim()) {
     lines.push(`  Error: ${job.errorMessage}`);
   }
   if (job.phase) {

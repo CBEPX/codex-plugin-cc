@@ -592,11 +592,11 @@ function applyTurnNotification(state, message) {
       break;
     case "error": {
       const error = message.params.error ?? { message: "Codex reported an error." };
-      state.error = error;
       if (message.params.willRetry === true) {
         emitProgress(state.onProgress, `Codex error (retrying): ${error.message}`, null);
         break;
       }
+      state.error = error;
       emitProgress(state.onProgress, `Codex error: ${error.message}`, "failed");
       // Terminal: no turn/completed follows a non-retried error (#698). completeTurn
       // is idempotent, so a late turn/completed is harmless.

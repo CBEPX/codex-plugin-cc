@@ -3684,6 +3684,9 @@ test("task keeps running through an error notification that Codex will retry", (
   const result = run("node", [SCRIPT, "task", "--json", "do the thing"], { cwd: repo, env: buildEnv(binDir), timeout: 15000 });
   assert.equal(result.status, 0, result.stderr);
   assert.match(JSON.parse(result.stdout).rawOutput, /./);
+  const stored = readPersistedJob(repo);
+  assert.equal(stored.status, "completed");
+  assert.equal(stored.errorMessage, null);
 });
 
 test("task survives fileChange started items that omit changes (#775)", () => {
