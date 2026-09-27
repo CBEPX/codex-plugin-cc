@@ -449,6 +449,16 @@ test("reapDeadJobs keeps a legacy running job whose pid still runs the companion
   assert.equal(reaped[0].status, "running");
 });
 
+// A legacy worker that died but was never reaped by its parent stays a zombie:
+// alive to kill 0, `<defunct>` to processCommandLine. It is failed, not signalled.
+test("reapDeadJobs fails a legacy running job whose worker is a zombie", () => {
+  const workspace = makeTempDir();
+  seedJob(workspace, { id: "job-legacy-zombie", status: "running", phase: "delegating", pid: process.pid, logFile: null });
+  const reaped = reapDeadJobs(workspace, listJobs(workspace), { platform: "linux", processCommandLineImpl: () => "<defunct>" });
+  assert.equal(reaped[0].status, "failed");
+  assert.equal(reaped[0].errorMessage, `worker exited before completing (worker pid ${process.pid} now belongs to an unrelated process)`);
+});
+
 test("reapDeadJobs keeps a legacy running job whose command line cannot be read", () => {
   const workspace = makeTempDir();
   seedJob(workspace, { id: "job-legacy-unknown", status: "running", phase: "delegating", pid: process.pid, logFile: null });

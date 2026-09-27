@@ -61,7 +61,7 @@ function looksLikeMissingProcessMessage(text) {
 }
 
 // Command line of a running process, or null when it is gone, unreadable or
-// empty (or the platform has no `ps`). Callers use it to prove a recorded PID is
+// empty (or the platform has no `ps`), and "<defunct>" for a zombie. Callers use it to prove a recorded PID is
 // still the process they believe it is before signalling it — PIDs get recycled.
 // It must be whole: `ps` cuts at $COLUMNS (procps, even when piped), and a cut
 // line can lose the marker a caller matches on.
@@ -79,7 +79,16 @@ export function processCommandLine(pid, options = {}) {
     try {
       const readFileSyncImpl = options.readFileSyncImpl ?? fs.readFileSync;
       const raw = String(readFileSyncImpl(`/proc/${pid}/cmdline`, "utf8"));
-      return raw.split("\0").filter(Boolean).join(" ").trim() || null;
+      const line = raw.split("\0").filter(Boolean).join(" ").trim();
+      if (line) {
+        return line;
+      }
+      // A zombie's cmdline is empty too. Say so the way `ps` does — no companion
+      // marker, so callers treat it as not theirs and never signal it. State is
+      // field 3, right after the last ")" (`comm` may hold parentheses).
+      const stat = String(readFileSyncImpl(`/proc/${pid}/stat`, "utf8"));
+      const state = stat.charAt(stat.lastIndexOf(")") + 2);
+      return state === "Z" || state === "X" ? "<defunct>" : null;
     } catch {
       return null;
     }

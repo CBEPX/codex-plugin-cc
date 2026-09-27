@@ -157,6 +157,18 @@ test("processCommandLine reads /proc/<pid>/cmdline on linux", () => {
   assert.equal(processCommandLine(42, { platform: "linux", readFileSyncImpl: () => { throw new Error("ENOENT"); } }), null);
 });
 
+// A zombie keeps its pid (alive to kill 0) but its /proc cmdline is empty: the
+// state field is what tells it from a live process whose line cannot be read.
+test("processCommandLine reports a linux zombie as <defunct> and nothing else", () => {
+  const read = (state) => (file) => (file.endsWith("/cmdline") ? "" : `42 (node (x) y) ${state} 1 42 42 0 -1 0`);
+  assert.equal(processCommandLine(42, { platform: "linux", readFileSyncImpl: read("Z") }), "<defunct>");
+  assert.equal(processCommandLine(42, { platform: "linux", readFileSyncImpl: read("X") }), "<defunct>");
+  assert.equal(processCommandLine(42, { platform: "linux", readFileSyncImpl: read("S") }), null);
+  assert.equal(processCommandLine(42, { platform: "linux", readFileSyncImpl: read("R") }), null);
+  const statThrows = (file) => { if (file.endsWith("/stat")) { throw new Error("ENOENT"); } return ""; };
+  assert.equal(processCommandLine(42, { platform: "linux", readFileSyncImpl: statThrows }), null);
+});
+
 test("processCommandLine asks ps for unlimited width off linux", () => {
   let seen = null;
   const line = processCommandLine(42, {
