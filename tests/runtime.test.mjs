@@ -3715,3 +3715,17 @@ test("a server-side turn failure that terminates normally still records an error
   assert.doesNotMatch(status.stdout, /Summary: \{$/m);
   assert.match(status.stdout, /Codex turn ended with status "failed"/);
 });
+
+test("a subagent's terminal error does not fail the main turn", () => {
+  const repo = makeTempDir();
+  initGitRepo(repo);
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "subagent-error");
+  const result = run("node", [SCRIPT, "task", "challenge the design"], { cwd: repo, env: buildEnv(binDir), timeout: 15000 });
+  assert.equal(result.error, undefined);
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stderr, /subagent at capacity/);
+  const stored = readPersistedJob(repo);
+  assert.equal(stored.status, "completed");
+  assert.equal(stored.errorMessage, null);
+});

@@ -554,7 +554,8 @@ rl.on("line", (line) => {
         if (
           BEHAVIOR === "with-subagent" ||
           BEHAVIOR === "with-late-subagent-message" ||
-          BEHAVIOR === "with-subagent-no-main-turn-completed"
+          BEHAVIOR === "with-subagent-no-main-turn-completed" ||
+          BEHAVIOR === "subagent-error"
         ) {
           const subThread = nextThread(state, thread.cwd, true);
           const subThreadRecord = ensureThread(state, subThread.id);
@@ -622,7 +623,14 @@ rl.on("line", (line) => {
               }
             }
           });
-          send({ method: "turn/completed", params: { threadId: subThread.id, turn: buildTurn(subTurnId, "completed") } });
+          if (BEHAVIOR === "subagent-error") {
+            send({
+              method: "error",
+              params: { threadId: subThread.id, turnId: subTurnId, willRetry: false, error: { message: "subagent at capacity" } }
+            });
+          } else {
+            send({ method: "turn/completed", params: { threadId: subThread.id, turn: buildTurn(subTurnId, "completed") } });
+          }
           send({
             method: "item/completed",
             params: {

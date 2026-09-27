@@ -596,6 +596,16 @@ function applyTurnNotification(state, message) {
         emitProgress(state.onProgress, `Codex error (retrying): ${error.message}`, null);
         break;
       }
+      const errorThreadId = message.params.threadId ?? null;
+      if (errorThreadId && errorThreadId !== state.threadId) {
+        // A subagent's terminal error ends only that subagent's turn, like its turn/completed.
+        // An error without a threadId stays terminal for the main turn.
+        const label = labelForThread(state, errorThreadId) ?? errorThreadId;
+        emitProgress(state.onProgress, `Subagent ${label} error: ${error.message}`, null);
+        state.activeSubagentTurns.delete(errorThreadId);
+        scheduleInferredCompletion(state);
+        break;
+      }
       state.error = error;
       emitProgress(state.onProgress, `Codex error: ${error.message}`, "failed");
       // Terminal: no turn/completed follows a non-retried error (#698). completeTurn
