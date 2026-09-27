@@ -329,6 +329,16 @@ async function handleSetup(argv) {
   const workspaceRoot = resolveCommandWorkspace(options);
   const actionsTaken = [];
 
+  // Validate everything before writing anything: a rejected effort must not
+  // leave a half-applied gate configuration behind.
+  const isInherit = (value) => String(value).trim().toLowerCase() === "inherit";
+  const modelGiven = options["review-gate-model"] != null;
+  const effortGiven = options["review-gate-effort"] != null;
+  const newModel = modelGiven && !isInherit(options["review-gate-model"]) ? normalizeRequestedModel(options["review-gate-model"]) : null;
+  const effectiveModel = modelGiven ? newModel : (getConfig(workspaceRoot).stopReviewGateModel ?? null);
+  const newEffort =
+    effortGiven && !isInherit(options["review-gate-effort"]) ? normalizeReasoningEffort(options["review-gate-effort"], effectiveModel) : null;
+
   if (options["enable-review-gate"]) {
     setConfig(workspaceRoot, "stopReviewGate", true);
     actionsTaken.push(`Enabled the stop-time review gate for ${workspaceRoot}.`);
@@ -336,15 +346,13 @@ async function handleSetup(argv) {
     setConfig(workspaceRoot, "stopReviewGate", false);
     actionsTaken.push(`Disabled the stop-time review gate for ${workspaceRoot}.`);
   }
-  if (options["review-gate-model"] != null) {
-    const value = String(options["review-gate-model"]).trim().toLowerCase() === "inherit" ? null : normalizeRequestedModel(options["review-gate-model"]);
-    setConfig(workspaceRoot, "stopReviewGateModel", value);
-    actionsTaken.push(value ? `Stop-time review gate model set to ${value}.` : "Stop-time review gate model now inherits Codex config.");
+  if (modelGiven) {
+    setConfig(workspaceRoot, "stopReviewGateModel", newModel);
+    actionsTaken.push(newModel ? `Stop-time review gate model set to ${newModel}.` : "Stop-time review gate model now inherits Codex config.");
   }
-  if (options["review-gate-effort"] != null) {
-    const value = String(options["review-gate-effort"]).trim().toLowerCase() === "inherit" ? null : normalizeReasoningEffort(options["review-gate-effort"]);
-    setConfig(workspaceRoot, "stopReviewGateEffort", value);
-    actionsTaken.push(value ? `Stop-time review gate effort set to ${value}.` : "Stop-time review gate effort now inherits Codex config.");
+  if (effortGiven) {
+    setConfig(workspaceRoot, "stopReviewGateEffort", newEffort);
+    actionsTaken.push(newEffort ? `Stop-time review gate effort set to ${newEffort}.` : "Stop-time review gate effort now inherits Codex config.");
   }
 
   const finalReport = await buildSetupReport(cwd, actionsTaken);

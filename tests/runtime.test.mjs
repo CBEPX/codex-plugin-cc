@@ -2520,6 +2520,20 @@ test("stop gate forwards the configured model and effort to the review task (#76
   assert.equal(JSON.parse(cleared.stdout).reviewGateModel, null);
 });
 
+test("setup rejects a gate effort the gate model does not support and writes nothing", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  const setup = run("node", [SCRIPT, "setup", "--review-gate-model", "spark", "--review-gate-effort", "ultra", "--json"], { cwd: repo, env: buildEnv(binDir) });
+  assert.notEqual(setup.status, 0);
+  assert.match(setup.stderr, /not supported by gpt-5\.3-codex-spark\. gpt-5\.3-codex-spark supports: /);
+  const after = run("node", [SCRIPT, "setup", "--json"], { cwd: repo, env: buildEnv(binDir) });
+  assert.equal(after.status, 0, after.stderr);
+  assert.equal(JSON.parse(after.stdout).reviewGateModel, null, "a rejected setup must not write the model");
+  assert.equal(JSON.parse(after.stdout).reviewGateEffort, null);
+});
+
 test("stop gate stops blocking after three gate-induced rounds by default (#548)", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
