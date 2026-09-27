@@ -196,8 +196,15 @@ export function saveBrokerSession(cwd, session) {
 
 export function clearBrokerSession(cwd) {
   const stateFile = resolveBrokerStateFile(cwd);
-  if (fs.existsSync(stateFile)) {
+  try {
     fs.unlinkSync(stateFile);
+  } catch (error) {
+    // A concurrently self-cleaning broker (`clearOwnSessionRecord`) can already
+    // have removed this same file: an `existsSync` pre-check does not close that
+    // race, it only narrows it.
+    if (error?.code !== "ENOENT") {
+      throw error;
+    }
   }
 }
 
@@ -347,22 +354,38 @@ export function teardownBrokerSession({ endpoint = null, pidFile, logFile, sessi
     }
   }
 
-  if (pidFile && fs.existsSync(pidFile)) {
-    fs.unlinkSync(pidFile);
+  // A concurrently self-cleaning broker can remove any of these between the
+  // `existsSync` check and the unlink; only ENOENT from that race is swallowed,
+  // every other error (e.g. EPERM) still surfaces as it did before.
+  if (pidFile) {
+    try {
+      fs.unlinkSync(pidFile);
+    } catch (error) {
+      if (error?.code !== "ENOENT") {
+        throw error;
+      }
+    }
   }
 
-  if (logFile && fs.existsSync(logFile)) {
-    fs.unlinkSync(logFile);
+  if (logFile) {
+    try {
+      fs.unlinkSync(logFile);
+    } catch (error) {
+      if (error?.code !== "ENOENT") {
+        throw error;
+      }
+    }
   }
 
   if (endpoint) {
     try {
       const target = parseBrokerEndpoint(endpoint);
-      if (target.kind === "unix" && fs.existsSync(target.path)) {
+      if (target.kind === "unix") {
         fs.unlinkSync(target.path);
       }
     } catch {
-      // Ignore malformed or already-removed broker endpoints during teardown.
+      // Ignore malformed or already-removed broker endpoints during teardown
+      // (this already swallowed ENOENT, and every other error, before this fix).
     }
   }
 

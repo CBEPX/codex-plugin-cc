@@ -16,6 +16,7 @@ import {
   loadBrokerSession,
   saveBrokerSession,
   sendBrokerShutdown,
+  teardownBrokerSession,
   waitForBrokerEndpoint
 } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
 import { terminateProcessTree } from "../plugins/codex/scripts/lib/process.mjs";
@@ -1297,4 +1298,33 @@ test("session end stops foreground workers on an odd budget", { skip: process.pl
   assert.doesNotMatch(hook.stderr, /SessionEnd left/);
   const jobs = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8")).jobs;
   assert.deepEqual(jobs, []);
+});
+
+// The broker's own SIGTERM handler (`clearOwnSessionRecord`) deletes the same
+// broker.json concurrently with the SessionEnd hook. A pre-check with
+// `existsSync` still loses that race: the file can vanish between the check and
+// the unlink. `clearBrokerSession` must tolerate a record that is simply not there.
+test("clearBrokerSession on a workspace with no broker.json returns without throwing", () => {
+  const workspace = makeTempDir();
+  assert.doesNotThrow(() => clearBrokerSession(workspace));
+});
+
+test("clearBrokerSession tolerates a broker that already cleared its own record", () => {
+  const workspace = makeTempDir();
+  saveBrokerSession(workspace, { endpoint: "unix:/tmp/x.sock", pid: null, pidFile: null, logFile: null, sessionDir: null });
+  clearBrokerSession(workspace);
+  // The second call hits exactly the file-already-gone race the broker's own
+  // cleanup can win against the hook.
+  assert.doesNotThrow(() => clearBrokerSession(workspace));
+  assert.equal(loadBrokerSession(workspace), null);
+});
+
+test("teardownBrokerSession tolerates a pidFile, logFile, and sessionDir the broker already removed", () => {
+  const sessionDir = makeTempDir("cxc-");
+  const pidFile = path.join(sessionDir, "broker.pid");
+  const logFile = path.join(sessionDir, "broker.log");
+  fs.rmdirSync(sessionDir);
+
+  const result = teardownBrokerSession({ pidFile, logFile, sessionDir });
+  assert.deepEqual(result, { signalled: false, reason: "no-pid" });
 });
