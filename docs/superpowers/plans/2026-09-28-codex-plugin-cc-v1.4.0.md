@@ -133,7 +133,10 @@ test("splitRawArgumentString keeps the old escape semantics for quotes, backslas
 
 ---
 
-### Task 7: Fallback state root на Windows → `%LOCALAPPDATA%`
+### Task 7: Windows state: `%LOCALAPPDATA%` fallback root и `writeFileAtomic` под открытым читателем
+
+**Дополнение по результату CI Task 1 (run 36356506497):** на Windows `renameSync(tmp → state.json)` в `writeFileAtomic` (`state.mjs:~190`) падает с `EPERM`, когда другой процесс держит `state.json` открытым на чтение (тест «concurrent writers never leave a torn state.json» → writer exit 1; на node 24 — падение прогона). Фикс (продукт): на win32 повторять `renameSync` до 20 раз с паузой 10–50 ms при `EPERM`/`EBUSY`/`EACCES` (`// ponytail: Windows refuses rename over an open reader; bounded retry, no lock`), затем бросать как сегодня. Читатели (`loadState`) на win32 аналогично повторяют `readFileSync` при `EBUSY`. Тест из Task 1 (`{ skip: IS_WIN }`) в этой задаче снова включается на всех платформах. Kill-семантика не затрагивается.
+
 
 **Files:** `plugins/codex/scripts/lib/state.mjs` (`resolveFallbackStateRoot`), `tests/state.test.mjs`, CHANGELOG.
 
