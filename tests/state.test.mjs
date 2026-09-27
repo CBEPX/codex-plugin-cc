@@ -807,3 +807,11 @@ test("fallback state root refuses a pre-existing world-accessible directory", { 
   fs.mkdirSync(shared, { mode: 0o755 });
   assert.throws(() => resolveFallbackStateRoot({ env: {}, tmpdir: tmp, pluginRoot: makeTempDir() }), /Refusing to use shared state directory/);
 });
+
+test("fallback state root refuses a symlinked user directory", { skip: process.platform === "win32" }, () => {
+  const tmp = makeTempDir();
+  const target = makeTempDir();
+  fs.chmodSync(target, 0o700);
+  fs.symlinkSync(target, path.join(tmp, `codex-companion-${process.getuid()}`));
+  assert.throws(() => resolveFallbackStateRoot({ env: {}, tmpdir: tmp, pluginRoot: makeTempDir() }), /Refusing to use shared state directory/);
+});

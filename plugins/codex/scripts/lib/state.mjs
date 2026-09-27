@@ -43,8 +43,9 @@ export function resolveFallbackStateRoot({
   const userDir = path.join(tmpdir, `codex-companion-${uid ?? "user"}`);
   fs.mkdirSync(userDir, { recursive: true, mode: 0o700 });
   if (process.platform !== "win32") {
-    const stats = fs.statSync(userDir);
-    if ((uid !== null && stats.uid !== uid) || (stats.mode & 0o077) !== 0) {
+    // lstat: a planted symlink would pass a following stat and could be retargeted later.
+    const stats = fs.lstatSync(userDir);
+    if (!stats.isDirectory() || (uid !== null && stats.uid !== uid) || (stats.mode & 0o077) !== 0) {
       throw new Error(
         `Refusing to use shared state directory ${userDir}: owned by another user or group/world accessible. Set CLAUDE_PLUGIN_DATA.`
       );
