@@ -3897,6 +3897,22 @@ test("task completes when the turn/start response carries no turn id (#781)", ()
   assert.match(JSON.parse(result.stdout).rawOutput, /./);
 });
 
+// Without an id in the turn/start response, turn/started is what names the turn:
+// the timeout path needs it to send turn/interrupt at all.
+test("a timed-out turn whose turn/start carried no id is still interrupted (#781)", () => {
+  const repo = makeTempDir();
+  initGitRepo(repo);
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "turn-start-without-id");
+  const env = buildEnv(binDir, { FAKE_CODEX_TURN_DELAY_MS: "5000" });
+  const result = run("node", [SCRIPT, "task", "--turn-timeout-ms", "500", "--json", "stall please"], { cwd: repo, env, timeout: 15000 });
+  assert.equal(result.error, undefined, "must not hang");
+  assert.equal(result.status, 1, result.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+  assert.ok(fakeState.lastInterrupt?.turnId, "the turn named by turn/started must be interrupted");
+  assert.equal(readPersistedJob(repo).turnId, fakeState.lastInterrupt.turnId);
+});
+
 test("status --wait reports a timeout in text output and exits 1 while the job is still active (#774)", () => {
   const repo = makeTempDir();
   initGitRepo(repo);

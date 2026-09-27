@@ -563,6 +563,11 @@ function applyTurnNotification(state, message) {
     case "turn/started":
       registerThread(state, message.params.threadId);
       state.threadTurnIds.set(message.params.threadId, message.params.turn.id);
+      // A turn/start response without an id (#781) leaves this the only place
+      // the main turn is named; the timeout path needs it to interrupt.
+      if ((message.params.threadId ?? null) === state.threadId && !state.turnId) {
+        state.turnId = message.params.turn.id ?? null;
+      }
       if ((message.params.threadId ?? null) !== state.threadId) {
         state.activeSubagentTurns.add(message.params.threadId);
       }
@@ -601,7 +606,8 @@ function applyTurnNotification(state, message) {
       const errorThreadId = message.params.threadId ?? null;
       if (errorThreadId && errorThreadId !== state.threadId) {
         // A subagent's terminal error ends only that subagent's turn, like its turn/completed.
-        // An error without a threadId stays terminal for the main turn.
+        // The protocol requires a threadId on `error`, and one without it never
+        // passes `belongsToTurn`, so it does not reach this switch at all.
         const label = labelForThread(state, errorThreadId) ?? errorThreadId;
         emitProgress(state.onProgress, `Subagent ${label} error: ${error.message}`, null);
         state.activeSubagentTurns.delete(errorThreadId);
@@ -713,10 +719,10 @@ async function failTurnOnTimeout(client, state, timeoutMs) {
     }
   }
 
-  // Wait for the turn to actually end. With no turnId there was nothing to
-  // interrupt (and notifications are still buffered), so this window only ever
-  // expires — the report then says the turn may still be running, which is the
-  // truth. `completeTurn` already ran if the notification arrived.
+  // Wait for the turn to actually end. With no turnId — neither the turn/start
+  // response nor a turn/started notification named the turn — there was nothing
+  // to interrupt, so this window usually expires and the report says the turn
+  // may still be running, which is the truth. `completeTurn` already ran if the notification arrived.
   if (await waitForTurnAcknowledgement(client, state, TURN_INTERRUPT_ACK_MS)) {
     return;
   }
