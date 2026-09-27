@@ -293,6 +293,10 @@ const CLOSE_DELAY_MS = Number(process.env.FAKE_CODEX_CLOSE_DELAY_MS || 0);
 // test can observe a job that is still running.
 const TURN_DELAY_MS = Number(process.env.FAKE_CODEX_TURN_DELAY_MS || 0);
 
+// Test knob: for with-subagent, announce the sub-thread (thread/started) before
+// the turn/start response, so the client must buffer and replay it.
+const SUBAGENT_EARLY_STARTED = process.env.FAKE_CODEX_SUBAGENT_EARLY_STARTED === "1";
+
 // Test knob: answer turn/interrupt but keep running the turn, the way a real
 // app-server that has wedged on a tool call does. Also records that the client
 // closed the connection, which is the only thing that stops such a turn.
@@ -507,6 +511,14 @@ rl.on("line", (line) => {
 	          prompt
 	        };
 	        saveState(state);
+        let earlySubThread = null;
+        if (SUBAGENT_EARLY_STARTED && BEHAVIOR === "with-subagent") {
+          earlySubThread = nextThread(state, thread.cwd, true);
+          const earlyRecord = ensureThread(state, earlySubThread.id);
+          earlyRecord.name = "design-challenger";
+          saveState(state);
+          send({ method: "thread/started", params: { thread: { ...buildThread(earlyRecord), name: "design-challenger", agentNickname: "design-challenger" } } });
+        }
 	        send({ id: message.id, result: { turn: BEHAVIOR === "turn-start-without-id" ? { status: "inProgress", items: [] } : buildTurn(turnId) } });
 
         const payload = message.params.outputSchema && message.params.outputSchema.properties && message.params.outputSchema.properties.verdict
@@ -557,13 +569,15 @@ rl.on("line", (line) => {
           BEHAVIOR === "with-subagent-no-main-turn-completed" ||
           BEHAVIOR === "subagent-error"
         ) {
-          const subThread = nextThread(state, thread.cwd, true);
+          const subThread = earlySubThread ?? nextThread(state, thread.cwd, true);
           const subThreadRecord = ensureThread(state, subThread.id);
           subThreadRecord.name = "design-challenger";
           saveState(state);
           const subTurnId = nextTurnId(state);
 
-          send({ method: "thread/started", params: { thread: { ...buildThread(subThreadRecord), name: "design-challenger", agentNickname: "design-challenger" } } });
+          if (!earlySubThread) {
+            send({ method: "thread/started", params: { thread: { ...buildThread(subThreadRecord), name: "design-challenger", agentNickname: "design-challenger" } } });
+          }
           send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
           send({
             method: "item/started",

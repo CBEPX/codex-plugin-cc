@@ -746,25 +746,25 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
   const timeoutMs = resolveTurnTimeoutMs(options.turnTimeoutMs);
   let timeoutTimer = null;
 
+  // Shared by the live handler and the buffered replay so they cannot drift:
+  // thread metadata (a subagent's thread/started) must apply before its thread
+  // id is known to belong to this turn.
+  const routeNotification = (message) => {
+    if (message.method === "thread/started" || message.method === "thread/name/updated") {
+      applyTurnNotification(state, message);
+    } else if (belongsToTurn(state, message)) {
+      applyTurnNotification(state, message);
+    } else {
+      previousHandler?.(message);
+    }
+  };
+
   client.setNotificationHandler((message) => {
     if (!state.started) {
       state.bufferedNotifications.push(message);
       return;
     }
-
-    if (message.method === "thread/started" || message.method === "thread/name/updated") {
-      applyTurnNotification(state, message);
-      return;
-    }
-
-    if (!belongsToTurn(state, message)) {
-        if (previousHandler) {
-          previousHandler(message);
-        }
-        return;
-    }
-
-    applyTurnNotification(state, message);
+    routeNotification(message);
   });
 
   try {
@@ -776,13 +776,7 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
     }
     state.started = true;
     for (const message of state.bufferedNotifications) {
-      if (belongsToTurn(state, message)) {
-        applyTurnNotification(state, message);
-      } else {
-        if (previousHandler) {
-          previousHandler(message);
-        }
-      }
+      routeNotification(message);
     }
     state.bufferedNotifications.length = 0;
 

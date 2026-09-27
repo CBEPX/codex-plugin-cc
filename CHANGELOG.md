@@ -12,6 +12,7 @@
 - `cancel` reports `cancelled` only when its signal reached the worker (a pid that leads no process group is signalled directly); an undelivered kill of a live worker is reported as pending (`not-delivered`), and a worker that finishes after an acknowledged cancel no longer overwrites the `cancelled` record.
 - A `running` job recorded without an identity (v1.2.x) whose pid now runs an unrelated, non-companion process is reconciled as failed instead of staying `running` forever; nothing is signalled.
 - `SessionEnd` keeps the record (and its files) of a foreground job whose worker it could not stop — a refused or undelivered kill, or a job its time budget never reached — and logs `[codex] SessionEnd left <id> running: <reason>`; only a stopped, provably gone or pid-less job's record is removed.
+- Subagent labels no longer depend on notification timing: buffered `thread/started` notifications are applied on replay.
 
 ### Added
 - `setup --review-gate-model <model|inherit> --review-gate-effort <effort|inherit>` pins the stop-time review gate's model/effort independently of your Codex config (#769).
