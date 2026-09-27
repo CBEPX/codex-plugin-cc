@@ -16,7 +16,9 @@
 - Гейт на задачу: `npm test > /tmp/npm-test.log 2>&1; st=$?; rg -e 'ℹ (tests|pass|fail)' -e '^not ok' /tmp/npm-test.log; test "$st" -eq 0` → `fail 0` (314 на базе); `sleep 10; pgrep -f codex-plugin-test- | wc -l` → 0; `npm run build`. С Task 3 добавляются `npm run lint`, `npm run typecheck`, `npm run typecheck:tests`, и `npm run check` становится единым гейтом.
 - Только `rg`, никаких `git add -A`, не пушить без команды. Трейлер `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>`; портированные upstream-PR — `Co-authored-by: <author> <login@users.noreply.github.com>`.
 - Windows нельзя проверить локально: задачи 1–2 доказываются CI-матрицей (push ветки `release/v1.4.0` — с разрешения пользователя); реальные Windows-проверки Task 5 и Task 6 — тоже только CI.
-- Kill-семантика (`terminateRecordedProcess`, `ownsBrokerProcess` на win32, отказы без identity) в этом релизе не меняется.
+- Kill-семантика (`terminateRecordedProcess`, `ownsBrokerProcess` на win32, отказы без identity, `cancellationPending` при живом непроверяемом worker) в этом релизе не меняется; тесты на Windows принимают текущие отказы, а не ослабляют их.
+- Tooling (eslint 10, Stryker 9, c8 12) требует Node ≥20 → lint/typecheck/coverage/mutation гоняются только на Node 24; runtime-тесты — на 18/22/24. `engines.node >=18.18.0` не меняется.
+- Codex-ревью плана (thread `01a0e4e4-9afc-7f30-8355-af30403a3cc4`, 2026-09-28) учтено во всех задачах ниже; при исполнении Task 5 и Task 6 обязательный второй проход `/codex:rescue --effort xhigh` (read-only) по диффу до Claude-ревью.
 
 ## Review Focus
 
@@ -31,100 +33,103 @@
 ### Task 1: Windows-обвязка тестов (класс A) — тесты, а не продукт
 
 **Files:**
-- Create: `.gitattributes` (`* text=auto eol=lf`)
-- Modify: `package.json` (`test`), `tests/test-env.mjs`, `tests/helpers.mjs`, `tests/runtime.test.mjs`, `tests/state.test.mjs`, `tests/broker-endpoint.test.mjs`, `tests/broker-idle-timeout.test.mjs`, `tests/broker-stale-pid.test.mjs`, `tests/app-server.test.mjs`, `tests/commands.test.mjs`
+- Create: `.gitattributes` (`* text=auto eol=lf`), `scripts/run-tests.mjs`
+- Modify: `package.json` (`test`, `prebuild`), `tests/test-env.mjs`, `tests/helpers.mjs`, `tests/runtime.test.mjs`, `tests/state.test.mjs`, `tests/broker-endpoint.test.mjs`, `tests/broker-idle-timeout.test.mjs`, `tests/broker-stale-pid.test.mjs`, `tests/app-server.test.mjs`, `tests/commands.test.mjs`
 
-**Interfaces:** новый helper в `tests/helpers.mjs`: `export const IS_WIN = process.platform === "win32";` и `export function homeEnv(home) { return { HOME: home, USERPROFILE: home }; }`. Тесты, зависящие от POSIX-семантики, получают `{ skip: IS_WIN }`.
+**Interfaces:** `tests/helpers.mjs`: `export const IS_WIN = process.platform === "win32";`, `export function homeEnv(home) { return { HOME: home, USERPROFILE: home }; }`; `run()` — `shell:false` для `node`/`git` (в тестах `run("node", …)` → `run(process.execPath, …)`), `shell` только там, где цель — `.cmd`. Тесты POSIX-семантики (mode-биты, unix socket, отрицательные pid, `pgrep`, graceful-signal сценарии, «неубиваемый ребёнок» в `app-server.test.mjs:145–154`) получают `{ skip: IS_WIN }` с комментарием, какой инвариант на Windows не моделируется; **замена ожиданий на другие exit-коды запрещена**.
 
-- [ ] **Step 1**: `.gitattributes` с `* text=auto eol=lf`; `git add --renormalize .` не нужен (репо уже LF). Единого вызова `node --test` для Node 18/22/24 и Windows нет (проверено локально на Node 24: `node --test tests/` не принимает каталог — «tests» падает как один тест; Node 18 не раскрывает glob, cmd.exe тоже). Поэтому `scripts/run-tests.mjs` (≈10 строк): `readdirSync("tests")` → файлы `*.test.mjs` → `spawnSync(process.execPath, ["--import", "./tests/test-env.mjs", "--test", ...files, ...process.argv.slice(2)], { stdio: "inherit" })` → `process.exit(status ?? 1)`; `package.json`: `"test": "node scripts/run-tests.mjs"`. Все остальные скрипты (`test:coverage`, `test:mutation:*:unit`) используют тот же раннер или явные списки файлов; шаблон `tests/*.test.mjs` в них не оставлять.
-- [ ] **Step 2**: `tests/test-env.mjs` — `import { fileURLToPath } from "node:url"; process.env.CODEX_COMPANION_MODEL_CATALOG = fileURLToPath(new URL("./fixtures/models-catalog.json", import.meta.url));`.
-- [ ] **Step 3**: `tests/commands.test.mjs` — 5 regex с `\n` заменить на `\r?\n` (или нормализовать `read()` через `.replace(/\r\n/g, "\n")` — один хелпер, предпочтительно).
-- [ ] **Step 4**: `tests/runtime.test.mjs`: transfer-тесты (~252, 297, 327, 353) → `...homeEnv(home)`; тест `setup is ready without npm…` (~85) → `PATH: [binDir, path.dirname(process.execPath)].join(path.delimiter)`; mode-assert'ы (~3314) и `tests/state.test.mjs` (~141, 696, 864) → внутрь `if (!IS_WIN)` или `{ skip: IS_WIN }` на тесте целиком, если mode — суть теста.
-- [ ] **Step 5**: `tests/broker-endpoint.test.mjs:6` — тест уже передаёт `"darwin"` явно; падал из-за `path.join` на win32 → использовать `path.posix.join` в ожидании или `{ skip: IS_WIN }`. Сигнальные тесты (`app-server.test.mjs` close()×2, `broker-idle-timeout.test.mjs` ~365/386, `broker-stale-pid.test.mjs` ~443/~480): на win32 `signalCode` = `null`, `exitCode` = `1` после `taskkill`; обернуть ожидания `IS_WIN ? … : …` либо `{ skip: IS_WIN }` с комментарием, какой инвариант теряется. Тестовые `process.kill(pid)` на уже мёртвый pid — в `try/catch` (`ESRCH`).
-- [ ] **Step 6**: `tests/state.test.mjs` «concurrent writers never leave a torn state.json» (~160–175): длинный `-e` скрипт → записать во временный файл (`makeTempDir()` + `fs.writeFileSync`) и `spawn(process.execPath, [file, …])` (node 24 на Windows: `spawn ENAMETOOLONG` роняет прогон).
-- [ ] **Step 7**: гейт; commit `test: make the suite runnable on Windows (LF, directory discovery, env/mode/signal expectations)`.
-
----
-
-### Task 2: CI hardening и обязательный Windows
-
-**Files:** `.github/workflows/pull-request-ci.yml`, `.github/workflows/release-verify.yml`, `plugins/codex/scripts/session-lifecycle-hook.mjs` (`BROKER_BUSY_RETRY_MS`), `tests/broker-stale-pid.test.mjs`, `tests/commands.test.mjs`.
-
-- [ ] **Step 1**: `pull-request-ci.yml`: `on.push.branches: [main, "release/**"]` (ветки `ci/**` убрать), `concurrency: { group: ci-${{ github.event.pull_request.number || github.ref }}, cancel-in-progress: true }`; `continue-on-error` для Windows **остаётся** до зелёного прогона Task 1 на CI, затем снимается отдельным коммитом в этой же задаче.
-- [ ] **Step 2**: `BROKER_BUSY_RETRY_MS` 1000 → 3000 (внутри 12 s: handshake ≤2 s + retry 3 s + teardown ≤2 s); `tests/commands.test.mjs` тест «SessionEnd hook timeout stays above the hook's own budget» — проверить, что арифметика в нём не захардкожена на 1 s. Тест «session end reaps a SIGKILLed background worker…» (`broker-stale-pid.test.mjs` ~443): перед вызовом хука дождаться, что broker больше не считает worker подключённым (`sendBrokerShutdown` не нужен — достаточно `waitFor(() => !isAlive(workerPid))` + короткий `setTimeout(200)`), чтобы тест проверял reaping, а не гонку закрытия сокета.
-- [ ] **Step 3**: `release-verify.yml` — та же матрица `{ubuntu, macos, windows} × {18, 22, 24}` через `strategy.matrix`, шаги как в PR CI + `npm audit --omit=dev`, `npm pack --dry-run`.
-- [ ] **Step 4**: после push (по команде пользователя) и зелёной матрицы: снять `continue-on-error`, оставить Windows required. Commit `ci: dedupe runs per SHA, widen broker busy-retry, make Windows required`.
+- [ ] **Step 0 (инвентарь)**: spike-список относится к v1.2.1; после Task 2 (по команде пользователя — push ветки, `workflow_dispatch`) снять актуальный список падений Windows на текущем SHA и записать в отчёт задачи; класс A ниже — ожидаемое, не исчерпывающее.
+- [ ] **Step 1**: `.gitattributes`; единого вызова `node --test` для Node 18/22/24 и Windows нет (проверено локально на Node 24: `node --test tests/` → `ERR_UNSUPPORTED_DIR_IMPORT`; на Node 18 каталог сработал бы, но подхватил бы и `tests/test-env.mjs` по шаблону `test-*`; cmd.exe не раскрывает glob). Поэтому `scripts/run-tests.mjs` (≈10 строк): `readdirSync("tests")` → `*.test.mjs` → `spawnSync(process.execPath, ["--import", "./tests/test-env.mjs", "--test", ...files, ...process.argv.slice(2)], { stdio: "inherit" })` → `process.exit(status ?? 1)`; `package.json`: `"test": "node scripts/run-tests.mjs"`; остальные test-скрипты — явные списки файлов. `prebuild`: `mkdir -p` → `node -e "require('fs').mkdirSync('plugins/codex/.generated/app-server-types',{recursive:true})"`.
+- [ ] **Step 2**: `tests/test-env.mjs` — `fileURLToPath(new URL("./fixtures/models-catalog.json", import.meta.url))`.
+- [ ] **Step 3**: `tests/commands.test.mjs` — один хелпер `read()` нормализует `\r\n` → `\n`.
+- [ ] **Step 4**: `tests/runtime.test.mjs`: transfer-тесты (~252, 297, 327, 353) → `...homeEnv(home)`; тест «setup is ready without npm…» (~76–94) — на win32 `{ skip: IS_WIN }` (изолировать `node.exe` без `npm` переносимо нельзя; добавление каталога Node в PATH вернуло бы npm и обессмыслило тест); mode-assert'ы (~3314) и `tests/state.test.mjs` (~141, 696, 864) под `if (!IS_WIN)`.
+- [ ] **Step 5**: `tests/broker-endpoint.test.mjs:6` — ожидание строить через `path.join` хоста (`"unix:" + path.join(dir, "broker.sock")`), не `path.posix`; сигнальные тесты: `app-server.test.mjs` close()×2 — `{ skip: IS_WIN }` (сценарий «SIGTERM-immune child» на Windows не моделируется), `broker-idle-timeout.test.mjs` (~365/386, ~395–446: `pgrep`, graceful SIGTERM) и `broker-stale-pid.test.mjs` (~443/~483: отрицательные pid) — классифицировать каждый: posix-only → skip; платформенно-нейтральный → оставить. Тестовые `process.kill` на мёртвый pid — `try/catch`.
+- [ ] **Step 6**: `tests/state.test.mjs` «concurrent writers…» (~160–184, >100 KiB JSON в `-e`) → временный `.mjs` файл + проверка `spawn` error и exit status writer'а.
+- [ ] **Step 7**: Windows-ожидания для `cancel`: тест «cancelling an awaited job…» (~3668) на win32 принимает `cancellationPending` + exit 1 (документированный отказ v1.3.0), код не ослабляется.
+- [ ] **Step 8**: гейт; commit `test: make the suite runnable on Windows (LF, explicit runner, env/mode/signal expectations)`.
 
 ---
 
-### Task 3: Тулинг
+### Task 2: CI hardening; Windows обязательный — в конце релиза
 
-**Files:** Create `eslint.config.mjs`, `tsconfig.json`, `tsconfig.tests.json`, `.githooks/pre-commit`, `scripts/setup-git-hooks.mjs`, `scripts/check-changelog.mjs`, `scripts/lib/changelog.mjs`, `.github/dependabot.yml`, `SECURITY.md`, `stryker.config.mjs`, `.github/workflows/mutation.yml`; Modify `package.json`, `.gitignore` (`reports/`, `.stryker-tmp/`), `tests/bump-version.test.mjs` (или новый `tests/changelog.test.mjs`).
+**Files:** `.github/workflows/pull-request-ci.yml`, `.github/workflows/release-verify.yml`, `plugins/codex/scripts/session-lifecycle-hook.mjs` (`BROKER_BUSY_RETRY_MS`), `plugins/codex/scripts/app-server-broker.mjs` (одна строка лога при закрытии клиентского сокета, если её нет), `tests/broker-stale-pid.test.mjs`, `tests/commands.test.mjs`.
 
-**Interfaces:** скрипты `lint`, `typecheck`, `typecheck:tests`, `check:changelog`, `test:coverage`, `test:mutation:critical`, `test:mutation:critical:unit`, `setup:git-hooks`, `check` = `check-version && check:changelog && lint && typecheck && typecheck:tests && test`. `prepack`: `check-version && check:changelog`.
+- [ ] **Step 1**: `pull-request-ci.yml`: `on: { pull_request, push: { branches: [main] }, workflow_dispatch }` — release-ветки до PR проверяются через `workflow_dispatch`, так один SHA гоняется одним событием; `concurrency: { group: ci-${{ github.workflow }}-${{ github.ref }}, cancel-in-progress: true }`. Матрица runtime-тестов `{ubuntu, macos, windows} × {18, 22, 24}`; отдельный job `quality` на ubuntu/node 24 (lint, build/typecheck, typecheck:tests, check:changelog, coverage-артефакт — наполняется в Task 3). `continue-on-error` для Windows **остаётся** до Task 9.
+- [ ] **Step 2**: `BROKER_BUSY_RETRY_MS` 1000 → 3000 — увеличение окна ожидания ответа `busy:false`; инвариант «teardown только после подтверждённого idle» не меняется; бюджет: handshake bound 5 s (`session-lifecycle-hook.mjs:40`, зажат `stepBudget`) + retry 3 s + teardown ≤2 s ≤ 12 s. Тест «session end reaps a SIGKILLed background worker…» (~443): к существующему `waitFor(!isAlive)` добавить `waitFor(() => brokerLog.includes("client disconnected"))` по `broker.log` (если broker такой строки не пишет — добавить одну в `app-server-broker.mjs` на `close` сокета). Никаких фиксированных `sleep`.
+- [ ] **Step 3**: `release-verify.yml` — та же матрица + quality job + `npm audit --omit=dev`, `npm pack --dry-run`.
+- [ ] **Step 4**: commit `ci: one run per SHA, quality job on node 24, wider broker busy-retry`. Снятие `continue-on-error` — Task 9, после полного зелёного прогона с Task 4–6.
 
-- [ ] **Step 1**: скопировать `eslint.config.mjs` из cc-plugin-codex (ignores + `plugins/codex/.generated/**`, `.worktrees/**`, `docs/**`); `tsconfig.json`: `include: ["plugins/codex/scripts/**/*.mjs"]`, `exclude: ["node_modules", "tests", ".worktrees"]`, остальное как в референсе; `tsconfig.tests.json` включает `tests/**/*.mjs`. Существующий `tsconfig.app-server.json` (`npm run build`) не трогать.
-- [ ] **Step 2**: devDependencies: `eslint`, `@eslint/js`, `globals`, `c8`, `@stryker-mutator/core` — версии как в референсе (`^10.2.0`, `^10.0.1`, `^17.5.0`, `12.0.0`, `^9.6.1`); `npm install` → `package-lock.json`; `npm run lint` и `npm run typecheck` должны пройти — правки кода только там, где eslint/tsc реально ругаются (ожидаемо: JSDoc-типы в `codex.mjs`/`state.mjs` под `checkJs`; исправлять минимально, `// @ts-ignore` не использовать без комментария почему).
-- [ ] **Step 3**: `scripts/check-changelog.mjs` + `scripts/lib/changelog.mjs` (копия референса; заголовок формата `## 1.3.0 — 2026-09-27`, поэтому regex: `^##\s+v?${version}(\s|$)`), плюс проверка `CHANGELOG.md` и `plugins/codex/CHANGELOG.md` побайтно равны — иначе `exit 1` с подсказкой `cp CHANGELOG.md plugins/codex/CHANGELOG.md`. Тест: временный репо с рассинхроном → падает; с секцией без bullet → падает.
-- [ ] **Step 4**: c8: `"test:coverage": "c8 --all --include='plugins/codex/scripts/**/*.mjs' --exclude='plugins/codex/.generated/**' --reporter=text --reporter=json-summary --reporter=lcov --reports-dir=reports/coverage --check-coverage --lines=<факт-2> --statements=<факт-2> --branches=<факт-2> --functions=<факт-2> node --import ./tests/test-env.mjs --test tests/"` — пороги = измеренное значение минус 2 пункта, записать фактические числа в отчёт задачи; цель 85/75/90 — в README как ориентир, не в гейте.
-- [ ] **Step 5**: Stryker только critical: `stryker.config.mjs` с `mutate: ["plugins/codex/scripts/lib/args.mjs", "plugins/codex/scripts/lib/model-catalog.mjs"]`, `commandRunner: npm run test:mutation:critical:unit` (= `node --import ./tests/test-env.mjs --test tests/args.test.mjs tests/model-catalog.test.mjs`), thresholds 80/55/55; `mutation.yml` — `workflow_dispatch` + `schedule` (воскресенье 03:00 UTC), без pull_request (не удлинять PR CI). Запустить локально один раз, записать score в отчёт.
-- [ ] **Step 6**: `.githooks/pre-commit` (lint + typecheck), `scripts/setup-git-hooks.mjs`, `.github/dependabot.yml` (копии), `SECURITY.md` (Supported: latest release; Reporting: GitHub Security Advisories для `CBEPX/codex-plugin-cc`; без email). README: раздел «Development» с `npm run check`, `npm run setup:git-hooks`.
-- [ ] **Step 7**: `pull-request-ci.yml`: шаги `npm run lint`, `typecheck`, `typecheck:tests`, `check:changelog` перед тестами; coverage-артефакт на ubuntu/node 22. Гейт; commit `chore: lint, typecheck, coverage, mutation (critical), dependabot, SECURITY.md, changelog gate`.
+---
+
+### Task 3: Тулинг (только Node 24)
+
+**Files:** Create `eslint.config.mjs`, `tsconfig.tests.json`, `.githooks/pre-commit`, `scripts/setup-git-hooks.mjs`, `scripts/check-changelog.mjs`, `scripts/lib/changelog.mjs`, `.c8rc.json`, `.github/dependabot.yml`, `SECURITY.md`, `stryker.config.mjs`, `.github/workflows/mutation.yml`; Modify `package.json`, `.gitignore` (`reports/`, `.stryker-tmp/`), новый `tests/changelog.test.mjs`.
+
+**Interfaces:** `lint`; `typecheck` = существующий `npm run build` (`tsconfig.app-server.json` уже `checkJs` против generated types — **не** переводить на NodeNext: extensionless JSDoc-импорты в `app-server.mjs:3–8`, `codex.mjs:2–9`); `typecheck:tests` (новый `tsconfig.tests.json`, `extends` app-server config, `include: ["tests/**/*.mjs", "scripts/**/*.mjs"]`); `check:changelog`; `test:coverage`; `test:mutation:critical`(+`:unit`); `setup:git-hooks`; `check` = `check-version && check:changelog && lint && build && typecheck:tests && test`. `prebuild` (генерация protocol types) остаётся и всегда предшествует typecheck.
+
+- [ ] **Step 1**: `eslint.config.mjs` из референса + ignores `plugins/codex/.generated/**`, `.worktrees/**`, `docs/**`, `reports/**`; `tsconfig.tests.json`. devDependencies: `eslint ^10.2.0`, `@eslint/js ^10.0.1`, `globals ^17.5.0`, `c8 12.0.0`, `@stryker-mutator/core ^9.6.1`; `npm install`; lint/typecheck:tests зелёные с минимальными правками (только реальные находки; `// @ts-expect-error` с причиной, не `@ts-ignore`).
+- [ ] **Step 2**: `scripts/check-changelog.mjs` + `scripts/lib/changelog.mjs` (регекс `^##\s+v?<version>(\s|$)` под формат `## 1.3.0 — 2026-09-27`) + побайтное равенство `CHANGELOG.md` и `plugins/codex/CHANGELOG.md`; `tests/changelog.test.mjs`: нет секции → fail; секция без bullet → fail; копии расходятся → fail с подсказкой `cp`.
+- [ ] **Step 3**: coverage: globs в `.c8rc.json` (`include: ["plugins/codex/scripts/**/*.mjs", "scripts/**/*.mjs"]`, `exclude: ["plugins/codex/.generated/**"]`, `all: true`, reporters text/json-summary/lcov, `reports-dir: reports/coverage`), `"test:coverage": "c8 --check-coverage node scripts/run-tests.mjs"`. c8 передаёт `NODE_V8_COVERAGE` дочерним процессам, поэтому companion-подпроцессы покрытие дают; ограничения (в README/отчёт): SIGKILL/`taskkill /F` не оставляют dump, detached broker/worker может завершиться после отчёта, Windows-ветки на ubuntu не измеряются. Сначала подтвердить ненулевое покрытие `codex-companion.mjs` в отчёте, затем пороги = факт − 2 п.п. в `.c8rc.json`; ориентир 85/75/90 — в README.
+- [ ] **Step 4**: Stryker critical: `mutate: ["plugins/codex/scripts/lib/args.mjs", "plugins/codex/scripts/lib/model-catalog.mjs"]`, `commandRunner: node --import ./tests/test-env.mjs --test tests/args.test.mjs tests/model-catalog.test.mjs`, thresholds 80/55/55; `mutation.yml` — `workflow_dispatch` + `schedule` (вс 03:00 UTC), node 24, без pull_request. Один локальный прогон → score в отчёт.
+- [ ] **Step 5**: `.githooks/pre-commit`, `scripts/setup-git-hooks.mjs`, `.github/dependabot.yml`, `SECURITY.md` (Supported: latest release; Reporting: GitHub Security Advisories `CBEPX/codex-plugin-cc`, без email). README «Development».
+- [ ] **Step 6**: наполнить quality job из Task 2. Гейт `npm run check`; commit `chore: lint, typecheck for tests, coverage, mutation (critical), dependabot, SECURITY.md, changelog gate`.
 
 ---
 
 ### Task 4: `--args-stdin` не съедает обратные слэши Windows-путей
 
-**Files:** `plugins/codex/scripts/lib/args.mjs` (`splitRawArgumentString`), `tests/args.test.mjs`, README (раздел про `--args-stdin`).
+**Files:** `plugins/codex/scripts/lib/args.mjs` (`splitRawArgumentString`), `tests/args.test.mjs`, README.
 
-- [ ] **Step 1: failing tests**
+**Контракт (минимальное изменение старой модели):** модель кавычек не меняется (`\` обрабатывается до проверки кавычек, `\'` внутри `'…'` по-прежнему даёт `'`); меняется одно: `\` экранирует **только** следующий символ из whitelist `"`, `'`, `\`, whitespace (`/\s/`, включая перевод строки — как сегодня); перед любым другим символом `\` — литерал. Документируемые ограничения: `\\server\share` → `\server\share`; `C:\dir\` перед закрывающей `"` экранирует кавычку. Для byte-exact текста есть `--prompt-stdin` (rescue уже его использует); `normalizeArgv` (`codex-companion.mjs:191–224`) получает то же поведение намеренно.
+
+- [ ] **Step 1: failing tests** (`tests/args.test.mjs`):
 ```js
-test("splitRawArgumentString keeps Windows path backslashes that escape nothing", () => {
+test("splitRawArgumentString keeps a backslash that escapes nothing (Windows paths)", () => {
   assert.deepEqual(splitRawArgumentString("investigate C:\\Users\\me\\proj\\file.mjs"), ["investigate", "C:\\Users\\me\\proj\\file.mjs"]);
-  assert.deepEqual(splitRawArgumentString('say \\"quoted\\" and a\\ b and back\\\\slash'), ["say", "\"quoted\"", "and", "a b", "and", "back\\slash"]);
   assert.deepEqual(splitRawArgumentString("'C:\\dir\\x' \"D:\\y\""), ["C:\\dir\\x", "D:\\y"]);
 });
+test("splitRawArgumentString keeps the old escape semantics for quotes, backslash and whitespace", () => {
+  assert.deepEqual(splitRawArgumentString("say \\\"q\\\" a\\ b back\\\\slash it\\'s"), ["say", "\"q\"", "a b", "back\\slash", "it's"]);
+  assert.deepEqual(splitRawArgumentString("'it\\'s'"), ["it's"]);                 // old behaviour, kept
+  assert.deepEqual(splitRawArgumentString("\\\\server\\share"), ["\\server\\share"]); // documented limitation
+});
 ```
-- [ ] **Step 2: implement** — `\` экранирует только следующий символ из набора `"`, `'`, `\`, пробел/таб (вне кавычек) и `"`/`\` внутри двойных кавычек; в остальных случаях `\` — литерал:
-```js
-    if (character === "\\") {
-      const next = raw[index + 1];
-      const escapable = quote === "'" ? false : quote === "\"" ? next === "\"" || next === "\\" : next === "\"" || next === "'" || next === "\\" || /\s/.test(next ?? "");
-      if (escapable) { escaping = true; continue; }
-      current += "\\";
-      continue;
-    }
-```
-(цикл переписать на `for (let index = 0; index < raw.length; index += 1)`; хвостовое `if (escaping) current += "\\"` остаётся). Существующие тесты `args.test.mjs` и runtime-тест «task --args-stdin keeps shell metacharacters…» должны пройти без изменений.
-- [ ] **Step 3**: README — одно предложение: обратный слэш в тексте задачи сохраняется, если за ним не идёт кавычка, пробел или ещё один `\`. Гейт; commit `fix(args): keep Windows path backslashes in --args-stdin text`.
+- [ ] **Step 2: implement** — в ветке `character === "\\"`: `const next = raw[index + 1]; if (next === "\"" || next === "'" || next === "\\" || /\s/.test(next ?? "")) { escaping = true; continue; } current += "\\"; continue;` (цикл по индексу). Больше ничего.
+- [ ] **Step 3**: README: правило в одном предложении + `--prompt-stdin` для точного текста. Гейт; commit `fix(args): keep backslashes that escape nothing in --args-stdin text`.
 
 ---
 
 ### Task 5: Windows spawn без `$SHELL`
 
-**Files:** `plugins/codex/scripts/lib/process.mjs` (`runCommand`, `binaryAvailable`, `terminateProcessTree` win32), `plugins/codex/scripts/lib/app-server.mjs` (`spawn("codex", …)`), `plugins/codex/scripts/lib/broker-lifecycle.mjs` (`spawnBrokerProcess`: `windowsHide: true`), `tests/process.test.mjs`, `tests/fake-codex-fixture.mjs`, `tests/helpers.mjs`.
+**Files:** `plugins/codex/scripts/lib/process.mjs`, `plugins/codex/scripts/lib/app-server.mjs` (spawn `codex`), `plugins/codex/scripts/lib/broker-lifecycle.mjs` (`windowsHide: true` в `spawnBrokerProcess`), `tests/process.test.mjs`, `tests/fake-codex-fixture.mjs`, `tests/helpers.mjs`, README (совместимость).
 
-**Interfaces:**
-- `resolveExecutable(command, { platform, env, runCommandImpl })` в `process.mjs`: posix → `command` как есть; win32 → `where.exe <command>` (`shell:false`, timeout 5 s), первая строка результата; `null` если не найдено.
-- `spawnOptionsFor(resolvedPath, platform)` → `{ file, args, shell }`: `.cmd`/`.bat` → `{ file: "cmd.exe", argsPrefix: ["/d", "/s", "/c", resolvedPath], shell: false }` (аргументы передаются как есть; `cmd.exe /c` с явным путём не подвержен MSYS-мангline), иначе `{ file: resolvedPath, shell: false }`.
-- `runCommand` по умолчанию `shell: false` на всех платформах; на win32 `command` без пути резолвится через `resolveExecutable` (кэш на процесс). Совместимость: если `where.exe` не нашёл — `ENOENT` как сегодня.
+**Дизайн (с учётом ревью Codex):**
+- `resolveExecutable(command, { env, cwd })` — только win32; **сырой** `spawnSync("where.exe", [command], { shell: false, timeout: 5000, env, cwd })` (не через `runCommand` — иначе рекурсия); из строк результата берётся первая с расширением из `PATHEXT` (`.exe`, `.cmd`, `.bat`, `.com`); extensionless shim (bash-скрипт) пропускается; не найдено → `null` → `ENOENT`, как сегодня. Без кэша.
+- `buildLaunch(resolvedPath, args)`: `.exe`/`.com` → `{ file: resolvedPath, args, windowsVerbatimArguments: false }`; `.cmd`/`.bat` → `{ file: env.ComSpec || "cmd.exe", args: ["/d", "/s", "/c", '"' + [resolvedPath, ...args].map(quoteForCmd).join(" ") + '"'], windowsVerbatimArguments: true }`; `quoteForCmd` — правила Node `child_process` для `shell:true` (обернуть в `"` при пробелах/кавычках/пустой строке, `"` → `\"`, завершающие `\` удваивать перед закрывающей `"`; `& | < > ^ %` внутри кавычек не трогать — `/s` снимает внешнюю пару). ≈15 строк, таблица случаев в тесте.
+- `runCommand`: на win32 `shell:false` всегда; `command` без пути → `resolveExecutable` → `buildLaunch`. `taskkill.exe`/`powershell.exe`/`where.exe` — прямые `.exe`. Критерии `terminateProcessTree` (`/T /F`, `looksLikeMissingProcessMessage`, ENOENT-fallback) не меняются.
+- `app-server.mjs:245`: `spawn(launch.file, launch.args, { shell: false, windowsVerbatimArguments: launch.windowsVerbatimArguments, windowsHide: true, … })` для `resolveExecutable("codex")` + `["app-server"]`; комментарий ~283 обновить (`terminateProcessTree(this.proc.pid)` на живом handle остаётся допустимым исключением).
+- **Совместимость (README + CHANGELOG «Changed»)**: codex/npm, доступные только внутри Git Bash (alias, функция, bash-only PATH), перестают находиться — нужен `codex.cmd`/`codex.exe` в Windows PATH.
 
-- [ ] **Step 1: unit tests** (инъекция `runCommandImpl`/`platform`): `terminateProcessTree(1234, {platform:"win32"})` вызывает `taskkill.exe` с `shell:false` (проверить переданные options через шпион-`runCommandImpl`); `resolveExecutable("codex", {platform:"win32", runCommandImpl: () => ({status:0, stdout:"C:\\npm\\codex.cmd\r\n"})})` → `.cmd` → `cmd.exe /d /s /c C:\npm\codex.cmd`; `.exe` → напрямую; ENOENT → `binaryAvailable` → `{available:false, detail:"not found"}`.
-- [ ] **Step 2: implement** в `process.mjs`; `app-server.mjs:245`: `spawn(file, [...argsPrefix, "app-server"], { shell: false, windowsHide: true, … })` через `spawnOptionsFor(resolveExecutable("codex"))`; комментарий на строке ~283 про cmd.exe-дерево обновить (дерево теперь `cmd.exe → node`, `terminateProcessTree(this.proc.pid)` по-прежнему бьёт по дереву через `taskkill /T` на живом handle — допустимое исключение). `spawnBrokerProcess`: `windowsHide: true`.
-- [ ] **Step 3: fixtures** — `tests/fake-codex-fixture.mjs` `installFakeCodex`: на win32 дополнительно писать `codex.cmd` (`@echo off\r\nnode "%~dp0codex.mjs" %*`) и класть JS в `codex.mjs`; на posix — как сейчас. `tests/helpers.mjs` `run()` — `shell` только для `.cmd` целей (или оставить как есть: тесты запускают `node`/`git` абсолютно/через PATH — проверить).
-- [ ] **Step 4**: гейт локально (posix не меняется по поведению); Windows — CI. Commit `fix(windows): spawn without $SHELL — where.exe resolution, cmd.exe for .cmd shims, taskkill/powershell direct` с `Co-authored-by: mohammad-malik <mohammad-malik@users.noreply.github.com>` (#735) и `Co-authored-by: mittalpk <mittalpk@users.noreply.github.com>` (#669).
+- [ ] **Step 1: unit tests** (`tests/process.test.mjs`, инъекция `spawnSyncImpl`): `resolveExecutable` выбирает `codex.cmd` из вывода `codex\r\ncodex.cmd\r\n`; таблица `buildLaunch`/`quoteForCmd`: путь с пробелом, аргумент с `"`, пустой аргумент, `%PATH%`, `a&b`, завершающий `\`; `terminateProcessTree(win32)` вызывает `taskkill.exe` c `shell:false` (шпион на options).
+- [ ] **Step 2: implement**; `spawnBrokerProcess`: `windowsHide: true`.
+- [ ] **Step 3: fixtures** — `installFakeCodex` на win32 пишет `codex.cjs` (тело фикстуры использует `require`) + `codex.cmd` = `@echo off\r\nnode "%~dp0codex.cjs" %*`; на posix как сейчас. `tests/helpers.mjs` `run()`: `shell:false` для `process.execPath`/`git`.
+- [ ] **Step 4: Windows round-trip test** (`{ skip: !IS_WIN }`, выполняется только на CI): `.cmd`-шим, печатающий `JSON.stringify(process.argv.slice(2))`, в каталоге **с пробелом**; `runCommand` с `["plain", "with space", "q\"uote", "", "%PATH%", "a&b", "trail\\"]` → argv совпадает.
+- [ ] **Step 5**: второй проход `/codex:rescue --effort xhigh` по диффу (read-only) до Claude-ревью. Гейт локально (posix без изменения поведения); Windows — CI. Commit `fix(windows): spawn without $SHELL — where.exe resolution, quoted cmd.exe launch for .cmd shims, direct taskkill/powershell` с `Co-authored-by: mohammad-malik <mohammad-malik@users.noreply.github.com>` (#735), `Co-authored-by: mittalpk <mittalpk@users.noreply.github.com>` (#669).
 
 ---
 
-### Task 6: Чтение stdin в хуках — дедлайн, EAGAIN, лимит
+### Task 6: Чтение stdin в хуках — дедлайн, EAGAIN, лимит (без потери payload)
 
-**Files:** Create `plugins/codex/scripts/lib/hook-input.mjs`; Modify `plugins/codex/scripts/session-lifecycle-hook.mjs`, `plugins/codex/scripts/stop-review-gate-hook.mjs` (`main` → async), `plugins/codex/scripts/lib/fs.mjs` (`readStdinIfPiped` — EAGAIN retry), `tests/runtime.test.mjs`, новый `tests/hook-input.test.mjs`.
+**Files:** Create `plugins/codex/scripts/lib/hook-input.mjs`; Modify `plugins/codex/scripts/session-lifecycle-hook.mjs`, `plugins/codex/scripts/stop-review-gate-hook.mjs` (`main` → async; prompt в companion через `--prompt-stdin`, не argv), `plugins/codex/scripts/lib/fs.mjs` (`readStdinIfPiped`), `tests/hook-input.test.mjs`, `tests/runtime.test.mjs`, `tests/commands.test.mjs`.
 
-**Interfaces:** `export async function readHookInput({ timeoutMs = 2000, maxBytes = 1024 * 1024, stdin = process.stdin } = {})` → `{ input: object, truncated: boolean, timedOut: boolean }`; пустой stdin → `{}`; невалидный JSON → **throws** (stop-gate оставляет fail-closed на этом; session-hook ловит и идёт fail-open с stderr-строкой); `timedOut` → `{}` (Windows: stdin без EOF, #530). `readStdinIfPiped` (companion) — синхронный `readSync` в цикле с повтором на `EAGAIN` (до 50 × 20 ms), затем как сейчас.
+**Interfaces:** `export async function readHookInput({ timeoutMs = 2000, maxBytes = 1024 * 1024, stdin = process.stdin } = {})` → `{ input: object|null, error: null | { code: "timeout"|"overflow"|"invalid-json", message } }`. EOF → parse полного ввода; дедлайн → если накопленный буфер **уже** валидный JSON — принять (EOF задержался), иначе `error.code = "timeout"`; байты > `maxBytes` → прекратить чтение, `"overflow"`, усечённый буфер не парсится; невалидный JSON → `"invalid-json"`. `StringDecoder("utf8")` на границах chunk'ов, лимит в байтах; по завершении `clearTimeout`, снять listeners, `stdin.pause()`/`destroy()`. Env `CODEX_HOOK_STDIN_TIMEOUT_MS` — для тестов.
+- Stop-hook: вызов внутри существующего fail-closed блока: любой `error` → `{"decision":"block"}` (как сегодня для malformed), **кроме** `timeout` с пустым буфером при `stopReviewGate === false` в workspace по `CLAUDE_PROJECT_DIR`/`process.cwd()` → allow (это #530); при включённом gate timeout → block с причиной «hook input did not arrive». Prompt в companion — через `--prompt-stdin` (снимает лимит argv на Windows).
+- SessionEnd-hook: `error` → stderr-строка и `return` без cleanup (не подставлять `{}`); бюджет 12 s стартует после чтения, поэтому `timeoutMs` = 1000; тест «SessionEnd hook timeout stays above…» дополнить `15 > 12 + 1`.
+- `readStdinIfPiped` (companion): `readSync` в цикле, накопленные байты сохраняются между повторами `EAGAIN` (до 50 × 20 ms); исчерпание → throw, не частичный prompt.
 
-- [ ] **Step 1: tests** — `hook-input.test.mjs`: (a) JSON приходит частями через `PassThrough` → собран; (b) stdin без `end` → через 200 ms `timedOut:true, input:{}`; (c) >maxBytes → `truncated:true` и throw на parse; (d) `{not-json` → throw. `runtime.test.mjs`: stop-hook с выключенным gate и `input` = открытый pipe без EOF (spawn с `stdio: ["pipe"]`, не закрывать stdin) завершается за <3 s с exit 0 и `CODEX_HOOK_STDIN_TIMEOUT_MS=200`.
-- [ ] **Step 2: implement** — `hook-input.mjs` на событиях `data`/`end`/`error` с `setTimeout`; env `CODEX_HOOK_STDIN_TIMEOUT_MS` для тестов. Оба хука: `const { input } = await readHookInput()`; в stop-hook `main()` становится `async`, верхний `try/catch` — `await main()`. `fs.mjs`: EAGAIN-цикл.
-- [ ] **Step 3**: гейт; commit `fix(hooks): bounded stdin read with EAGAIN retry and size cap` с `Co-authored-by: stantheman0128 <stantheman0128@users.noreply.github.com>` (#544), `Co-authored-by: tmchow <tmchow@users.noreply.github.com>` (#123).
+- [ ] **Step 1: tests** — `tests/hook-input.test.mjs` через `PassThrough`: (a) JSON частями + EOF; (b) полный JSON без EOF → принят на дедлайне; (c) частичный на дедлайне → `timeout`; (d) UTF-8 символ через границу chunk'ов; (e) > `maxBytes` → `overflow` без parse; (f) `{not-json` → `invalid-json`. `runtime.test.mjs`: stop-hook с выключенным gate и открытым stdin без EOF → exit 0 за <3 s (`CODEX_HOOK_STDIN_TIMEOUT_MS=200`); с включённым gate → `block` с причиной про input; `last_assistant_message` 300 KB → prompt доходит до fake codex целиком.
+- [ ] **Step 2: implement**; оба хука; `fs.mjs`.
+- [ ] **Step 3**: второй проход `/codex:rescue --effort xhigh` (read-only). Гейт; commit `fix(hooks): bounded stdin read that never drops a complete payload; review prompt via stdin` с `Co-authored-by: stantheman0128 <stantheman0128@users.noreply.github.com>` (#544), `Co-authored-by: tmchow <tmchow@users.noreply.github.com>` (#123).
 
 ---
 
@@ -133,7 +138,7 @@ test("splitRawArgumentString keeps Windows path backslashes that escape nothing"
 **Files:** `plugins/codex/scripts/lib/state.mjs` (`resolveFallbackStateRoot`), `tests/state.test.mjs`, CHANGELOG.
 
 - [ ] **Step 1: test** — `resolveFallbackStateRoot({ env: { LOCALAPPDATA: "C:\\Users\\me\\AppData\\Local" }, platform: "win32", tmpdir: "C:\\Temp", pluginRoot })` → начинается с `C:\Users\me\AppData\Local\codex-companion\`; без `LOCALAPPDATA` → `tmpdir`. (Добавить параметр `platform` в опции; `mkdirSync` в тесте на posix создаст каталог — использовать `makeTempDir()` как `LOCALAPPDATA`.)
-- [ ] **Step 2: implement** — `const base = platform === "win32" && env.LOCALAPPDATA ? path.join(env.LOCALAPPDATA, "codex-companion") : path.join(tmpdir, \`codex-companion-${uid ?? "user"}\`)`; остальное без изменений. Гейт; commit `fix(state): per-user fallback state root under %LOCALAPPDATA% on Windows`.
+- [ ] **Step 2: implement** — `const base = platform === "win32" && env.LOCALAPPDATA ? path.join(env.LOCALAPPDATA, "codex-companion") : path.join(tmpdir, \`codex-companion-${uid ?? "user"}\`)`; **переходная политика**: если новый корень ещё не существует, а старый `<tmpdir>/codex-companion-user/<hash>` существует — использовать старый (без миграции файлов) и написать одну stderr-строку; тест на оба случая; CHANGELOG «Changed». Гейт; commit `fix(state): per-user fallback state root under %LOCALAPPDATA% on Windows`.
 
 ---
 
@@ -146,8 +151,8 @@ test("splitRawArgumentString keeps Windows path backslashes that escape nothing"
 - [ ] refusal-тест: `fs.chmodSync(shared, 0o755)` явно; foreign-uid ветка: `uid: process.getuid() + 1` → refusal.
 - [ ] `CODEX_REVIEW_GATE_MAX_ROUNDS=0` → без предела (4 блокировки подряд), `=5` → пятая блокирует, шестая allow; `Number.isInteger(parsed) && parsed >= 0`, иначе default 3 + stderr-предупреждение.
 - [ ] `--review-gate-model ""`/`--review-gate-effort ""` → ошибка «use inherit to clear», ничего не пишется.
-- [ ] `teardownBrokerSession` catch → `reason: "kill-failed"` заменить на `"identity-unavailable"`? Нет — оставить `kill-failed`, но добавить в документированный enum (`process.mjs` JSDoc + README-таблица причин).
-- [ ] `workerCommandLine(jobId)` — `escapeRegExp(jobId)`; ps-ветка `processCommandLine` — `if (!(timeoutMs > 0)) return null` как в `getProcessIdentity`.
+- [ ] `kill-failed` добавить в документированный enum причин (`process.mjs` JSDoc + README-таблица).
+- [ ] `workerCommandLine(jobId)` — `escapeRegExp(jobId)` (строго сужает matching; id генерируются). **Не в v1.4.0**: guard `timeoutMs > 0` в ps-ветке `processCommandLine` — меняет matching kill-путей (вызовы без timeout стали бы возвращать `null`) → v1.4.1.
 - [ ] `tests/runtime.test.mjs` G1-тест (SIGTERM-immune worker) — `t.after(() => { try { process.kill(-workerPid, "SIGKILL"); } catch {} })`; заголовки fresh-broker тестов — «killed as a process group».
 - [ ] README transfer: одно предложение про `~/.claude/projects` / `$CLAUDE_CONFIG_DIR/projects`; комментарий в `codex.mjs` `registerThread` о single-tenant допущении broker.
 - [ ] Гейт; commit `chore: fold in deferred v1.3.0 review minors`.
