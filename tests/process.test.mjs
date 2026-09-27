@@ -216,6 +216,19 @@ test("runCommand reports a timed-out command as having no exit status", { skip: 
   assert.notEqual(result.status, 0);
 });
 
+// spawnSync throws ERR_OUT_OF_RANGE on a fractional timeout and reads 0 as
+// "unbounded": budgets halved or spent must still reach it as an integer >= 1.
+test("runCommand clamps a fractional, zero or negative timeout to an integer >= 1", { skip: process.platform === "win32" }, () => {
+  const fractional = runCommand(process.execPath, ["-e", ""], { timeoutMs: 500.5 });
+  assert.equal(fractional.status, 0);
+  for (const timeoutMs of [0, 0.4, -5]) {
+    const started = Date.now();
+    const result = runCommand(process.execPath, ["-e", "setTimeout(()=>{}, 5000)"], { timeoutMs });
+    assert.equal(result.status, null, `timeoutMs ${timeoutMs} must stay bounded`);
+    assert.ok(Date.now() - started < 4000);
+  }
+});
+
 test("terminateRecordedProcess refuses on identity mismatch and without identity on win32", () => {
   let killed = false;
   const mismatch = terminateRecordedProcess(4242, { identity: "linux:1", platform: "linux", readFileSyncImpl: () => "4242 (node) S 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 0 0 1 0 999 0 0 0", killImpl: () => { killed = true; } });

@@ -10,7 +10,9 @@ export function runCommand(command, args = [], options = {}) {
     input: options.input,
     maxBuffer: options.maxBuffer,
     stdio: options.stdio ?? "pipe",
-    timeout: options.timeoutMs,
+    // spawnSync throws on a fractional timeout and reads 0 as "no timeout":
+    // whatever budget arithmetic a caller did, a bound stays a bound.
+    timeout: Number.isFinite(options.timeoutMs) ? Math.max(1, Math.floor(options.timeoutMs)) : undefined,
     shell: options.shell ?? (process.platform === "win32" ? (process.env.SHELL || true) : false),
     windowsHide: true
   });

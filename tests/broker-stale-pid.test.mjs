@@ -1281,3 +1281,20 @@ test("session end keeps the records of foreground jobs its budget never reached"
   assert.deepEqual(jobs.map((job) => [job.id, job.status]), [["task-own-unreached", "running"]]);
   assert.equal(fs.existsSync(path.join(jobsDir, "task-own-unreached.request.json")), true);
 });
+
+// Probe timeouts are halves of what is left of the budget; an odd remainder gave
+// spawnSync a fractional timeout, it threw, and the kill was logged `kill-failed`
+// with the worker kept. Several workers make an odd remainder all but certain.
+test("session end stops foreground workers on an odd budget", { skip: process.platform === "win32" }, async (t) => {
+  const workspace = makeTempDir();
+  const ids = ["a", "b", "c", "d", "e", "f"].map((suffix) => `task-own-odd-${suffix}`);
+  const workers = ids.map((id) => spawnWorkerStandIn(t, ["codex-companion.mjs", "task-worker", "--job-id", id]));
+  const { stateDir } = seedForegroundJobs(workspace, ids.map((id, index) => ({ id, pid: workers[index].pid })));
+
+  const hook = runSessionEndHook(workspace, { sessionId: "sess-current", env: { ...process.env, CODEX_COMPANION_SESSION_END_BUDGET_MS: "1001" } });
+  assert.equal(hook.status, 0, hook.stderr);
+  assert.doesNotMatch(hook.stderr, /kill-failed/);
+  assert.doesNotMatch(hook.stderr, /SessionEnd left/);
+  const jobs = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8")).jobs;
+  assert.deepEqual(jobs, []);
+});

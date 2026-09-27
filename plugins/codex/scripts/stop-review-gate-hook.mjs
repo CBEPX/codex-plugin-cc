@@ -155,7 +155,7 @@ function runStopReview(cwd, input = {}, config = {}) {
     cwd,
     env: childEnv,
     encoding: "utf8",
-    timeout: STOP_REVIEW_TIMEOUT_OVERRIDE_MS || STOP_REVIEW_TIMEOUT_MS,
+    timeout: Math.max(1, Math.floor(STOP_REVIEW_TIMEOUT_OVERRIDE_MS || STOP_REVIEW_TIMEOUT_MS)),
     killSignal: "SIGKILL",
     maxBuffer: 16 * 1024 * 1024
   });

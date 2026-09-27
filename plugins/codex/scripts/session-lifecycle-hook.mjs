@@ -142,7 +142,7 @@ function cleanupSessionJobs(cwd, sessionId, lockWaitMs, remainingMs) {
       // Only a pid still provably this job's process is signalled (#743), and
       // proving it costs up to two probes (a worker that leads no process group
       // is re-proved before its own pid is signalled) the budget has to cover.
-      const probeMs = Math.min(IDENTITY_PROBE_MS, remainingMs() / 2);
+      const probeMs = Math.floor(Math.min(IDENTITY_PROBE_MS, remainingMs() / 2));
       let reason = "budget-exhausted";
       if (probeMs >= MIN_STEP_MS) {
         let pid;
@@ -311,7 +311,7 @@ async function handleSessionEnd(input) {
     pidIdentity,
     killProcess: terminateProcessTree,
     // Halved: a broker gone from its group is re-proved with a second probe.
-    timeoutMs: stepBudget(IDENTITY_PROBE_MS) / 2
+    timeoutMs: Math.floor(stepBudget(IDENTITY_PROBE_MS) / 2)
   });
   // Every branch of this hook says what it decided: when a broker outlives a
   // SessionEnd the only question worth asking is which of these four paths ran.
