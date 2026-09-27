@@ -334,10 +334,15 @@ async function handleSetup(argv) {
   const isInherit = (value) => String(value).trim().toLowerCase() === "inherit";
   const modelGiven = options["review-gate-model"] != null;
   const effortGiven = options["review-gate-effort"] != null;
+  const config = getConfig(workspaceRoot);
   const newModel = modelGiven && !isInherit(options["review-gate-model"]) ? normalizeRequestedModel(options["review-gate-model"]) : null;
-  const effectiveModel = modelGiven ? newModel : (getConfig(workspaceRoot).stopReviewGateModel ?? null);
+  const effectiveModel = modelGiven ? newModel : (config.stopReviewGateModel ?? null);
   const newEffort =
     effortGiven && !isInherit(options["review-gate-effort"]) ? normalizeReasoningEffort(options["review-gate-effort"], effectiveModel) : null;
+  // A model-only change must still fit the effort already stored with it.
+  if (modelGiven && !effortGiven) {
+    normalizeReasoningEffort(config.stopReviewGateEffort ?? null, effectiveModel);
+  }
 
   if (options["enable-review-gate"]) {
     setConfig(workspaceRoot, "stopReviewGate", true);
