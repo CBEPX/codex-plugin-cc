@@ -2012,7 +2012,7 @@ test("a background worker's pid sidecar carries its identity and cancel signals 
       try { process.kill(sidecar.pid, 0); return false; } catch (error) { return error?.code === "ESRCH"; }
     });
   } finally {
-    try { process.kill(-sidecar.pid, "SIGKILL"); } catch {}
+    try { process.kill(-sidecar.pid, "SIGKILL"); } catch { try { process.kill(sidecar.pid, "SIGKILL"); } catch {} }
   }
 });
 
@@ -3668,7 +3668,9 @@ test("cancelling an awaited job ends the await with exit 1 and leaves a readable
     return job && job.status === "running" && job.pid ? job.id : null;
   }, { timeoutMs: 15000 });
 
-  const cancelled = run(process.execPath, [SCRIPT, "cancel", jobId, "--json"], { cwd: repo, env });
+  // A job can be cancelled once, so POSIX keeps the rendered (text) path and
+  // win32 reads the structured cancellationPending answer.
+  const cancelled = run(process.execPath, [SCRIPT, "cancel", jobId, ...(IS_WIN ? ["--json"] : [])], { cwd: repo, env });
   if (IS_WIN) {
     // Documented v1.3.0 refusal: win32 has no worker process identity yet (v1.4.1),
     // so cancel does not signal the worker and reports cancellationPending + exit 1.
@@ -3678,6 +3680,7 @@ test("cancelling an awaited job ends the await with exit 1 and leaves a readable
     return;
   }
   assert.equal(cancelled.status, 0, cancelled.stderr);
+  assert.match(cancelled.stdout, /cancelled/i);
   assert.equal(await exited, 1);
 
   const stored = run(process.execPath, [SCRIPT, "result", jobId, "--json"], { cwd: repo, env });
@@ -3915,7 +3918,12 @@ test("cancel removes the private request payload of a job killed in the queued w
     try {
       process.kill(-sleeper.pid, "SIGKILL");
     } catch {
-      // Already gone.
+      // No process groups on Windows, or already gone.
+      try {
+        process.kill(sleeper.pid, "SIGKILL");
+      } catch {
+        // Already gone.
+      }
     }
   });
 

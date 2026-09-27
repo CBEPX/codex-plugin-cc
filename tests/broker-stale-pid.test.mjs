@@ -132,7 +132,11 @@ test("session end teardown does not signal a recycled pid that is not this broke
     try {
       process.kill(-impostor.pid, "SIGKILL");
     } catch {
-      // Already gone.
+      try {
+        process.kill(impostor.pid, "SIGKILL");
+      } catch {
+        // Already gone.
+      }
     }
     clearBrokerSession(workspace);
   }
