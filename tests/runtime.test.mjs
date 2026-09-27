@@ -2225,7 +2225,9 @@ test("session end fully cleans up jobs for the ending session", async (t) => {
     stdio: "ignore"
   });
   sleeper.unref();
-  fs.writeFileSync(runningJobFile, JSON.stringify({ id: "review-running" }, null, 2), "utf8");
+  // A live worker's own file says `running`; a status-less file reads as terminal
+  // on disk and the reaper would reconcile that into the kept index entry.
+  fs.writeFileSync(runningJobFile, JSON.stringify({ id: "review-running", status: "running" }, null, 2), "utf8");
 
   t.after(() => {
     try {
@@ -2306,7 +2308,10 @@ test("session end fully cleans up jobs for the ending session", async (t) => {
     assert.match(result.stderr, /\[codex\] SessionEnd left review-running running: identity-unavailable/);
     const kept = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8")).jobs;
     assert.deepEqual(kept.map((job) => job.id).sort(), ["review-other", "review-running"]);
-    assert.equal(kept.find((job) => job.id === "review-running").status, "running");
+    assert.deepEqual(
+      (({ status, pid }) => ({ status, pid }))(kept.find((job) => job.id === "review-running")),
+      { status: "running", pid: sleeper.pid }
+    );
     assert.equal(fs.existsSync(runningJobFile), true);
     return;
   }
@@ -3704,7 +3709,7 @@ test("cancelling an awaited job ends the await with exit 1 and leaves a readable
     // Documented v1.3.0 refusal: win32 has no worker process identity yet (v1.4.1),
     // so cancel does not signal the worker and reports cancellationPending + exit 1.
     assert.equal(cancelled.status, 1, cancelled.stderr);
-    assert.equal(JSON.parse(cancelled.stdout).cancellationPending, true);
+    assert.deepEqual(JSON.parse(cancelled.stdout), { jobId, status: "running", cancellationPending: true, reason: "identity-unavailable" });
     await exited;
     return;
   }
