@@ -15,6 +15,7 @@
  *   threadTurnIds: Map<string, string>,
  *   threadLabels: Map<string, string>,
  *   turnId: string | null,
+ *   started: boolean,
  *   bufferedNotifications: AppServerNotification[],
  *   completion: Promise<TurnCaptureState>,
  *   resolveCompletion: (state: TurnCaptureState) => void,
@@ -371,6 +372,7 @@ function createTurnCaptureState(threadId, options = {}) {
     threadTurnIds: new Map(),
     threadLabels: new Map(),
     turnId: null,
+    started: false,
     bufferedNotifications: [],
     completion,
     resolveCompletion,
@@ -739,7 +741,7 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
   let timeoutTimer = null;
 
   client.setNotificationHandler((message) => {
-    if (!state.turnId) {
+    if (!state.started) {
       state.bufferedNotifications.push(message);
       return;
     }
@@ -766,6 +768,7 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
     if (state.turnId) {
       state.threadTurnIds.set(state.threadId, state.turnId);
     }
+    state.started = true;
     for (const message of state.bufferedNotifications) {
       if (belongsToTurn(state, message)) {
         applyTurnNotification(state, message);

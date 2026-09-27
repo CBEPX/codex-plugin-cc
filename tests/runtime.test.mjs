@@ -3729,3 +3729,14 @@ test("a subagent's terminal error does not fail the main turn", () => {
   assert.equal(stored.status, "completed");
   assert.equal(stored.errorMessage, null);
 });
+
+test("task completes when the turn/start response carries no turn id (#781)", () => {
+  const repo = makeTempDir();
+  initGitRepo(repo);
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "turn-start-without-id");
+  const result = run("node", [SCRIPT, "task", "--json", "hello"], { cwd: repo, env: buildEnv(binDir), timeout: 15000 });
+  assert.equal(result.error, undefined, "must not hang");
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(JSON.parse(result.stdout).rawOutput, /./);
+});
