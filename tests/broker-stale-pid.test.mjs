@@ -979,7 +979,9 @@ test("ensureBrokerSession kills a live unreachable broker before replacing it (#
     retryTimeoutMs: 300
   });
   try {
-    assert.deepEqual(killed, [process.pid], "the unreachable but live broker must be signalled");
+    // win32 (v1.3.0 documented refusal): a record without an identity is never
+    // signalled (identity-unavailable until v1.4.1), so nothing is killed there.
+    assert.deepEqual(killed, IS_WIN ? [] : [process.pid], "the unreachable but live broker must be signalled");
     assert.ok(probes >= 1);
     assert.ok(session && session.endpoint !== staleEndpoint, "a fresh broker must be spawned");
     assert.equal(loadBrokerSession(workspace)?.endpoint, session.endpoint);
@@ -1190,7 +1192,9 @@ test("ensureBrokerSession re-verifies a legacy broker's ownership after the read
     retryTimeoutMs: 300
   });
   try {
-    assert.ok(probes >= 2, "ownership must be checked again at kill time");
+    // win32 (v1.3.0 documented refusal): teardown refuses an identity-less record
+    // before any kill-time recheck, so only the first probe happens there.
+    if (!IS_WIN) assert.ok(probes >= 2, "ownership must be checked again at kill time");
     assert.deepEqual(killed, []);
     assert.ok(session);
   } finally {

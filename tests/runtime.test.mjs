@@ -1913,6 +1913,13 @@ test("cancel stops an active background job and marks it cancelled", async (t) =
     cwd: workspace
   });
 
+  if (IS_WIN) {
+    // Documented v1.3.0 refusal: win32 cannot prove the pid is this job's worker
+    // (identity-unavailable until v1.4.1), so the job stays running, exit 1.
+    assert.equal(cancelResult.status, 1, cancelResult.stderr);
+    assert.deepEqual(JSON.parse(cancelResult.stdout), { jobId: "task-live", status: "running", cancellationPending: true, reason: "identity-unavailable" });
+    return;
+  }
   assert.equal(cancelResult.status, 0, cancelResult.stderr);
   assert.equal(JSON.parse(cancelResult.stdout).status, "cancelled");
 
@@ -2155,11 +2162,17 @@ test("cancel sends turn interrupt to the shared app-server before killing a brok
     env
   });
 
-  assert.equal(cancelResult.status, 0, cancelResult.stderr);
-  const cancelPayload = JSON.parse(cancelResult.stdout);
-  assert.equal(cancelPayload.status, "cancelled");
-  assert.equal(cancelPayload.turnInterruptAttempted, true);
-  assert.equal(cancelPayload.turnInterrupted, true);
+  if (IS_WIN && cancelResult.status === 1) {
+    // Documented v1.3.0 refusal: the interrupt is sent, but a worker still alive
+    // is not signalled without an identity (until v1.4.1), so cancel stays pending.
+    assert.deepEqual(JSON.parse(cancelResult.stdout), { jobId, status: "running", cancellationPending: true, reason: "identity-unavailable" });
+  } else {
+    assert.equal(cancelResult.status, 0, cancelResult.stderr);
+    const cancelPayload = JSON.parse(cancelResult.stdout);
+    assert.equal(cancelPayload.status, "cancelled");
+    assert.equal(cancelPayload.turnInterruptAttempted, true);
+    assert.equal(cancelPayload.turnInterrupted, true);
+  }
 
   await waitFor(() => {
     const fakeState = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
@@ -2287,6 +2300,16 @@ test("session end fully cleans up jobs for the ending session", async (t) => {
   assert.equal(result.status, 0, result.stderr);
   assert.equal(fs.existsSync(otherSessionLog), true);
   assert.equal(fs.existsSync(otherJobFile), true);
+  if (IS_WIN) {
+    // Documented v1.3.0 refusal: without a worker identity (until v1.4.1) the
+    // hook does not signal the running job and keeps its record, saying why.
+    assert.match(result.stderr, /\[codex\] SessionEnd left review-running running: identity-unavailable/);
+    const kept = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8")).jobs;
+    assert.deepEqual(kept.map((job) => job.id).sort(), ["review-other", "review-running"]);
+    assert.equal(kept.find((job) => job.id === "review-running").status, "running");
+    assert.equal(fs.existsSync(runningJobFile), true);
+    return;
+  }
   assert.deepEqual(
     fs.readdirSync(path.dirname(otherJobFile)).sort(),
     [path.basename(otherJobFile), path.basename(otherSessionLog)].sort()
@@ -2406,15 +2429,21 @@ test("session end preserves background jobs and their broker so workers survive 
 
   assert.equal(result.status, 0, result.stderr);
 
-  // Foreground job killed + pruned from state.
-  await waitFor(() => {
-    try {
-      process.kill(foregroundSleeper.pid, 0);
-      return false;
-    } catch (error) {
-      return error?.code === "ESRCH";
-    }
-  });
+  if (IS_WIN) {
+    // Documented v1.3.0 refusal: the foreground worker is not signalled without
+    // an identity (until v1.4.1); its record stays and the hook says why.
+    assert.match(result.stderr, /\[codex\] SessionEnd left review-foreground running: identity-unavailable/);
+  } else {
+    // Foreground job killed + pruned from state.
+    await waitFor(() => {
+      try {
+        process.kill(foregroundSleeper.pid, 0);
+        return false;
+      } catch (error) {
+        return error?.code === "ESRCH";
+      }
+    });
+  }
 
   // Background job still alive — its worker outlives the session that started it.
   assert.equal(
@@ -2432,8 +2461,8 @@ test("session end preserves background jobs and their broker so workers survive 
 
   const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
   assert.deepEqual(
-    state.jobs.map((job) => job.id),
-    ["task-background"],
+    state.jobs.map((job) => job.id).sort(),
+    IS_WIN ? ["review-foreground", "task-background"] : ["task-background"],
     "background job stays in state so later sessions can poll it"
   );
   assert.equal(fs.existsSync(backgroundJobFile), true, "background job file preserved");
