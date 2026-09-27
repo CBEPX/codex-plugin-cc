@@ -1102,7 +1102,8 @@ test("SessionEnd leaves a recorded broker pid alone when its identity no longer 
 });
 
 // A broker this call just spawned that never becomes ready is killed through the
-// child handle: its pid cannot have been recycled, so no identity is consulted.
+// child handle: its pid cannot have been recycled while the handle says it has
+// not exited, so no identity is consulted.
 test("ensureBrokerSession kills a fresh broker that never becomes ready", async () => {
   const binDir = makeTempDir();
   installFakeCodex(binDir);
@@ -1110,16 +1111,69 @@ test("ensureBrokerSession kills a fresh broker that never becomes ready", async 
   const scriptPath = path.join(makeTempDir(), "never-listens.mjs");
   fs.writeFileSync(scriptPath, "setInterval(() => {}, 1000);\n");
   const killed = [];
-  const session = await ensureBrokerSession(workspace, { env: buildEnv(binDir), scriptPath, timeoutMs: 300, killProcess: recordingKill(killed),
-    // An identity that cannot be read (win32) must not keep the child alive.
-    getProcessIdentityImpl: () => null
+  const spawned = [];
+  try {
+    const session = await ensureBrokerSession(workspace, { env: buildEnv(binDir), scriptPath, timeoutMs: 300, killProcess: recordingKill(killed),
+      // An identity that cannot be read (win32) must not keep the child alive.
+      getProcessIdentityImpl: (pid) => (spawned.push(pid), null)
+    });
+    assert.equal(session, null);
+    assert.equal(spawned.length, 1);
+    assert.equal(loadBrokerSession(workspace), null);
+    const deadline = Date.now() + 5000;
+    while (isAlive(spawned[0]) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    assert.equal(isAlive(spawned[0]), false, "the fresh child must be gone");
+  } finally {
+    for (const pid of spawned) { try { process.kill(pid, "SIGKILL"); } catch {} }
+  }
+});
+
+// A fresh child that exited during the readiness wait has a pid the OS may
+// already have handed on: nothing may be signalled by number.
+test("ensureBrokerSession never signals the pid of a fresh broker that already exited", async () => {
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const workspace = makeTempDir();
+  const scriptPath = path.join(makeTempDir(), "exits-at-once.mjs");
+  fs.writeFileSync(scriptPath, "process.exit(0);\n");
+  const killed = [];
+  const spawned = [];
+  const session = await ensureBrokerSession(workspace, { env: buildEnv(binDir), scriptPath, timeoutMs: 500, killProcess: recordingKill(killed),
+    getProcessIdentityImpl: (pid) => (spawned.push(pid), null)
   });
   assert.equal(session, null);
-  assert.equal(killed.length, 1, "the fresh child must be signalled");
+  assert.equal(spawned.length, 1);
+  assert.deepEqual(killed, [], "an exited child's pid must not be signalled");
   assert.equal(loadBrokerSession(workspace), null);
-  const deadline = Date.now() + 5000;
-  while (isAlive(killed[0]) && Date.now() < deadline) {
-    await new Promise((resolve) => setTimeout(resolve, 50));
+});
+
+// A legacy record (no identity) is re-checked by command line when the kill
+// happens, not only before the 2 s readiness retry: the pid may be recycled
+// during that wait.
+test("ensureBrokerSession re-verifies a legacy broker's ownership after the readiness retry", async () => {
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const workspace = makeTempDir();
+  const sessionDir = makeTempDir("cxc-");
+  saveBrokerSession(workspace, { endpoint: createBrokerEndpoint(sessionDir), pidFile: null, logFile: null, sessionDir, pid: process.pid });
+  const killed = [];
+  let probes = 0;
+  const session = await ensureBrokerSession(workspace, {
+    env: buildEnv(binDir),
+    isAliveImpl: () => true,
+    // Ours before the retry; the command line changed during it.
+    ownsProcessImpl: () => (probes += 1) === 1,
+    killProcess: recordingKill(killed),
+    retryTimeoutMs: 300
+  });
+  try {
+    assert.ok(probes >= 2, "ownership must be checked again at kill time");
+    assert.deepEqual(killed, []);
+    assert.ok(session);
+  } finally {
+    if (session?.pid) { try { process.kill(session.pid, "SIGTERM"); } catch {} }
+    clearBrokerSession(workspace);
   }
-  assert.equal(isAlive(killed[0]), false, "the fresh child must be gone");
 });

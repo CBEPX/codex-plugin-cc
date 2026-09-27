@@ -244,9 +244,13 @@ export async function ensureBrokerSession(cwd, options = {}) {
       pid: liveOwned ? pid : null,
       pidIdentity: existing.pidIdentity ?? null,
       killProcess: liveOwned ? killProcess : null,
-      ownsProcess: () => true
+      // Re-checked at kill time: the pid may have been recycled during the retry.
+      ownsProcess: ownsProcessImpl
     });
-    clearBrokerSession(cwd);
+    // Compare before delete: a concurrent caller may already have replaced it.
+    if (loadBrokerSession(cwd)?.endpoint === existing.endpoint) {
+      clearBrokerSession(cwd);
+    }
   }
 
   const sessionDir = createBrokerSessionDir();
@@ -271,17 +275,28 @@ export async function ensureBrokerSession(cwd, options = {}) {
 
   const ready = await waitForBrokerEndpoint(endpoint, options.timeoutMs ?? 2000);
   if (!ready) {
-    // The pid comes from the child handle just spawned, not from a stored
-    // record: it cannot have been recycled, so it is killed without the identity
-    // check (which cannot answer on win32 at all).
-    if (Number.isInteger(child.pid)) {
+    // A child that already exited is not signalled at all: its pid may belong to
+    // someone else by now. A live one is killed through its handle, which cannot
+    // reach a recycled pid; only if that fails does the numeric (process-group)
+    // kill run, and then only after identity or command-line proof.
+    let fallback = false;
+    if (child.exitCode === null && child.signalCode === null) {
       try {
-        killProcess(child.pid);
+        fallback = !child.kill("SIGTERM");
       } catch {
-        // Already exited.
+        fallback = true;
       }
     }
-    teardownBrokerSession({ endpoint, pidFile, logFile, sessionDir });
+    teardownBrokerSession({
+      endpoint,
+      pidFile,
+      logFile,
+      sessionDir,
+      pid: fallback ? (child.pid ?? null) : null,
+      pidIdentity,
+      killProcess: fallback ? killProcess : null,
+      ownsProcess: ownsProcessImpl
+    });
     return null;
   }
 
