@@ -1330,15 +1330,16 @@ async function handleCancel(argv) {
   // Only a pid that is provably still this job's worker is signalled (#743).
   const { pid, identity } = resolveJobPid(workspaceRoot, job);
   const kill = terminateRecordedProcess(pid, { identity, commandLineMatch: workerCommandLine(job.id) });
-  // A worker we may not signal but that is still alive would overwrite a
-  // `cancelled` record with its own result: the job stays running, and the
-  // sidecar stays so a later cancel or the reaper can still find it.
-  if (pid && !kill.attempted && isPidAlive(pid) === true) {
-    const pending = `cancellation not confirmed: worker pid ${pid} left running (${kill.reason})`;
+  // A worker we may not signal, or whose signal reached nothing, but that is
+  // still alive is not cancelled: the job stays running, and the sidecar stays
+  // so a later cancel or the reaper can still find it.
+  if (pid && (!kill.attempted || !kill.delivered) && isPidAlive(pid) === true) {
+    const reason = kill.attempted ? "not-delivered" : kill.reason;
+    const pending = `cancellation not confirmed: worker pid ${pid} left running (${reason})`;
     appendLogLine(job.logFile, pending);
     process.exitCode = 1;
     outputCommandResult(
-      { jobId: job.id, status: "running", cancellationPending: true, reason: kill.reason },
+      { jobId: job.id, status: "running", cancellationPending: true, reason },
       `${pending}\nThe turn interrupt was sent; the job stays running until the worker exits. Re-run cancel or wait for result.\n`,
       options.json
     );

@@ -3,7 +3,7 @@ import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
@@ -3628,6 +3628,54 @@ test("cancelling an awaited job ends the await with exit 1 and leaves a readable
   assert.equal(await exited, 1);
 
   const stored = run("node", [SCRIPT, "result", jobId, "--json"], { cwd: repo, env });
+  assert.equal(stored.status, 0, stored.stderr);
+  assert.equal(JSON.parse(stored.stdout).job.status, "cancelled");
+});
+
+// A worker that outlives the SIGTERM (it only stops once its turn winds down)
+// used to overwrite the acknowledged `cancelled` record with its own result.
+test("an acknowledged cancellation survives a worker that finishes after it", { skip: process.platform === "win32" }, async () => {
+  const repo = seededRepo();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  // Only the task worker ignores SIGTERM; the broker and fake codex keep the default.
+  const preload = path.join(binDir, "worker-ignores-sigterm.mjs");
+  fs.writeFileSync(preload, 'if (process.argv.includes("task-worker")) process.on("SIGTERM", () => {});\n');
+  const env = buildEnv(binDir, {
+    FAKE_CODEX_TURN_DELAY_MS: "3000",
+    NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ""} --import ${pathToFileURL(preload).href}`.trim()
+  });
+
+  const launch = run("node", [SCRIPT, "task", "--background", "--json", "--prompt-stdin"], {
+    cwd: repo, env, input: "cancel me late\n"
+  });
+  assert.equal(launch.status, 0, launch.stderr);
+  const { jobId } = JSON.parse(launch.stdout);
+
+  const stateFile = path.join(resolveStateDir(repo), "state.json");
+  const workerPid = await waitFor(() => {
+    if (!fs.existsSync(stateFile)) {
+      return null;
+    }
+    const job = JSON.parse(fs.readFileSync(stateFile, "utf8")).jobs?.find((entry) => entry.id === jobId);
+    return job && job.status === "running" && job.pid ? job.pid : null;
+  }, { timeoutMs: 15000 });
+
+  const cancelled = run("node", [SCRIPT, "cancel", jobId, "--json"], { cwd: repo, env });
+  assert.equal(cancelled.status, 0, cancelled.stderr);
+  assert.equal(JSON.parse(cancelled.stdout).status, "cancelled");
+
+  const isAlive = () => {
+    try {
+      process.kill(workerPid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  await waitFor(() => !isAlive(), { timeoutMs: 20000 });
+
+  const stored = run("node", [SCRIPT, "result", jobId, "--json"], { cwd: repo, env: buildEnv(binDir) });
   assert.equal(stored.status, 0, stored.stderr);
   assert.equal(JSON.parse(stored.stdout).job.status, "cancelled");
 });

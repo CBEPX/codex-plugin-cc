@@ -63,6 +63,37 @@ test("terminateProcessTree treats missing Windows processes as already stopped",
   assert.match(outcome.result.stdout, /not found/i);
 });
 
+test("terminateProcessTree falls back to the pid when it is not a process-group leader", () => {
+  const calls = [];
+  const outcome = terminateProcessTree(4242, {
+    platform: "linux",
+    killImpl(pid, signal) {
+      calls.push([pid, signal]);
+      if (pid < 0) {
+        throw Object.assign(new Error("kill ESRCH"), { code: "ESRCH" });
+      }
+    }
+  });
+
+  assert.deepEqual(calls, [[-4242, "SIGTERM"], [4242, "SIGTERM"]]);
+  assert.equal(outcome.attempted, true);
+  assert.equal(outcome.delivered, true);
+  assert.equal(outcome.method, "process");
+});
+
+test("terminateProcessTree reports not delivered only when the pid itself is gone", () => {
+  const outcome = terminateProcessTree(4242, {
+    platform: "linux",
+    killImpl() {
+      throw Object.assign(new Error("kill ESRCH"), { code: "ESRCH" });
+    }
+  });
+
+  assert.equal(outcome.attempted, true);
+  assert.equal(outcome.delivered, false);
+  assert.equal(outcome.method, "process");
+});
+
 test("processCommandLine reads the command line of a live process", { skip: process.platform === "win32" }, () => {
   const line = processCommandLine(process.pid);
   assert.ok(line, "expected a command line for the current process");

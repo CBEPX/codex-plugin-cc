@@ -160,6 +160,19 @@ function readStoredJobOrNull(workspaceRoot, jobId) {
   return readJobFile(jobFile);
 }
 
+// A cancel that was acknowledged already wrote the terminal record and released
+// the artifacts; a worker that outlives it must not replace `cancelled` with its
+// own outcome. Read and write share the lock so a cancel cannot land in between.
+function writeTerminalUnlessCancelled(workspaceRoot, jobId, logFile, write) {
+  return withStateLock(workspaceRoot, () => {
+    if (readStoredJobOrNull(workspaceRoot, jobId)?.status === "cancelled") {
+      appendLogLine(logFile, "Worker finished after the job was cancelled; the cancelled record is kept.");
+      return;
+    }
+    write();
+  });
+}
+
 export async function runTrackedJob(job, runner, options = {}) {
   const runningRecord = {
     ...job,
@@ -180,68 +193,73 @@ export async function runTrackedJob(job, runner, options = {}) {
     // A run that fails without throwing (a timed-out or interrupted turn) still
     // has to say why: `status`/`result` read the reason off the record.
     const errorMessage = completionStatus === "failed" ? execution.errorMessage ?? null : null;
-    writeJobFile(job.workspaceRoot, job.id, {
-      ...runningRecord,
-      status: completionStatus,
-      errorMessage,
-      threadId: execution.threadId ?? null,
-      turnId: execution.turnId ?? null,
-      resolved: execution.resolved ?? null,
-      pid: null,
-      pidIdentity: null,
-      phase: completionStatus === "completed" ? "done" : "failed",
-      completedAt,
-      result: execution.payload,
-      rendered: execution.rendered
+    const logFile = options.logFile ?? job.logFile ?? null;
+    writeTerminalUnlessCancelled(job.workspaceRoot, job.id, logFile, () => {
+      writeJobFile(job.workspaceRoot, job.id, {
+        ...runningRecord,
+        status: completionStatus,
+        errorMessage,
+        threadId: execution.threadId ?? null,
+        turnId: execution.turnId ?? null,
+        resolved: execution.resolved ?? null,
+        pid: null,
+        pidIdentity: null,
+        phase: completionStatus === "completed" ? "done" : "failed",
+        completedAt,
+        result: execution.payload,
+        rendered: execution.rendered
+      });
+      upsertJob(job.workspaceRoot, {
+        id: job.id,
+        status: completionStatus,
+        errorMessage,
+        threadId: execution.threadId ?? null,
+        turnId: execution.turnId ?? null,
+        resolved: execution.resolved ?? null,
+        summary: execution.summary,
+        phase: completionStatus === "completed" ? "done" : "failed",
+        pid: null,
+        pidIdentity: null,
+        completedAt
+      });
+      removeJobPidFile(job.workspaceRoot, job.id);
+      // Nothing revisits a terminal job, so this is the last chance to release a
+      // payload the worker never consumed (a crash before the read, or one staged
+      // by the legacy-record migration).
+      removeJobRequestFile(job.workspaceRoot, job.id);
     });
-    upsertJob(job.workspaceRoot, {
-      id: job.id,
-      status: completionStatus,
-      errorMessage,
-      threadId: execution.threadId ?? null,
-      turnId: execution.turnId ?? null,
-      resolved: execution.resolved ?? null,
-      summary: execution.summary,
-      phase: completionStatus === "completed" ? "done" : "failed",
-      pid: null,
-      pidIdentity: null,
-      completedAt
-    });
-    removeJobPidFile(job.workspaceRoot, job.id);
-    // Nothing revisits a terminal job, so this is the last chance to release a
-    // payload the worker never consumed (a crash before the read, or one staged
-    // by the legacy-record migration).
-    removeJobRequestFile(job.workspaceRoot, job.id);
-    appendLogBlock(options.logFile ?? job.logFile ?? null, "Final output", execution.rendered);
+    appendLogBlock(logFile, "Final output", execution.rendered);
     return execution;
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
-    const existing = readStoredJobOrNull(job.workspaceRoot, job.id) ?? runningRecord;
-    const completedAt = nowIso();
-    writeJobFile(job.workspaceRoot, job.id, {
-      ...existing,
-      status: "failed",
-      phase: "failed",
-      errorMessage,
-      pid: null,
-      pidIdentity: null,
-      completedAt,
-      logFile: options.logFile ?? job.logFile ?? existing.logFile ?? null
+    writeTerminalUnlessCancelled(job.workspaceRoot, job.id, options.logFile ?? job.logFile ?? null, () => {
+      const existing = readStoredJobOrNull(job.workspaceRoot, job.id) ?? runningRecord;
+      const completedAt = nowIso();
+      writeJobFile(job.workspaceRoot, job.id, {
+        ...existing,
+        status: "failed",
+        phase: "failed",
+        errorMessage,
+        pid: null,
+        pidIdentity: null,
+        completedAt,
+        logFile: options.logFile ?? job.logFile ?? existing.logFile ?? null
+      });
+      upsertJob(job.workspaceRoot, {
+        id: job.id,
+        status: "failed",
+        phase: "failed",
+        pid: null,
+        pidIdentity: null,
+        errorMessage,
+        completedAt
+      });
+      removeJobPidFile(job.workspaceRoot, job.id);
+      // Nothing revisits a terminal job, so this is the last chance to release a
+      // payload the worker never consumed (a crash before the read, or one staged
+      // by the legacy-record migration).
+      removeJobRequestFile(job.workspaceRoot, job.id);
     });
-    upsertJob(job.workspaceRoot, {
-      id: job.id,
-      status: "failed",
-      phase: "failed",
-      pid: null,
-      pidIdentity: null,
-      errorMessage,
-      completedAt
-    });
-    removeJobPidFile(job.workspaceRoot, job.id);
-    // Nothing revisits a terminal job, so this is the last chance to release a
-    // payload the worker never consumed (a crash before the read, or one staged
-    // by the legacy-record migration).
-    removeJobRequestFile(job.workspaceRoot, job.id);
     throw error;
   }
 }
