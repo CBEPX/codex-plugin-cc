@@ -12,6 +12,7 @@ import { makeTempDir, run } from "./helpers.mjs";
 import { createBrokerEndpoint, parseBrokerEndpoint } from "../plugins/codex/scripts/lib/broker-endpoint.mjs";
 import {
   clearBrokerSession,
+  ensureBrokerSession,
   loadBrokerSession,
   saveBrokerSession,
   sendBrokerShutdown,
@@ -920,4 +921,103 @@ test("waitForBrokerEndpoint gives up on a socket that never connects or errors (
   assert.equal(ready, false);
   assert.ok(Date.now() - started < 1500, "must respect the overall timeout");
   assert.ok(destroyed >= 1, "hung probe sockets must be destroyed");
+});
+
+test("waitForBrokerEndpoint reads a connected probe whose close is slow as ready", async () => {
+  const connectImpl = () => {
+    const socket = new EventEmitter();
+    socket.destroy = () => {};
+    socket.end = () => {};
+    setImmediate(() => socket.emit("connect"));
+    return socket;
+  };
+  const started = Date.now();
+  const ready = await waitForBrokerEndpoint("unix:/nonexistent/broker.sock", 600, { connectImpl });
+  assert.equal(ready, true);
+  assert.ok(Date.now() - started < 1500, "must resolve within the attempt window");
+});
+
+function deadPid() {
+  const result = run(process.execPath, ["-e", ""]);
+  assert.equal(result.status, 0);
+  return result.pid;
+}
+
+test("ensureBrokerSession kills a live unreachable broker before replacing it (#753/#762)", async () => {
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const workspace = makeTempDir();
+  const sessionDir = makeTempDir("cxc-");
+  const staleEndpoint = createBrokerEndpoint(sessionDir); // nothing listens here
+  saveBrokerSession(workspace, { endpoint: staleEndpoint, pidFile: path.join(sessionDir, "broker.pid"), logFile: path.join(sessionDir, "broker.log"), sessionDir, pid: process.pid });
+  const killed = [];
+  let probes = 0;
+  const session = await ensureBrokerSession(workspace, {
+    env: buildEnv(binDir),
+    isAliveImpl: () => true,
+    ownsProcessImpl: () => { probes += 1; return true; },
+    killProcess: (pid) => { killed.push(pid); },
+    retryTimeoutMs: 300
+  });
+  try {
+    assert.deepEqual(killed, [process.pid], "the unreachable but live broker must be signalled");
+    assert.ok(probes >= 1);
+    assert.ok(session && session.endpoint !== staleEndpoint, "a fresh broker must be spawned");
+    assert.equal(loadBrokerSession(workspace)?.endpoint, session.endpoint);
+  } finally {
+    if (session?.pid) { try { process.kill(session.pid, "SIGTERM"); } catch {} }
+    clearBrokerSession(workspace);
+  }
+});
+
+test("ensureBrokerSession never signals a dead or foreign pid from a stale record (#749)", async () => {
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const workspace = makeTempDir();
+  const sessionDir = makeTempDir("cxc-");
+  saveBrokerSession(workspace, { endpoint: createBrokerEndpoint(sessionDir), pidFile: null, logFile: null, sessionDir, pid: deadPid() });
+  const killed = [];
+  const session = await ensureBrokerSession(workspace, { env: buildEnv(binDir), killProcess: (pid) => killed.push(pid) });
+  try {
+    assert.deepEqual(killed, []);
+    assert.ok(session);
+  } finally {
+    if (session?.pid) { try { process.kill(session.pid, "SIGTERM"); } catch {} }
+    clearBrokerSession(workspace);
+  }
+});
+
+test("ensureBrokerSession retries the readiness probe before giving up on a slow broker (#768)", async () => {
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const workspace = makeTempDir();
+  const sessionDir = makeTempDir("cxc-");
+  const endpoint = createBrokerEndpoint(sessionDir);
+  const server = net.createServer((socket) => socket.end());
+  saveBrokerSession(workspace, { endpoint, pidFile: null, logFile: null, sessionDir, pid: process.pid });
+  const killed = [];
+  const sessionPromise = ensureBrokerSession(workspace, {
+    env: buildEnv(binDir),
+    isAliveImpl: () => true,
+    ownsProcessImpl: () => true,
+    killProcess: (pid) => killed.push(pid),
+    retryTimeoutMs: 2000
+  });
+  let session = null;
+  try {
+    // Not listening yet during the first 150 ms probe; the 2 s retry must catch it.
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    await new Promise((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(parseBrokerEndpoint(endpoint).path, resolve);
+    });
+    session = await sessionPromise;
+    assert.deepEqual(killed, [], "a broker that answers within the retry window must not be killed");
+    assert.equal(session.endpoint, endpoint);
+  } finally {
+    session ??= await sessionPromise.catch(() => null);
+    if (session?.pid && session.pid !== process.pid) { try { process.kill(session.pid, "SIGTERM"); } catch {} }
+    server.close();
+    clearBrokerSession(workspace);
+  }
 });

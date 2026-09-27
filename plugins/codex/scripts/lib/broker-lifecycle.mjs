@@ -6,7 +6,7 @@ import process from "node:process";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { createBrokerEndpoint, parseBrokerEndpoint } from "./broker-endpoint.mjs";
-import { processCommandLine } from "./process.mjs";
+import { isPidAlive, processCommandLine, terminateProcessTree } from "./process.mjs";
 import { resolveStateDir } from "./state.mjs";
 
 export const PID_FILE_ENV = "CODEX_COMPANION_APP_SERVER_PID_FILE";
@@ -42,9 +42,10 @@ export async function waitForBrokerEndpoint(endpoint, timeoutMs = 2000, options 
         }
       };
       // A socket stuck in `connecting` fires neither connect nor error (#773).
+      // A socket that already connected but closes slowly is still a live broker.
       const timer = setTimeout(() => {
         socket.destroy();
-        finish(false);
+        finish(connected);
       }, attemptMs);
       socket.on("connect", () => {
         connected = true;
@@ -178,20 +179,38 @@ async function isBrokerEndpointReady(endpoint) {
   }
 }
 
+const STALE_BROKER_RETRY_MS = 2000;
+
 export async function ensureBrokerSession(cwd, options = {}) {
+  const killProcess = options.killProcess ?? terminateProcessTree;
+  const isAliveImpl = options.isAliveImpl ?? isPidAlive;
+  const ownsProcessImpl = options.ownsProcessImpl ?? ownsBrokerProcess;
   const existing = loadBrokerSession(cwd);
   if (existing && (await isBrokerEndpointReady(existing.endpoint))) {
     return existing;
   }
 
   if (existing) {
+    const pid = Number.isFinite(existing.pid) ? existing.pid : null;
+    const liveOwned = pid !== null && isAliveImpl(pid) === true && ownsProcessImpl(pid, existing.endpoint ?? null, options.timeoutMs);
+    // A live broker that missed the 150 ms probe is not a dead one (#768): give it the
+    // full window before deciding it is wedged.
+    if (liveOwned) {
+      const ready = await waitForBrokerEndpoint(existing.endpoint, options.retryTimeoutMs ?? STALE_BROKER_RETRY_MS).catch(() => false);
+      if (ready) {
+        return existing;
+      }
+    }
     teardownBrokerSession({
       endpoint: existing.endpoint ?? null,
       pidFile: existing.pidFile ?? null,
       logFile: existing.logFile ?? null,
       sessionDir: existing.sessionDir ?? null,
-      pid: existing.pid ?? null,
-      killProcess: options.killProcess ?? null
+      // Only a live broker that is provably ours gets a signal (#762); a dead or
+      // recycled pid is left alone (#749) — the files are stale either way.
+      pid: liveOwned ? pid : null,
+      killProcess: liveOwned ? killProcess : null,
+      ownsProcess: () => true
     });
     clearBrokerSession(cwd);
   }
@@ -222,7 +241,7 @@ export async function ensureBrokerSession(cwd, options = {}) {
       logFile,
       sessionDir,
       pid: child.pid ?? null,
-      killProcess: options.killProcess ?? null
+      killProcess
     });
     return null;
   }
@@ -243,7 +262,7 @@ export async function ensureBrokerSession(cwd, options = {}) {
 // record behind long enough for the OS to hand the PID — and with it the process
 // group `terminateProcessTree` kills — to something unrelated. Windows has no
 // cheap equivalent probe, so it keeps the previous unconditional behavior.
-function ownsBrokerProcess(pid, endpoint, timeoutMs) {
+export function ownsBrokerProcess(pid, endpoint, timeoutMs) {
   if (process.platform === "win32") {
     return true;
   }
@@ -257,9 +276,9 @@ function ownsBrokerProcess(pid, endpoint, timeoutMs) {
 // Reports whether the recorded process was actually signalled: a PID that no
 // longer looks like this broker is deliberately left alone, and a caller that
 // wonders why a broker outlived its teardown needs to know which it was.
-export function teardownBrokerSession({ endpoint = null, pidFile, logFile, sessionDir = null, pid = null, killProcess = null, timeoutMs = undefined }) {
+export function teardownBrokerSession({ endpoint = null, pidFile, logFile, sessionDir = null, pid = null, killProcess = null, timeoutMs = undefined, ownsProcess = ownsBrokerProcess }) {
   let signalled = false;
-  if (Number.isFinite(pid) && killProcess && ownsBrokerProcess(pid, endpoint, timeoutMs)) {
+  if (Number.isFinite(pid) && killProcess && ownsProcess(pid, endpoint, timeoutMs)) {
     try {
       killProcess(pid);
       signalled = true;
