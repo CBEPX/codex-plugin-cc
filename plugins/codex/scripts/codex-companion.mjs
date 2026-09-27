@@ -25,7 +25,7 @@ import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
 import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
 import { loadModelCatalog, resolveModelAlias, supportedEfforts } from "./lib/model-catalog.mjs";
-import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
+import { binaryAvailable, getProcessIdentity, terminateRecordedProcess, workerCommandLine } from "./lib/process.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import {
   consumeJobRequestFile,
@@ -907,6 +907,7 @@ function enqueueBackgroundTask(cwd, job, request) {
     // patches the real one in as soon as the worker exists.
     background: true,
     pid: null,
+    pidIdentity: null,
     logFile,
     requestFile,
     request: { ...request, config: redactConfigValues(request.config) }
@@ -936,7 +937,7 @@ function enqueueBackgroundTask(cwd, job, request) {
   // owns it — it writes an atomic `jobs/<id>.pid` sidecar plus a pid-only index
   // patch. Without it a `cancel` inside the queued window signals nothing and
   // the reaper cannot tell a dead queued worker from a live one.
-  updateJobPid(job.workspaceRoot, job.id, child.pid);
+  updateJobPid(job.workspaceRoot, job.id, child.pid, getProcessIdentity(child.pid));
 
   return {
     payload: {
@@ -1318,7 +1319,13 @@ async function handleCancel(argv) {
     );
   }
 
-  terminateProcessTree(resolveJobPid(workspaceRoot, job) ?? Number.NaN);
+  // Only a pid that is provably still this job's worker is signalled (#743).
+  const { pid, identity } = resolveJobPid(workspaceRoot, job);
+  const kill = terminateRecordedProcess(pid, { identity, commandLineMatch: workerCommandLine(job.id) });
+  const leftRunning = pid && !kill.attempted ? `worker pid ${pid} left running: ${kill.reason}` : null;
+  if (leftRunning) {
+    appendLogLine(job.logFile, leftRunning);
+  }
   appendLogLine(job.logFile, "Cancelled by user.");
 
   const completedAt = nowIso();
@@ -1327,6 +1334,7 @@ async function handleCancel(argv) {
     status: "cancelled",
     phase: "cancelled",
     pid: null,
+    pidIdentity: null,
     requestFile: null,
     completedAt,
     errorMessage: "Cancelled by user."
@@ -1353,6 +1361,7 @@ async function handleCancel(argv) {
       status: "cancelled",
       phase: "cancelled",
       pid: null,
+      pidIdentity: null,
       requestFile: null,
       errorMessage: "Cancelled by user.",
       completedAt
@@ -1364,10 +1373,12 @@ async function handleCancel(argv) {
     status: "cancelled",
     title: job.title,
     turnInterruptAttempted: interrupt.attempted,
-    turnInterrupted: interrupt.interrupted
+    turnInterrupted: interrupt.interrupted,
+    workerLeftRunning: leftRunning
   };
 
-  outputCommandResult(payload, renderCancelReport(nextJob), options.json);
+  const rendered = renderCancelReport(nextJob);
+  outputCommandResult(payload, leftRunning ? `${rendered}${leftRunning}\n` : rendered, options.json);
 }
 
 async function main() {

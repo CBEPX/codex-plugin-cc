@@ -8,13 +8,17 @@ import { fileURLToPath } from "node:url";
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 import { loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
+import { getProcessIdentity } from "../plugins/codex/scripts/lib/process.mjs";
 import { resolveClaudeSessionPath, resolveClaudeProjectsDir } from "../plugins/codex/scripts/lib/claude-session-transfer.mjs";
 import {
   consumeJobRequestFile,
   readJobFile,
   resolveJobFile,
+  resolveJobPidFile,
   resolveJobRequestFile,
-  resolveStateDir
+  resolveStateDir,
+  upsertJob,
+  writeJobFile
 } from "../plugins/codex/scripts/lib/state.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -1815,7 +1819,9 @@ test("cancel stops an active background job and marks it cancelled", async (t) =
   const jobsDir = path.join(stateDir, "jobs");
   fs.mkdirSync(jobsDir, { recursive: true });
 
-  const sleeper = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+  // A record without an identity (written by v1.2.x) is only signalled when the
+  // pid's command line is still this job's worker (#743).
+  const sleeper = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)", "task-worker", "--job-id", "task-live"], {
     cwd: workspace,
     detached: true,
     stdio: "ignore"
@@ -1902,6 +1908,66 @@ test("cancel stops an active background job and marks it cancelled", async (t) =
   const stored = JSON.parse(fs.readFileSync(jobFile, "utf8"));
   assert.equal(stored.status, "cancelled");
   assert.match(fs.readFileSync(logFile, "utf8"), /Cancelled by user/);
+});
+
+// The #743 scenario: a record from before identities existed names a pid the OS
+// has since handed to an unrelated process. Liveness says "alive", so the reaper
+// keeps the job; cancel must still refuse to signal a process that is not this
+// job's worker, and say so.
+test("cancel refuses to signal a worker whose recorded identity no longer matches and says so", { skip: process.platform === "win32" }, async (t) => {
+  const repo = makeTempDir();
+  initGitRepo(repo);
+  const stranger = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { detached: true, stdio: "ignore" });
+  stranger.unref();
+  t.after(() => {
+    try { process.kill(stranger.pid, "SIGKILL"); } catch {}
+  });
+  const job = {
+    id: "task-recycled",
+    status: "running",
+    phase: "delegating",
+    title: "Codex Task",
+    jobClass: "task",
+    pid: stranger.pid,
+    logFile: null,
+    createdAt: new Date().toISOString()
+  };
+  writeJobFile(repo, job.id, job);
+  upsertJob(repo, job);
+
+  const cancel = run("node", [SCRIPT, "cancel", job.id], { cwd: repo });
+
+  assert.equal(cancel.status, 0, cancel.stderr);
+  assert.match(cancel.stdout, new RegExp(`worker pid ${stranger.pid} left running: identity-mismatch`));
+  const json = run("node", [SCRIPT, "status", job.id, "--json"], { cwd: repo });
+  assert.equal(json.status, 0, json.stderr);
+  process.kill(stranger.pid, 0); // still alive: throws ESRCH if cancel signalled it
+});
+
+// The parent records the worker's identity next to its pid, so cancel can prove
+// the pid is still that worker before signalling it.
+test("a background worker's pid sidecar carries its identity and cancel signals it", { skip: process.platform === "win32" }, async () => {
+  const repo = seededRepo();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const env = buildEnv(binDir, { FAKE_CODEX_TURN_DELAY_MS: "8000" });
+  const launched = run("node", [SCRIPT, "task", "--background", "--json", "slow"], { cwd: repo, env });
+  assert.equal(launched.status, 0, launched.stderr);
+  const jobId = JSON.parse(launched.stdout).jobId;
+  const sidecar = JSON.parse(fs.readFileSync(resolveJobPidFile(repo, jobId), "utf8"));
+  try {
+    assert.ok(Number.isInteger(sidecar.pid));
+    assert.equal(sidecar.identity, getProcessIdentity(sidecar.pid));
+    assert.match(sidecar.identity, /^(linux|darwin):/);
+    const cancel = run("node", [SCRIPT, "cancel", jobId], { cwd: repo, env });
+    assert.equal(cancel.status, 0, cancel.stderr);
+    assert.doesNotMatch(cancel.stdout, /left running/);
+    await waitFor(() => {
+      try { process.kill(sidecar.pid, 0); return false; } catch (error) { return error?.code === "ESRCH"; }
+    });
+  } finally {
+    try { process.kill(-sidecar.pid, "SIGKILL"); } catch {}
+  }
 });
 
 test("cancel without a job id ignores active jobs from other Claude sessions", () => {
@@ -2136,6 +2202,8 @@ test("session end fully cleans up jobs for the ending session", async (t) => {
             title: "Codex Review",
             sessionId: "sess-current",
             pid: sleeper.pid,
+            // Records since v1.3.0 carry the worker's identity (#743).
+            pidIdentity: getProcessIdentity(sleeper.pid),
             logFile: runningLog,
             createdAt: "2026-03-18T15:32:00.000Z",
             updatedAt: "2026-03-18T15:33:00.000Z"
@@ -2264,6 +2332,7 @@ test("session end preserves background jobs and their broker so workers survive 
             title: "Codex Review",
             sessionId: "sess-current",
             pid: foregroundSleeper.pid,
+            pidIdentity: getProcessIdentity(foregroundSleeper.pid),
             logFile: foregroundLog,
             createdAt: "2026-03-18T15:32:00.000Z",
             updatedAt: "2026-03-18T15:33:00.000Z"

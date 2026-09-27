@@ -18,6 +18,7 @@ import {
   sendBrokerShutdown,
   waitForBrokerEndpoint
 } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
+import { terminateProcessTree } from "../plugins/codex/scripts/lib/process.mjs";
 import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -937,6 +938,18 @@ test("waitForBrokerEndpoint reads a connected probe whose close is slow as ready
   assert.ok(Date.now() - started < 1500, "must resolve within the attempt window");
 });
 
+// Records every kill; a pid other than the test runner's own (a fresh broker that
+// missed its readiness window on a slow machine) is really terminated, or it is
+// orphaned.
+function recordingKill(killed) {
+  return (pid) => {
+    killed.push(pid);
+    if (pid !== process.pid) {
+      terminateProcessTree(pid);
+    }
+  };
+}
+
 function deadPid() {
   const result = run(process.execPath, ["-e", ""]);
   assert.equal(result.status, 0);
@@ -956,7 +969,7 @@ test("ensureBrokerSession kills a live unreachable broker before replacing it (#
     env: buildEnv(binDir),
     isAliveImpl: () => true,
     ownsProcessImpl: () => { probes += 1; return true; },
-    killProcess: (pid) => { killed.push(pid); },
+    killProcess: recordingKill(killed),
     retryTimeoutMs: 300
   });
   try {
@@ -977,13 +990,32 @@ test("ensureBrokerSession never signals a dead or foreign pid from a stale recor
   const sessionDir = makeTempDir("cxc-");
   saveBrokerSession(workspace, { endpoint: createBrokerEndpoint(sessionDir), pidFile: null, logFile: null, sessionDir, pid: deadPid() });
   const killed = [];
-  const session = await ensureBrokerSession(workspace, { env: buildEnv(binDir), killProcess: (pid) => killed.push(pid) });
+  const session = await ensureBrokerSession(workspace, { env: buildEnv(binDir), killProcess: recordingKill(killed) });
   try {
     assert.deepEqual(killed, []);
     assert.ok(session);
   } finally {
     if (session?.pid) { try { process.kill(session.pid, "SIGTERM"); } catch {} }
     clearBrokerSession(workspace);
+  }
+
+  // Alive but not ours: the pid now belongs to something else.
+  const foreignWorkspace = makeTempDir();
+  const foreignDir = makeTempDir("cxc-");
+  saveBrokerSession(foreignWorkspace, { endpoint: createBrokerEndpoint(foreignDir), pidFile: null, logFile: null, sessionDir: foreignDir, pid: process.pid });
+  const foreignKilled = [];
+  const replacement = await ensureBrokerSession(foreignWorkspace, {
+    env: buildEnv(binDir),
+    isAliveImpl: () => true,
+    ownsProcessImpl: () => false,
+    killProcess: recordingKill(foreignKilled)
+  });
+  try {
+    assert.deepEqual(foreignKilled, []);
+    assert.ok(replacement);
+  } finally {
+    if (replacement?.pid) { try { process.kill(replacement.pid, "SIGTERM"); } catch {} }
+    clearBrokerSession(foreignWorkspace);
   }
 });
 
@@ -1000,7 +1032,7 @@ test("ensureBrokerSession retries the readiness probe before giving up on a slow
     env: buildEnv(binDir),
     isAliveImpl: () => true,
     ownsProcessImpl: () => true,
-    killProcess: (pid) => killed.push(pid),
+    killProcess: recordingKill(killed),
     retryTimeoutMs: 2000
   });
   let session = null;
@@ -1035,16 +1067,36 @@ test("loadBrokerSession ignores a malformed record instead of trusting it", () =
       "[]",
       JSON.stringify({ endpoint: "ftp://x", pid: 1 }),
       JSON.stringify({ endpoint: "unix:/tmp/x.sock", pid: -5 }),
-      JSON.stringify({ endpoint: "unix:/tmp/x.sock", pid: 1, pidFile: "relative/broker.pid" })
+      JSON.stringify({ endpoint: "unix:/tmp/x.sock", pid: 1, pidFile: "relative/broker.pid" }),
+      JSON.stringify({ endpoint: "unix:/tmp/x.sock", pid: 1, pidIdentity: 42 })
     ]) {
       fs.writeFileSync(file, bad);
       assert.equal(loadBrokerSession(workspace), null, bad);
     }
     fs.writeFileSync(file, JSON.stringify({ endpoint: "unix:/tmp/x.sock", pid: null, pidFile: null, logFile: null, sessionDir: null }));
     assert.ok(loadBrokerSession(workspace));
+    fs.writeFileSync(file, JSON.stringify({ endpoint: "unix:/tmp/x.sock", pid: 1, pidIdentity: "linux:1" }));
+    assert.ok(loadBrokerSession(workspace));
   } finally {
     process.stderr.write = originalWrite;
   }
-  assert.equal(notes.length, 4);
+  assert.equal(notes.length, 5);
   assert.ok(notes.every((note) => note.startsWith(`[codex] Ignoring malformed broker.json at ${file}: `)));
+});
+
+// The recorded pid is alive (it is this test runner) but its start identity is
+// not the one the broker recorded: the pid was recycled, so it must not be
+// signalled (#743).
+test("SessionEnd leaves a recorded broker pid alone when its identity no longer matches (#743)", { skip: process.platform === "win32" }, async () => {
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const workspace = makeTempDir();
+  const sessionDir = makeTempDir("cxc-");
+  const endpoint = createBrokerEndpoint(sessionDir);
+  saveBrokerSession(workspace, { endpoint, pidFile: null, logFile: null, sessionDir, pid: process.pid, pidIdentity: "darwin:definitely-not-this|nope" });
+  const hook = run("node", [SESSION_HOOK, "SessionEnd"], { cwd: workspace, env: buildEnv(binDir), input: JSON.stringify({ cwd: workspace, session_id: "sess-identity" }) });
+  assert.equal(hook.status, 0, hook.stderr);
+  assert.match(hook.stderr, /signalled=false/);
+  assert.match(hook.stderr, /identity-mismatch/);
+  clearBrokerSession(workspace);
 });

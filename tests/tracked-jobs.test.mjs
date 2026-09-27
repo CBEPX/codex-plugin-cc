@@ -6,6 +6,7 @@ import { spawn } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { makeTempDir, run } from "./helpers.mjs";
+import { getProcessIdentity } from "../plugins/codex/scripts/lib/process.mjs";
 import { reapDeadJobs, runTrackedJob } from "../plugins/codex/scripts/lib/tracked-jobs.mjs";
 import {
   listJobs,
@@ -275,7 +276,7 @@ test("updateJobPid records the worker pid without rewriting the job file", () =>
   const stored = readJobFile(jobFile);
   assert.equal(stored.status, "queued");
   assert.equal(stored.requestFile, job.requestFile);
-  assert.equal(resolveJobPid(workspace, stored), 424242, "readers must find the pid in the sidecar");
+  assert.deepEqual(resolveJobPid(workspace, stored), { pid: 424242, identity: null }, "readers must find the pid in the sidecar");
   assert.equal(listJobs(workspace).find((entry) => entry.id === "job-pid").pid, 424242);
 });
 
@@ -309,7 +310,7 @@ test("updateJobPid leaves a record the worker already completed intact", () => {
   const indexed = listJobs(workspace).find((entry) => entry.id === "job-raced");
   assert.equal(indexed.status, "completed");
   assert.equal(indexed.pid, null, "a finished job must not get its pid back");
-  assert.equal(resolveJobPid(workspace, stored), null, "a terminal record never reports a pid");
+  assert.deepEqual(resolveJobPid(workspace, stored), { pid: null, identity: null }, "a terminal record never reports a pid");
 });
 
 // A worker that took the record over but has not written its own pid yet is
@@ -395,4 +396,57 @@ test("a terminal write releases the job's private request payload", async () => 
     /boom/
   );
   assert.equal(fs.existsSync(resolveJobRequestFile(workspace, "job-thrown")), false, "a failed job must not keep its payload");
+});
+
+// A live pid is not proof of a live worker: the OS may have handed the number to
+// something else (#743). The recorded identity tells them apart.
+test("reapDeadJobs fails a running job whose pid was recycled by another process", () => {
+  const workspace = makeTempDir();
+  seedJob(workspace, { id: "job-recycled", status: "running", phase: "delegating", pid: process.pid, pidIdentity: "linux:not-this-process", logFile: null });
+  const reaped = reapDeadJobs(workspace, listJobs(workspace), { getProcessIdentityImpl: () => "linux:something-else" });
+  assert.equal(reaped[0].status, "failed");
+  assert.match(reaped[0].errorMessage, /pid reused/);
+  assert.equal(reaped[0].pidIdentity, null);
+});
+
+test("reapDeadJobs leaves a running job alone when the identity probe fails", () => {
+  const workspace = makeTempDir();
+  seedJob(workspace, { id: "job-probe-fails", status: "running", phase: "delegating", pid: process.pid, pidIdentity: "linux:x", logFile: null });
+  const reaped = reapDeadJobs(workspace, listJobs(workspace), { getProcessIdentityImpl: () => { throw new Error("ps unavailable"); } });
+  assert.equal(reaped[0].status, "running");
+});
+
+test("reapDeadJobs keeps a running job whose identity still matches", () => {
+  const workspace = makeTempDir();
+  seedJob(workspace, { id: "job-same", status: "running", phase: "delegating", pid: process.pid, pidIdentity: "linux:same", logFile: null });
+  const reaped = reapDeadJobs(workspace, listJobs(workspace), { getProcessIdentityImpl: () => "linux:same" });
+  assert.equal(reaped[0].status, "running");
+});
+
+test("pid sidecar round-trips identity and still reads the legacy bare integer", () => {
+  const workspace = makeTempDir();
+  seedJob(workspace, { id: "job-sidecar", status: "queued", phase: "queued", pid: null, logFile: null });
+  updateJobPid(workspace, "job-sidecar", 777, "linux:777");
+  assert.deepEqual(resolveJobPid(workspace, listJobs(workspace)[0]), { pid: 777, identity: "linux:777" });
+  fs.writeFileSync(resolveJobPidFile(workspace, "job-sidecar"), "778\n");
+  assert.deepEqual(resolveJobPid(workspace, { id: "job-sidecar", status: "queued", pid: null }), { pid: 778, identity: null });
+  updateJobPid(workspace, "job-sidecar", 779, "linux:779");
+  assert.deepEqual(resolveJobPid(workspace, { id: "job-sidecar", status: "queued", pid: null }), { pid: 779, identity: "linux:779" });
+});
+
+test("runTrackedJob records the worker identity and clears it with the pid", async () => {
+  const workspace = makeTempDir();
+  const job = { id: "job-identity", workspaceRoot: workspace, status: "queued", logFile: null };
+  seedJob(workspace, job);
+  let running = null;
+  await runTrackedJob(job, async () => {
+    running = readJobFile(resolveJobFile(workspace, "job-identity"));
+    return { exitStatus: 0, payload: {}, rendered: "", summary: "" };
+  });
+  assert.equal(running.pid, process.pid);
+  assert.equal(running.pidIdentity, process.platform === "win32" ? null : getProcessIdentity(process.pid));
+  const done = readJobFile(resolveJobFile(workspace, "job-identity"));
+  assert.deepEqual([done.pid, done.pidIdentity], [null, null]);
+  const indexed = listJobs(workspace).find((entry) => entry.id === "job-identity");
+  assert.deepEqual([indexed.pid, indexed.pidIdentity], [null, null]);
 });

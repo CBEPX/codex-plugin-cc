@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { isPidAlive } from "./process.mjs";
+import { getProcessIdentity, isPidAlive } from "./process.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
 const STATE_VERSION = 1;
@@ -245,6 +245,7 @@ function sleepSync(ms) {
 const LOCK_ENTRY_GONE = "gone";
 const LOCK_ENTRY_HELD = "held";
 const LOCK_ENTRY_ABANDONED = "abandoned";
+const LOCK_IDENTITY_PROBE_MS = 2000;
 
 // Only the entry having disappeared is an answer. Every other stat failure —
 // EACCES, EIO, ELOOP — says nothing about the owner, and guessing there is how a
@@ -302,6 +303,15 @@ function judgeLockEntry(entryPath) {
   if (owner) {
     const alive = isPidAlive(owner.pid);
     if (alive === true) {
+      // A live pid that is provably another process is a recycled one (#743).
+      // An identity we cannot read proves nothing and keeps the entry.
+      // ponytail: win32 lock entries stay PID-liveness only (no identity recorded there)
+      if (typeof owner.identity === "string") {
+        const actual = getProcessIdentity(owner.pid, { timeoutMs: LOCK_IDENTITY_PROBE_MS });
+        if (actual && actual !== owner.identity) {
+          return LOCK_ENTRY_ABANDONED;
+        }
+      }
       return LOCK_ENTRY_HELD;
     }
     if (alive === false) {
@@ -443,7 +453,8 @@ function lockTimeoutError(lockDir, blockers, waitMs) {
 function acquireTicket(lockDir, waitMs) {
   fs.mkdirSync(lockDir, { recursive: true });
   const token = `${process.pid}-${randomBytes(8).toString("hex")}`;
-  const owner = `${JSON.stringify({ pid: process.pid, startedAt: nowIso() })}\n`;
+  const identity = process.platform === "win32" ? null : getProcessIdentity(process.pid);
+  const owner = `${JSON.stringify({ pid: process.pid, startedAt: nowIso(), identity })}\n`;
   const choosingName = `${LOCK_CHOOSING_PREFIX}${token}`;
 
   writeLockEntry(lockDir, choosingName, token, owner);
@@ -634,8 +645,8 @@ export function upsertJob(cwd, jobPatch) {
 // threadId and turnId. The pid goes into an atomic sidecar plus the pid-only
 // index patch, and readers fall back to the sidecar (`resolveJobPid`) only while
 // the job is still active.
-export function updateJobPid(cwd, jobId, pid) {
-  writeJobPidFile(cwd, jobId, pid);
+export function updateJobPid(cwd, jobId, pid, identity = null) {
+  writeJobPidFile(cwd, jobId, pid, identity);
   // The index is patch-based, so it cannot lose a field — but a worker that
   // already reported `running` wrote its own pid there, and that record is the
   // newer one. A job that is gone from the index needs no pid at all. The read
@@ -644,7 +655,7 @@ export function updateJobPid(cwd, jobId, pid) {
   withStateLock(cwd, () => {
     const indexed = listJobs(cwd).find((job) => job.id === jobId);
     if (indexed?.status === "queued") {
-      upsertJob(cwd, { id: jobId, pid });
+      upsertJob(cwd, { id: jobId, pid, pidIdentity: identity });
     }
   });
 }
@@ -735,18 +746,23 @@ export function resolveJobPidFile(cwd, jobId) {
   return path.join(resolveJobsDir(cwd), `${jobId}.pid`);
 }
 
-export function writeJobPidFile(cwd, jobId, pid) {
-  return writeFileAtomic(resolveJobPidFile(cwd, jobId), `${pid}\n`);
+export function writeJobPidFile(cwd, jobId, pid, identity = null) {
+  return writeFileAtomic(resolveJobPidFile(cwd, jobId), `${JSON.stringify({ pid, identity })}\n`);
 }
 
 export function removeJobPidFile(cwd, jobId) {
   removeFileIfExists(resolveJobPidFile(cwd, jobId));
 }
 
+// `{"pid":N,"identity":"..."}`, or the bare integer v1.2.x wrote.
 function readJobPidSidecar(cwd, jobId) {
   try {
-    const pid = Number.parseInt(fs.readFileSync(resolveJobPidFile(cwd, jobId), "utf8").trim(), 10);
-    return Number.isInteger(pid) && pid > 0 ? pid : null;
+    const raw = fs.readFileSync(resolveJobPidFile(cwd, jobId), "utf8").trim();
+    const parsed = raw.startsWith("{") ? JSON.parse(raw) : { pid: Number.parseInt(raw, 10), identity: null };
+    if (!Number.isInteger(parsed.pid) || parsed.pid <= 0) {
+      return null;
+    }
+    return { pid: parsed.pid, identity: typeof parsed.identity === "string" ? parsed.identity : null };
   } catch {
     return null;
   }
@@ -755,15 +771,16 @@ function readJobPidSidecar(cwd, jobId) {
 // The pid every reader (cancel, reaper, SessionEnd cleanup) should use: the
 // record's own pid once the worker has taken the record over, the sidecar during
 // the queued window before that. A terminal job never reports one — its worker
-// is gone and the sidecar may name a pid the OS has recycled.
+// is gone and the sidecar may name a pid the OS has recycled. The identity
+// recorded with the pid comes along (`null` for records from before v1.3.0).
 export function resolveJobPid(cwd, job) {
   if (job?.pid != null) {
-    return job.pid;
+    return { pid: job.pid, identity: typeof job.pidIdentity === "string" ? job.pidIdentity : null };
   }
   if (job?.status !== "queued" && job?.status !== "running") {
-    return null;
+    return { pid: null, identity: null };
   }
-  return readJobPidSidecar(cwd, job.id);
+  return readJobPidSidecar(cwd, job.id) ?? { pid: null, identity: null };
 }
 
 // The full task request can carry secrets (`--config` values such as auth

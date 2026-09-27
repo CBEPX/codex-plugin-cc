@@ -6,7 +6,7 @@ import process from "node:process";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { createBrokerEndpoint, parseBrokerEndpoint } from "./broker-endpoint.mjs";
-import { isPidAlive, processCommandLine, terminateProcessTree } from "./process.mjs";
+import { getProcessIdentity, isPidAlive, processCommandLine, terminateProcessTree, terminateRecordedProcess } from "./process.mjs";
 import { resolveStateDir } from "./state.mjs";
 
 export const PID_FILE_ENV = "CODEX_COMPANION_APP_SERVER_PID_FILE";
@@ -157,6 +157,9 @@ function describeBrokerRecordProblem(record) {
   if (record.pid != null && !(Number.isInteger(record.pid) && record.pid > 0)) {
     return "pid is not a positive integer";
   }
+  if (record.pidIdentity != null && typeof record.pidIdentity !== "string") {
+    return "pidIdentity is not a string";
+  }
   for (const key of ["pidFile", "logFile", "sessionDir"]) {
     if (record[key] != null && !(typeof record[key] === "string" && path.isAbsolute(record[key]))) {
       return `${key} is not an absolute path`;
@@ -239,6 +242,7 @@ export async function ensureBrokerSession(cwd, options = {}) {
       // Only a live broker that is provably ours gets a signal (#762); a dead or
       // recycled pid is left alone (#749) — the files are stale either way.
       pid: liveOwned ? pid : null,
+      pidIdentity: existing.pidIdentity ?? null,
       killProcess: liveOwned ? killProcess : null,
       ownsProcess: () => true
     });
@@ -262,6 +266,9 @@ export async function ensureBrokerSession(cwd, options = {}) {
     logFile,
     env: options.env ?? process.env
   });
+  // Captured before the readiness wait, so even the teardown of a broker that
+  // never came up signals only the process it spawned.
+  const pidIdentity = getProcessIdentity(child.pid ?? Number.NaN);
 
   const ready = await waitForBrokerEndpoint(endpoint, options.timeoutMs ?? 2000);
   if (!ready) {
@@ -271,6 +278,7 @@ export async function ensureBrokerSession(cwd, options = {}) {
       logFile,
       sessionDir,
       pid: child.pid ?? null,
+      pidIdentity,
       killProcess
     });
     return null;
@@ -281,7 +289,8 @@ export async function ensureBrokerSession(cwd, options = {}) {
     pidFile,
     logFile,
     sessionDir,
-    pid: child.pid ?? null
+    pid: child.pid ?? null,
+    pidIdentity
   };
   saveBrokerSession(cwd, session);
   return session;
@@ -290,30 +299,40 @@ export async function ensureBrokerSession(cwd, options = {}) {
 // A recorded PID is only worth signalling while it still belongs to this
 // session's broker: an idle self-terminate (or any abnormal exit) can leave the
 // record behind long enough for the OS to hand the PID — and with it the process
-// group `terminateProcessTree` kills — to something unrelated. Windows has no
-// cheap equivalent probe, so it keeps the previous unconditional behavior.
-export function ownsBrokerProcess(pid, endpoint, timeoutMs) {
+// group `terminateProcessTree` kills — to something unrelated. This command-line
+// check is what a record without an identity falls back to. It answers `true` on
+// Windows, which has no cheap probe, but teardown itself refuses to signal there
+// without an identity (`identity-unavailable`, CIM identity is v1.4.0).
+export function ownsBrokerProcess(pid, endpoint, timeoutMs, commandLine = processCommandLine(pid, { timeoutMs })) {
   if (process.platform === "win32") {
     return true;
   }
-  const commandLine = processCommandLine(pid, { timeoutMs });
   if (!commandLine || !commandLine.includes("app-server-broker.mjs")) {
     return false;
   }
   return !endpoint || commandLine.includes(endpoint);
 }
 
-// Reports whether the recorded process was actually signalled: a PID that no
-// longer looks like this broker is deliberately left alone, and a caller that
+// Reports whether the recorded process was actually signalled, and why not: a
+// PID whose identity (or, for a record without one, command line) no longer
+// matches this broker is deliberately left alone (#743), and a caller that
 // wonders why a broker outlived its teardown needs to know which it was.
-export function teardownBrokerSession({ endpoint = null, pidFile, logFile, sessionDir = null, pid = null, killProcess = null, timeoutMs = undefined, ownsProcess = ownsBrokerProcess }) {
+export function teardownBrokerSession({ endpoint = null, pidFile, logFile, sessionDir = null, pid = null, pidIdentity = null, killProcess = null, timeoutMs = undefined, ownsProcess = ownsBrokerProcess }) {
   let signalled = false;
-  if (Number.isFinite(pid) && killProcess && ownsProcess(pid, endpoint, timeoutMs)) {
+  let reason = "no-pid";
+  if (Number.isFinite(pid) && killProcess) {
     try {
-      killProcess(pid);
-      signalled = true;
+      const outcome = terminateRecordedProcess(pid, {
+        identity: pidIdentity,
+        commandLineMatch: (commandLine) => ownsProcess(pid, endpoint, timeoutMs, commandLine),
+        timeoutMs,
+        terminateImpl: (target) => killProcess(target)
+      });
+      signalled = outcome.attempted && outcome.delivered;
+      reason = outcome.reason;
     } catch {
       // Ignore missing or already-exited broker processes.
+      reason = "kill-failed";
     }
   }
 
@@ -345,5 +364,5 @@ export function teardownBrokerSession({ endpoint = null, pidFile, logFile, sessi
     }
   }
 
-  return { signalled };
+  return { signalled, reason };
 }

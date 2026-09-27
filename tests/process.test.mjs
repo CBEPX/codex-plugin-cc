@@ -2,8 +2,15 @@ import path from "node:path";
 import process from "node:process";
 import test from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 
-import { processCommandLine, terminateProcessTree } from "../plugins/codex/scripts/lib/process.mjs";
+import {
+  getProcessIdentity,
+  processCommandLine,
+  runCommand,
+  terminateProcessTree,
+  terminateRecordedProcess
+} from "../plugins/codex/scripts/lib/process.mjs";
 
 test("terminateProcessTree uses taskkill on Windows", () => {
   let captured = null;
@@ -64,4 +71,93 @@ test("processCommandLine reads the command line of a live process", { skip: proc
 
 test("processCommandLine returns null for a pid that is not running", { skip: process.platform === "win32" }, () => {
   assert.equal(processCommandLine(2 ** 31 - 1), null);
+});
+
+// A pid alone cannot tell the process that was recorded from the one that
+// inherited the number (#743): identity is the start time, which a recycled pid
+// cannot share.
+test("getProcessIdentity is stable for the same process and differs for another one", { skip: process.platform === "win32" }, () => {
+  const mine = getProcessIdentity(process.pid);
+  assert.ok(mine && mine.length > 0);
+  assert.equal(getProcessIdentity(process.pid), mine);
+  const child = spawnSync(process.execPath, ["-e", "setTimeout(()=>{}, 2000); console.log(process.pid)"], { encoding: "utf8", timeout: 100 });
+  // The child was killed by the timeout; its identity, if any, must not equal ours.
+  assert.notEqual(getProcessIdentity(Number(child.stdout.trim()) || 999999), mine);
+});
+
+test("getProcessIdentity parses linux /proc stat and darwin ps output", () => {
+  assert.equal(getProcessIdentity(42, { platform: "linux", readFileSyncImpl: () => "42 (node (x)) S 1 42 42 0 -1 4194560 1 0 0 0 0 0 0 0 20 0 1 0 123456 1 2 3" }), "linux:123456");
+  assert.equal(getProcessIdentity(42, { platform: "darwin", runCommandImpl: () => ({ status: 0, stdout: "Mon Sep 27 10:00:00 2026 node\n", stderr: "", error: null }) }), "darwin:Mon Sep 27 10:00:00 2026|node");
+  assert.equal(getProcessIdentity(42, { platform: "win32" }), null);
+});
+
+// `comm` on darwin is the executable path, which can hold spaces; and `lstart`
+// follows the locale and time zone unless they are pinned — a process recorded
+// under one locale and checked under another must not read as a different one.
+test("getProcessIdentity pins the darwin ps locale and keeps a comm path with spaces whole", () => {
+  let seen = null;
+  const identity = getProcessIdentity(42, {
+    platform: "darwin",
+    runCommandImpl: (command, args, options) => {
+      seen = { command, args, options };
+      return { status: 0, stdout: "Sun Sep  7 09:00:00 2026     /Applications/Visual Studio Code.app/Contents/MacOS/Electron\n", stderr: "", error: null };
+    }
+  });
+  assert.equal(identity, "darwin:Sun Sep  7 09:00:00 2026|/Applications/Visual Studio Code.app/Contents/MacOS/Electron");
+  assert.equal(seen.options.shell, false);
+  assert.equal(seen.options.env.LC_ALL, "C");
+  assert.equal(seen.options.env.TZ, "UTC");
+  // A spent budget is not "no timeout": spawnSync reads 0 as unbounded.
+  assert.equal(getProcessIdentity(42, { platform: "darwin", timeoutMs: 0, runCommandImpl: () => assert.fail("must not probe") }), null);
+});
+
+test("runCommand reports a timed-out command as having no exit status", { skip: process.platform === "win32" }, () => {
+  const result = runCommand(process.execPath, ["-e", "setTimeout(()=>{}, 5000)"], { timeoutMs: 100 });
+  assert.equal(result.status, null);
+  assert.notEqual(result.status, 0);
+});
+
+test("terminateRecordedProcess refuses on identity mismatch and without identity on win32", () => {
+  let killed = false;
+  const mismatch = terminateRecordedProcess(4242, { identity: "linux:1", platform: "linux", readFileSyncImpl: () => "4242 (node) S 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 0 0 1 0 999 0 0 0", killImpl: () => { killed = true; } });
+  assert.equal(mismatch.attempted, false);
+  assert.equal(mismatch.reason, "identity-mismatch");
+  assert.equal(killed, false);
+  const win = terminateRecordedProcess(4242, { identity: null, platform: "win32", killImpl: () => { killed = true; } });
+  assert.deepEqual([win.attempted, win.reason, killed], [false, "identity-unavailable", false]);
+});
+
+test("terminateRecordedProcess signals on a matching identity and refuses when it is unavailable", () => {
+  const calls = [];
+  const stat = "4242 (node) S 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 0 0 1 0 999 0 0 0";
+  const ok = terminateRecordedProcess(4242, { identity: "linux:999", platform: "linux", readFileSyncImpl: () => stat, killImpl: (pid, sig) => calls.push([pid, sig]) });
+  assert.deepEqual([ok.attempted, ok.reason], [true, "identity-match"]);
+  assert.deepEqual(calls, [[-4242, "SIGTERM"]]);
+  const gone = terminateRecordedProcess(4242, { identity: "linux:999", platform: "linux", readFileSyncImpl: () => { throw new Error("ENOENT"); }, killImpl: () => calls.push("must not") });
+  assert.deepEqual([gone.attempted, gone.reason], [false, "identity-unavailable"]);
+  assert.equal(terminateRecordedProcess(Number.NaN).reason, "no-pid");
+  assert.equal(calls.length, 1);
+});
+
+test("terminateRecordedProcess falls back to the command line on posix when no identity was recorded", () => {
+  const calls = [];
+  const ok = terminateRecordedProcess(4242, { identity: null, platform: "linux", commandLineMatch: /app-server-broker\.mjs/, runCommandImpl: () => ({ status: 0, stdout: "node app-server-broker.mjs serve\n", stderr: "", error: null }), killImpl: (pid, sig) => calls.push([pid, sig]) });
+  assert.equal(ok.attempted, true);
+  assert.equal(ok.reason, "command-line-match");
+  assert.deepEqual(calls[0], [-4242, "SIGTERM"]);
+  const no = terminateRecordedProcess(4242, { identity: null, platform: "linux", commandLineMatch: /app-server-broker\.mjs/, runCommandImpl: () => ({ status: 0, stdout: "bash\n", stderr: "", error: null }), killImpl: () => calls.push("must not") });
+  assert.equal(no.attempted, false);
+  assert.equal(calls.length, 1);
+});
+
+test("terminateRecordedProcess hands a verified pid to an injected terminateImpl", () => {
+  const terminated = [];
+  const outcome = terminateRecordedProcess(4242, {
+    platform: "linux",
+    commandLineMatch: () => true,
+    runCommandImpl: () => ({ status: 0, stdout: "node x\n", stderr: "", error: null }),
+    terminateImpl: (pid) => terminated.push(pid)
+  });
+  assert.deepEqual(terminated, [4242]);
+  assert.deepEqual([outcome.attempted, outcome.delivered, outcome.reason], [true, true, "command-line-match"]);
 });

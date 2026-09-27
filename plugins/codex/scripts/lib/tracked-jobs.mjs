@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import process from "node:process";
 
-import { isPidAlive } from "./process.mjs";
+import { getProcessIdentity, isPidAlive } from "./process.mjs";
 
 import {
   readJobFile,
@@ -167,6 +167,7 @@ export async function runTrackedJob(job, runner, options = {}) {
     startedAt: nowIso(),
     phase: "starting",
     pid: process.pid,
+    pidIdentity: getProcessIdentity(process.pid),
     logFile: options.logFile ?? job.logFile ?? null
   };
   writeJobFile(job.workspaceRoot, job.id, runningRecord);
@@ -187,6 +188,7 @@ export async function runTrackedJob(job, runner, options = {}) {
       turnId: execution.turnId ?? null,
       resolved: execution.resolved ?? null,
       pid: null,
+      pidIdentity: null,
       phase: completionStatus === "completed" ? "done" : "failed",
       completedAt,
       result: execution.payload,
@@ -202,6 +204,7 @@ export async function runTrackedJob(job, runner, options = {}) {
       summary: execution.summary,
       phase: completionStatus === "completed" ? "done" : "failed",
       pid: null,
+      pidIdentity: null,
       completedAt
     });
     removeJobPidFile(job.workspaceRoot, job.id);
@@ -221,6 +224,7 @@ export async function runTrackedJob(job, runner, options = {}) {
       phase: "failed",
       errorMessage,
       pid: null,
+      pidIdentity: null,
       completedAt,
       logFile: options.logFile ?? job.logFile ?? existing.logFile ?? null
     });
@@ -229,6 +233,7 @@ export async function runTrackedJob(job, runner, options = {}) {
       status: "failed",
       phase: "failed",
       pid: null,
+      pidIdentity: null,
       errorMessage,
       completedAt
     });
@@ -271,6 +276,7 @@ function markJobDeadLocked(workspaceRoot, jobSummary, errorMessage) {
       resolved: base.resolved ?? null,
       requestFile: base.requestFile ?? null,
       pid: null,
+      pidIdentity: null,
       completedAt: base.completedAt ?? null
     });
     return base;
@@ -288,6 +294,7 @@ function markJobDeadLocked(workspaceRoot, jobSummary, errorMessage) {
     phase: "failed",
     errorMessage,
     pid: null,
+    pidIdentity: null,
     requestFile: null,
     completedAt,
     // Keep updatedAt current so the reaped job sorts newest-first in the same
@@ -301,6 +308,7 @@ function markJobDeadLocked(workspaceRoot, jobSummary, errorMessage) {
     status: "failed",
     phase: "failed",
     pid: null,
+    pidIdentity: null,
     requestFile: null,
     errorMessage,
     completedAt
@@ -342,16 +350,17 @@ function isQueuedWithoutWorker(job, pid) {
 // liveness is only consulted for jobs whose own file still says they are active.
 // Below this there is no point starting another lock wait.
 const REAP_MIN_STEP_MS = 100;
+const IDENTITY_PROBE_MS = 2000;
 
 /**
- * @param {{ lockWaitMs?: number, remainingMs?: () => number }} [options] Bounds the
+ * @param {{ lockWaitMs?: number, remainingMs?: () => number, getProcessIdentityImpl?: typeof getProcessIdentity }} [options] Bounds the
  * reaper's own state-lock waits. Each dead job costs one acquisition, so a caller
  * working to a deadline passes `remainingMs` and every wait is clamped to what is
  * left of it; once that is spent the remaining jobs are left for the next run
  * rather than reaped past the caller's budget.
  */
 export function reapDeadJobs(workspaceRoot, jobs, options = {}) {
-  const { lockWaitMs, remainingMs } = options;
+  const { lockWaitMs, remainingMs, getProcessIdentityImpl = getProcessIdentity } = options;
   const waitFor = () => {
     if (!remainingMs) {
       return lockWaitMs;
@@ -378,9 +387,22 @@ export function reapDeadJobs(workspaceRoot, jobs, options = {}) {
     }
     // The queued record carries no pid of its own — the parent records it in an
     // atomic sidecar instead of rewriting the worker's job file.
-    const pid = resolveJobPid(workspaceRoot, job);
+    const { pid, identity } = resolveJobPid(workspaceRoot, job);
     if (isPidAlive(pid) === false || isQueuedWithoutWorker(job, pid)) {
       return markJobDead(workspaceRoot, job, DEAD_WORKER_MESSAGE, waitFor());
+    }
+    // Alive is not enough: the pid may now belong to another process (#743).
+    // A probe that fails or times out proves nothing, so the job is left alone.
+    if (pid && identity) {
+      let actual = null;
+      try {
+        actual = getProcessIdentityImpl(pid, { timeoutMs: remainingMs ? Math.min(IDENTITY_PROBE_MS, remainingMs()) : IDENTITY_PROBE_MS });
+      } catch {
+        actual = null;
+      }
+      if (actual && actual !== identity) {
+        return markJobDead(workspaceRoot, job, `${DEAD_WORKER_MESSAGE} (pid reused: ${pid} now belongs to another process)`, waitFor());
+      }
     }
     return job;
   });

@@ -3,7 +3,7 @@
 import fs from "node:fs";
 import process from "node:process";
 
-import { terminateProcessTree } from "./lib/process.mjs";
+import { terminateProcessTree, terminateRecordedProcess, workerCommandLine } from "./lib/process.mjs";
 import { BROKER_ENDPOINT_ENV } from "./lib/app-server.mjs";
 import {
   clearBrokerSession,
@@ -40,6 +40,8 @@ const STATE_LOCK_STEP_MS = 5000;
 const BROKER_HANDSHAKE_STEP_MS = 5000;
 // Below this there is no point starting another bounded step.
 const MIN_STEP_MS = 100;
+// Upper bound on one process-identity probe (`ps` on darwin).
+const IDENTITY_PROBE_MS = 2000;
 
 // The override may only ever SHORTEN the budget. `hooks.json`'s timeout is a fixed
 // number that cannot be raised from the environment, so an override above the
@@ -100,7 +102,7 @@ function appendEnvVar(name, value) {
   );
 }
 
-function cleanupSessionJobs(cwd, sessionId, lockWaitMs) {
+function cleanupSessionJobs(cwd, sessionId, lockWaitMs, remainingMs) {
   if (!cwd || !sessionId) {
     return;
   }
@@ -133,8 +135,15 @@ function cleanupSessionJobs(cwd, sessionId, lockWaitMs) {
       if (!stillRunning) {
         continue;
       }
+      // Only a pid still provably this job's process is signalled (#743), and
+      // proving it costs a probe the budget has to cover.
+      const probeMs = Math.min(IDENTITY_PROBE_MS, remainingMs());
+      if (probeMs < MIN_STEP_MS) {
+        continue;
+      }
       try {
-        terminateProcessTree(resolveJobPid(workspaceRoot, job) ?? Number.NaN);
+        const { pid, identity } = resolveJobPid(workspaceRoot, job);
+        terminateRecordedProcess(pid, { identity, commandLineMatch: workerCommandLine(job.id), timeoutMs: probeMs });
       } catch {
         // Ignore teardown failures during session shutdown.
       }
@@ -194,10 +203,11 @@ async function handleSessionEnd(input) {
   const logFile = brokerSession?.logFile ?? null;
   const sessionDir = brokerSession?.sessionDir ?? null;
   const pid = brokerSession?.pid ?? null;
+  const pidIdentity = brokerSession?.pidIdentity ?? null;
 
   let activeJobs;
   try {
-    cleanupSessionJobs(cwd, input.session_id || process.env[SESSION_ID_ENV], stepBudget(STATE_LOCK_STEP_MS));
+    cleanupSessionJobs(cwd, input.session_id || process.env[SESSION_ID_ENV], stepBudget(STATE_LOCK_STEP_MS), remainingMs);
     activeJobs = activeWorkspaceJobs(cwd, stepBudget(STATE_LOCK_STEP_MS), remainingMs);
   } catch (error) {
     // A lock this hook could not take says nothing about the broker, and a
@@ -283,13 +293,14 @@ async function handleSessionEnd(input) {
     logFile,
     sessionDir,
     pid,
+    pidIdentity,
     killProcess: terminateProcessTree,
-    timeoutMs: stepBudget(STATE_LOCK_STEP_MS)
+    timeoutMs: stepBudget(IDENTITY_PROBE_MS)
   });
   // Every branch of this hook says what it decided: when a broker outlives a
   // SessionEnd the only question worth asking is which of these four paths ran.
   process.stderr.write(
-    `[codex] Broker teardown: endpoint=${brokerEndpoint ?? "none"} pid=${pid ?? "none"} signalled=${teardown.signalled} busyRetries=${busyRetries} budgetExhausted=false\n`
+    `[codex] Broker teardown: endpoint=${brokerEndpoint ?? "none"} pid=${pid ?? "none"} signalled=${teardown.signalled} reason=${teardown.reason} busyRetries=${busyRetries} budgetExhausted=false\n`
   );
 
   // A replacement broker can have started — and recorded itself — while this one

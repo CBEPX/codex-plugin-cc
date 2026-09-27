@@ -7,6 +7,7 @@ import { spawn } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { makeTempDir, run } from "./helpers.mjs";
+import { getProcessIdentity } from "../plugins/codex/scripts/lib/process.mjs";
 import {
   consumeJobRequestFile,
   listJobs,
@@ -300,9 +301,9 @@ function lockDirFor(workspace) {
   return lockDir;
 }
 
-function seedLockEntry(lockDir, name, pid, startedAt = new Date().toISOString()) {
+function seedLockEntry(lockDir, name, pid, startedAt = new Date().toISOString(), identity = undefined) {
   const entry = path.join(lockDir, name);
-  fs.writeFileSync(entry, `${JSON.stringify({ pid, startedAt })}\n`, "utf8");
+  fs.writeFileSync(entry, `${JSON.stringify({ pid, startedAt, identity })}\n`, "utf8");
   return entry;
 }
 
@@ -340,6 +341,41 @@ test("two processes acquiring concurrently never overlap", async () => {
   assert.equal(first.code, 0, first.stderr);
   assert.equal(second.code, 0, second.stderr);
   assert.equal(Number.parseInt(fs.readFileSync(counter, "utf8"), 10), rounds * 2, "an overlap lost increments");
+});
+
+// A live pid whose start identity no longer matches the one the holder recorded
+// is not the holder: the OS gave the number to someone else (#743).
+test("a ticket whose pid was recycled by another process is evicted at once", { skip: process.platform === "win32" }, () => {
+  const workspace = makeTempDir();
+  saveState(workspace, { jobs: [] });
+  const lockDir = lockDirFor(workspace);
+  const ticket = seedLockEntry(lockDir, `1.${process.pid}-recycled.ticket`, process.pid, undefined, "darwin:not-this-process|nope");
+
+  const started = Date.now();
+  assert.equal(withStateLock(workspace, () => "ok", { waitMs: 2000 }), "ok");
+  assert.ok(Date.now() - started < 1500, `a recycled pid must not cost a grace period, took ${Date.now() - started} ms`);
+  assert.equal(fs.existsSync(ticket), false, "the recycled holder's ticket must be cleared");
+});
+
+test("a ticket whose recorded identity still matches its live holder is kept", { skip: process.platform === "win32" }, () => {
+  const workspace = makeTempDir();
+  saveState(workspace, { jobs: [] });
+  const lockDir = lockDirFor(workspace);
+  const ticket = seedLockEntry(lockDir, `1.${process.pid}-same.ticket`, process.pid, undefined, getProcessIdentity(process.pid));
+
+  assert.throws(() => withStateLock(workspace, () => "stolen", { waitMs: 200 }), /state lock/i);
+  assert.equal(fs.existsSync(ticket), true, "a live holder's ticket must survive");
+});
+
+test("the lock owner record carries this process's identity", { skip: process.platform === "win32" }, () => {
+  const workspace = makeTempDir();
+  saveState(workspace, { jobs: [] });
+  const lockDir = lockDirFor(workspace);
+  const owners = withStateLock(workspace, () =>
+    fs.readdirSync(lockDir).map((name) => JSON.parse(fs.readFileSync(path.join(lockDir, name), "utf8")))
+  );
+  assert.ok(owners.length > 0);
+  assert.ok(owners.every((owner) => owner.pid === process.pid && owner.identity === getProcessIdentity(process.pid)));
 });
 
 // A holder that died with its ticket in the directory releases it to the next
