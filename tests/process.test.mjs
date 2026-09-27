@@ -63,35 +63,70 @@ test("terminateProcessTree treats missing Windows processes as already stopped",
   assert.match(outcome.result.stdout, /not found/i);
 });
 
-test("terminateProcessTree falls back to the pid when it is not a process-group leader", () => {
+// ESRCH on the group means the pid leads no group (or is gone). Signalling the
+// bare pid is a second syscall on a number that may have been recycled since the
+// caller proved it, so the primitive stops here and says so.
+test("terminateProcessTree never signals the bare pid after the group kill fails", () => {
   const calls = [];
   const outcome = terminateProcessTree(4242, {
     platform: "linux",
     killImpl(pid, signal) {
       calls.push([pid, signal]);
-      if (pid < 0) {
-        throw Object.assign(new Error("kill ESRCH"), { code: "ESRCH" });
-      }
-    }
-  });
-
-  assert.deepEqual(calls, [[-4242, "SIGTERM"], [4242, "SIGTERM"]]);
-  assert.equal(outcome.attempted, true);
-  assert.equal(outcome.delivered, true);
-  assert.equal(outcome.method, "process");
-});
-
-test("terminateProcessTree reports not delivered only when the pid itself is gone", () => {
-  const outcome = terminateProcessTree(4242, {
-    platform: "linux",
-    killImpl() {
       throw Object.assign(new Error("kill ESRCH"), { code: "ESRCH" });
     }
   });
 
-  assert.equal(outcome.attempted, true);
-  assert.equal(outcome.delivered, false);
-  assert.equal(outcome.method, "process");
+  assert.deepEqual(calls, [[-4242, "SIGTERM"]]);
+  assert.deepEqual([outcome.attempted, outcome.delivered, outcome.method, outcome.groupGone], [true, false, "process-group", true]);
+});
+
+const LINUX_STAT = (starttime) => `42 (node) S 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 0 0 1 0 ${starttime} 0 0 0`;
+const groupEsrchKill = (calls) => (pid, signal) => {
+  calls.push([pid, signal]);
+  if (pid < 0) {
+    throw Object.assign(new Error("kill ESRCH"), { code: "ESRCH" });
+  }
+};
+
+test("terminateRecordedProcess re-verifies the identity before signalling a pid that leads no group", () => {
+  const calls = [];
+  let reads = 0;
+  const outcome = terminateRecordedProcess(42, {
+    identity: "linux:999",
+    platform: "linux",
+    readFileSyncImpl: () => { reads += 1; return LINUX_STAT(999); },
+    killImpl: groupEsrchKill(calls)
+  });
+  assert.deepEqual(calls, [[-42, "SIGTERM"], [42, "SIGTERM"]]);
+  assert.equal(reads, 2);
+  assert.deepEqual([outcome.attempted, outcome.delivered, outcome.method, outcome.reason], [true, true, "process", "identity-match"]);
+});
+
+test("terminateRecordedProcess refuses the bare pid when its identity changed after the group kill", () => {
+  const calls = [];
+  const stats = [LINUX_STAT(999), LINUX_STAT(1000)];
+  const outcome = terminateRecordedProcess(42, {
+    identity: "linux:999",
+    platform: "linux",
+    readFileSyncImpl: () => stats.shift(),
+    killImpl: groupEsrchKill(calls)
+  });
+  assert.deepEqual(calls, [[-42, "SIGTERM"]]);
+  assert.deepEqual([outcome.attempted, outcome.delivered, outcome.reason], [true, false, "identity-mismatch"]);
+});
+
+test("terminateRecordedProcess refuses the bare pid when its command line changed after the group kill", () => {
+  const calls = [];
+  const lines = ["node codex-companion.mjs task-worker --job-id job-1\n", "bash\n"];
+  const outcome = terminateRecordedProcess(42, {
+    identity: null,
+    platform: "darwin",
+    commandLineMatch: /task-worker/,
+    runCommandImpl: () => ({ status: 0, stdout: lines.shift(), stderr: "", error: null }),
+    killImpl: groupEsrchKill(calls)
+  });
+  assert.deepEqual(calls, [[-42, "SIGTERM"]]);
+  assert.deepEqual([outcome.attempted, outcome.delivered, outcome.reason], [true, false, "identity-mismatch"]);
 });
 
 test("processCommandLine reads the command line of a live process", { skip: process.platform === "win32" }, () => {

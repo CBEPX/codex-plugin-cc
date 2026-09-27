@@ -151,32 +151,47 @@ export function terminateRecordedProcess(pid, options = {}) {
   }
   const platform = options.platform ?? process.platform;
   const identity = options.identity ?? null;
-  let reason;
-  if (identity) {
-    const actual = getProcessIdentity(pid, options);
-    if (!actual) {
-      return { attempted: false, delivered: false, reason: "identity-unavailable" };
+  // null when the pid is still provably the recorded process, else why not.
+  const refusal = () => {
+    if (identity) {
+      const actual = getProcessIdentity(pid, options);
+      return !actual ? "identity-unavailable" : actual !== identity ? "identity-mismatch" : null;
     }
-    if (actual !== identity) {
-      return { attempted: false, delivered: false, reason: "identity-mismatch" };
-    }
-    reason = "identity-match";
-  } else {
     if (platform === "win32") {
-      return { attempted: false, delivered: false, reason: "identity-unavailable" };
+      return "identity-unavailable";
     }
     const commandLine = processCommandLine(pid, options);
     const match = options.commandLineMatch;
     const matched =
       Boolean(commandLine) &&
       (typeof match === "function" ? Boolean(match(commandLine)) : match instanceof RegExp ? match.test(commandLine) : false);
-    if (!matched) {
-      return { attempted: false, delivered: false, reason: "identity-mismatch" };
-    }
-    reason = "command-line-match";
+    return matched ? null : "identity-mismatch";
+  };
+  const refused = refusal();
+  if (refused) {
+    return { attempted: false, delivered: false, reason: refused };
   }
+  const reason = identity ? "identity-match" : "command-line-match";
   // An injected terminator may report nothing; having been called is the attempt.
   const outcome = (options.terminateImpl ?? terminateProcessTree)(pid, options);
+  if (outcome?.groupGone) {
+    // The pid leads no group (a foreground worker): signal it alone, but only
+    // after proving again that it is still ours — it may have exited and been
+    // recycled since the first check.
+    const again = refusal();
+    if (again) {
+      return { attempted: true, delivered: false, method: "process", reason: again };
+    }
+    try {
+      (options.killImpl ?? process.kill.bind(process))(pid, "SIGTERM");
+      return { attempted: true, delivered: true, method: "process", reason };
+    } catch (error) {
+      if (error?.code === "ESRCH") {
+        return { attempted: true, delivered: false, method: "process", reason };
+      }
+      throw error;
+    }
+  }
   return { ...(outcome && typeof outcome === "object" ? outcome : { attempted: true, delivered: true }), reason };
 }
 
@@ -242,18 +257,15 @@ export function terminateProcessTree(pid, options = {}) {
   try {
     killImpl(-pid, "SIGTERM");
     return { attempted: true, delivered: true, method: "process-group" };
-  } catch {
+  } catch (error) {
     // ESRCH here only means `pid` leads no process group (a foreground worker,
     // a child spawned without `detached`) — the process itself may be alive.
-    try {
-      killImpl(pid, "SIGTERM");
-      return { attempted: true, delivered: true, method: "process" };
-    } catch (innerError) {
-      if (innerError?.code === "ESRCH") {
-        return { attempted: true, delivered: false, method: "process" };
-      }
-      throw innerError;
+    // Signalling the bare pid is the caller's call: only it can re-prove the
+    // pid is still the process it meant (see terminateRecordedProcess).
+    if (error?.code === "ESRCH") {
+      return { attempted: true, delivered: false, method: "process-group", groupGone: true };
     }
+    throw error;
   }
 }
 
