@@ -3,7 +3,12 @@ name: Pull Request CI
 on:
   pull_request:
   push:
-    branches: [main, "release/**", "ci/**"]
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -45,7 +50,7 @@ jobs:
           npm test 2>&1 | tee test-output.log
           status=${PIPESTATUS[0]}
           echo "## Test summary (${{ matrix.os }}, node ${{ matrix.node }})" >> "$GITHUB_STEP_SUMMARY"
-          { rg -e 'ℹ (tests|pass|fail)' -e '^not ok' test-output.log || grep -E 'ℹ (tests|pass|fail)|^not ok' test-output.log; } >> "$GITHUB_STEP_SUMMARY" || true
+          { rg -e 'ℹ (tests|pass|fail)' -e '^# (tests|pass|fail)' -e '^not ok' -e '^✖' test-output.log || grep -E 'ℹ (tests|pass|fail)|^# (tests|pass|fail)|^not ok|^✖' test-output.log; } >> "$GITHUB_STEP_SUMMARY" || true
           exit "$status"
 
       - name: Upload test log
@@ -64,3 +69,31 @@ jobs:
 
       - name: Run build
         run: npm run build
+
+  quality:
+    name: Quality (ubuntu, node 24)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Lint/typecheck/changelog/coverage land here in Task 3.
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up Node.js
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Codex CLI
+        run: npm install -g @openai/codex
+
+      - name: Run build
+        run: npm run build
+
+      - name: Version metadata matches the package
+        run: npm run check-version

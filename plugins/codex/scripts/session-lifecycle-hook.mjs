@@ -22,15 +22,15 @@ export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
 // How long a `busy` broker is given to shed a client this hook has just reaped,
 // and how often to ask. Bounded: a broker that is really in use stays busy for the
 // whole window and keeps everything it owns.
-const BROKER_BUSY_RETRY_MS = 1000;
+const BROKER_BUSY_RETRY_MS = 3000;
 const BROKER_BUSY_POLL_MS = 100;
 
 // One absolute budget for the whole SessionEnd hook. Claude Code kills the hook at
 // the timeout in hooks.json, and the steps below have bounds of their own (state
-// lock 5 s, each broker handshake 5 s, the busy retries 1 s, the teardown probe):
-// added up they can exceed any single bound, so each step is clamped to what is
-// left of this budget and the hook reports what it decided instead of being killed
-// mid-decision. KEEP hooks.json's SessionEnd timeout ABOVE this — the pair is
+// lock 5 s, each broker handshake 5 s, the busy retries 3 s, the teardown probe
+// ≤2 s): added up they can exceed any single bound, so each step is clamped to what
+// is left of this budget and the hook reports what it decided instead of being
+// killed mid-decision. KEEP hooks.json's SessionEnd timeout ABOVE this — the pair is
 // asserted by `tests/commands.test.mjs` and documented in the README. The env
 // override can only shorten this ceiling, never raise it, so the pair holds
 // whatever the environment says.

@@ -376,6 +376,11 @@ async function main() {
     socket.on("close", () => {
       sockets.delete(socket);
       clearSocketOwnership(socket);
+      // Observable marker for callers (tests, operators) that need to know the
+      // broker has actually processed this socket's close — not just that the
+      // OS closed it — before a busy/idle check that counts `sockets` can be
+      // trusted.
+      process.stderr.write(`[broker] client disconnected (${sockets.size} remaining)\n`);
       armIdleTimer();
     });
 

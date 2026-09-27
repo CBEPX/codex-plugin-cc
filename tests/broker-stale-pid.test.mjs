@@ -484,8 +484,23 @@ test("session end reaps a SIGKILLed background worker instead of keeping its bro
     clearBrokerSession(workspace);
   });
 
+  // The broker's log already has at least one "client disconnected" line from
+  // its own readiness probe (`ensureBrokerSession` connects and immediately
+  // closes). Count before the kill so the wait below is for a *new*
+  // disconnect, not one already on record.
+  const countDisconnects = () =>
+    (fs.readFileSync(broker.logFile, "utf8").match(/client disconnected/g) ?? []).length;
+  const disconnectsBeforeKill = countDisconnects();
+
   process.kill(-running.pid, "SIGKILL");
   await waitUntil(() => (isAlive(running.pid) ? null : "dead"));
+
+  // The killed worker's socket close is async on the broker's side: `sockets`
+  // (and therefore its busy check) is only accurate once the broker's own
+  // "close" handler has run for THIS socket. Wait for that observable log
+  // line rather than a fixed sleep, so this isn't racing the broker's event
+  // loop.
+  await waitUntil(() => (countDisconnects() > disconnectsBeforeKill ? "disconnected" : null));
 
   const cleanup = runSessionEndHook(workspace, { env, sessionId: "sess-current" });
   assert.equal(cleanup.status, 0, cleanup.stderr);
