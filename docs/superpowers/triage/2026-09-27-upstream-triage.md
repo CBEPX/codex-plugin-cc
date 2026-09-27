@@ -70,7 +70,7 @@
 | #490 | pr | +199/-3 | Stop orphaned Codex companion brokers | verify | — |
 | #509 | issue | — | Rescue tasks intermittently hang forever: stale shared broker reused without a health check; headless app-server inherits desktop MCP servers | verify | — |
 | #518 | pr | +1320/-175 | fix: close detached broker and worker lifecycles | verify | — |
-| #521 | issue | — | Predictable os.tmpdir() fallback state dir (0755) + unvalidated broker.json lets a co-located user MITM the Codex IPC and force arbitrary process-kill / file-delete | planned v1.3.0 | — |
+| #521 | issue | — | Predictable os.tmpdir() fallback state dir (0755) + unvalidated broker.json lets a co-located user MITM the Codex IPC and force arbitrary process-kill / file-delete | fixed-in v1.3.0 | — |
 | #526 | issue | — | Prevent clients racing with idle-timeout broker shutdown | verify | — |
 | #540 | issue | — | Ending any Claude session kills the shared broker mid-turn: concurrent sessions' tasks die silently (exit 0) and stay "running" forever | verify | — |
 | #541 | pr | +2948/-204 | Fix test broker leaks, state races, and signal-masked command failures | verify | — |
@@ -84,7 +84,7 @@
 | #623 | pr | +4105/-94 | bug fix: stop session end from tearing down the shared broker under other sessions' jobs | reference-only | see #628 |
 | #628 | issue | — | Terminal-status repair: residual multi-fault interleavings, turn-identity race window, and broker readiness-probe kills (follow-up to #623) | verify | see #623 |
 | #629 | issue | — | Test suite leaks ~50 app-server-broker processes per full run | verify | — |
-| #631 | issue | — | Companion writes all job state (broker.json, state.json, jobs/) into another plugin's data directory | planned v1.3.0 | — |
+| #631 | issue | — | Companion writes all job state (broker.json, state.json, jobs/) into another plugin's data directory | fixed-in v1.3.0 | — |
 | #632 | issue | — | test: broker-spawn integration tests flake under host load — widen/tune the waitFor budget and reap leaked processes | verify | — |
 | #636 | issue | — | SessionEnd cannot find the broker when CLAUDE_PLUGIN_DATA differs between spawn and teardown — same cwd, same hash, different state root | planned v1.5.0 | — |
 | #642 | pr | +109/-3 | Stop brokers started by the test suite | verify | cherry-pick candidate |
@@ -101,14 +101,14 @@
 | #715 | pr | +289/-23 | fix(setup): fall back when broker auth is busy | verify | — |
 | #718 | issue | — | Windows: every command leaks an orphaned broker, and a live app-server makes the workspace directory undeletable | planned v1.4.0 | — |
 | #741 | issue | — | `npm test` leaves a detached broker and a fake app-server behind for every test workspace | verify | — |
-| #743 | issue | — | SessionEnd kills whatever pid `broker.json` names, without checking it is still a broker (pid reuse → SIGTERM to an unrelated process group) | planned v1.3.0 | — |
-| #749 | pr | +72/-7 | fix(broker): do not signal stale persisted pids | planned v1.3.0 | cherry-pick candidate |
-| #753 | issue | — | ensureBrokerSession() deletes a live broker's state without killing it — the only production caller passes no killProcess | planned v1.3.0 | see #762 |
-| #762 | pr | +5/-3 | fix: terminate broker process when ensureBrokerSession tears down (fixes #753) | planned v1.3.0 | fixes #753 |
+| #743 | issue | — | SessionEnd kills whatever pid `broker.json` names, without checking it is still a broker (pid reuse → SIGTERM to an unrelated process group) | fixed-in v1.3.0 | — |
+| #749 | pr | +72/-7 | fix(broker): do not signal stale persisted pids | fixed-in v1.3.0 | cherry-pick candidate |
+| #753 | issue | — | ensureBrokerSession() deletes a live broker's state without killing it — the only production caller passes no killProcess | fixed-in v1.3.0 | see #762 |
+| #762 | pr | +5/-3 | fix: terminate broker process when ensureBrokerSession tears down (fixes #753) | fixed-in v1.3.0 | fixes #753 |
 | #767 | issue | — | SessionEnd never reclaims the app-server broker when the Claude session cwd is not a git repository | planned v1.5.0 | — |
-| #768 | pr | +169/-1 | fix(broker): stop tearing down a live broker that misses the readiness probe | planned v1.3.0 | — |
-| #773 | pr | +83/-8 | fix: bound hung broker connects instead of waiting forever | planned v1.3.0 | cherry-pick candidate |
-| #782 | issue | — | Broker processes leak on Windows: ensureBrokerSession tears down stale broker without killing it | planned v1.3.0 | — |
+| #768 | pr | +169/-1 | fix(broker): stop tearing down a live broker that misses the readiness probe | fixed-in v1.3.0 | — |
+| #773 | pr | +83/-8 | fix: bound hung broker connects instead of waiting forever | fixed-in v1.3.0 | cherry-pick candidate |
+| #782 | issue | — | Broker processes leak on Windows: ensureBrokerSession tears down stale broker without killing it | fixed-in v1.3.0 | — |
 
 ## 2. CLAUDE_ENV_FILE
 
@@ -258,16 +258,16 @@ Windows-специфика: taskkill, spawn/PATHEXT, PowerShell, EPERM/ENOENT н
 | #686 | issue | — | `codex-rescue` can generate duplicate `pgrep -f "codex-companion.mjs"` wait loops that keep each other alive on macOS (stuck background tasks) | verify | — |
 | #689 | pr | +1142/-274 | Fix job records lost on concurrent background task launches | reference-only | reference, huge PR |
 | #696 | pr | +88/-1 | Keep the inferred-completion timer referenced | verify | cherry-pick candidate |
-| #698 | issue | — | `captureTurn` treats the `error` notification as non-terminal, so a Codex-side failure hangs the turn forever and wedges the job at `status: running` | planned v1.3.0 | — |
+| #698 | issue | — | `captureTurn` treats the `error` notification as non-terminal, so a Codex-side failure hangs the turn forever and wedges the job at `status: running` | fixed-in v1.3.0 | — |
 | #700 | issue | — | task: add `--resume-thread <id>` — jobs killed by a usage limit cannot be resumed from the plugin | planned v1.5.0 | — |
 | #704 | issue | — | status reports a background job as running forever when its worker dies before writing a terminal status | verify | — |
 | #740 | issue | — | `thread/resume` sandbox is ignored while the thread is still live in the shared app-server, so `task --resume-last --write` cannot write after a read-only run | verify | — |
 | #742 | pr | +506/-14 | feat: add `--sandbox <mode>` to `task` and `/codex:rescue` | planned v1.5.0 | — |
 | #754 | issue | — | codex-rescue reports completion without checking git state — reproducible false positives | verify | — |
 | #765 | issue | — | codex-rescue with --cwd <git worktree>: git write ops fail because the linked worktree's gitdir (hub .git/worktrees/<name>) is outside the sandbox writable roots | verify | — |
-| #774 | pr | +75/-3 | fix: surface status --wait timeouts instead of looking successful | planned v1.3.0 | cherry-pick candidate |
-| #775 | pr | +30/-1 | fix: do not crash when a fileChange start event omits changes | planned v1.3.0 | cherry-pick candidate |
-| #781 | issue | — | captureTurn drops every notification (including turn/completed) when the start response has no turn.id, hanging the job forever | planned v1.3.0 | — |
+| #774 | pr | +75/-3 | fix: surface status --wait timeouts instead of looking successful | fixed-in v1.3.0 | cherry-pick candidate |
+| #775 | pr | +30/-1 | fix: do not crash when a fileChange start event omits changes | fixed-in v1.3.0 | cherry-pick candidate |
+| #781 | issue | — | captureTurn drops every notification (including turn/completed) when the start response has no turn.id, hanging the job forever | fixed-in v1.3.0 | — |
 | #786 | issue | — | cancel never signals a foreground companion on Linux/macOS: process-group kill fails with ESRCH and there is no fallback to the pid | verify | — |
 | #787 | pr | +42/-12 | fix: signal the pid when the process-group kill fails with ESRCH | verify | cherry-pick candidate |
 
@@ -286,11 +286,11 @@ Windows-специфика: taskkill, spawn/PATHEXT, PowerShell, EPERM/ENOENT н
 | #625 | pr | +49/-5 | Suppress dynamic tool progress in stderr | verify | cherry-pick candidate |
 | #685 | pr | +786/-102 | fix: make app-server connection loss terminal | verify | — |
 | #707 | pr | +1364/-89 | fix(app-server): unsubscribe task threads after client disconnect | reference-only | reference, huge PR |
-| #710 | pr | +261/-7 | fix(runtime): terminate turns on terminal errors | planned v1.3.0 | — |
+| #710 | pr | +261/-7 | fix(runtime): terminate turns on terminal errors | fixed-in v1.3.0 | — |
 | #744 | issue | — | `runCommand` sets `maxBuffer: options.maxBuffer` — the ENOBUFS fix from #179 works only because a spread `undefined` deletes Node's default | verify | — |
 | #747 | pr | +27/-2 | fix: make runCommand maxBuffer explicit | verify | cherry-pick candidate |
-| #757 | issue | — | A server-side turn failure that terminates stores no `errorMessage`, so `status` reports the reason as `Summary: {` | planned v1.3.0 | see #763 |
-| #763 | pr | +105/-4 | fix: persist errorMessage on non-throwing turn failure and shorten summary (fixes #757) | planned v1.3.0 | fixes #757 |
+| #757 | issue | — | A server-side turn failure that terminates stores no `errorMessage`, so `status` reports the reason as `Summary: {` | fixed-in v1.3.0 | see #763 |
+| #763 | pr | +105/-4 | fix: persist errorMessage on non-throwing turn failure and shorten summary (fixes #757) | fixed-in v1.3.0 | fixes #757 |
 
 ## 6. stop-review gate
 
@@ -309,13 +309,13 @@ Stop-хук ревью-гейта: fail-open/fail-closed, таймауты, mono
 | #422 | pr | +134/-19 | fix(stop-review-gate): fail open on infra errors instead of blocking | verify | — |
 | #442 | pr | +24/-2 | fix: surface the real task error in the stop-review gate instead of stderr noise | verify | cherry-pick candidate |
 | #452 | issue | — | Stop-review-gate hook masks the real failure: Node 24 DEP0190 warning displaces the actual error in stderr-first reporting | n-a | DEP0190 Node warning, posix quirk — n/a |
-| #483 | issue | — | stop-review-gate-hook.mjs: fail-closed reason strings do not mention the /codex:setup --disable-review-gate escape valve | planned v1.3.0 | — |
+| #483 | issue | — | stop-review-gate-hook.mjs: fail-closed reason strings do not mention the /codex:setup --disable-review-gate escape valve | fixed-in v1.3.0 | — |
 | #517 | issue | — | Jobs killed by host timeouts stay "running" forever (no pid liveness check); concurrent state writers can wipe all job state and silently disable stopReviewGate | verify | — |
-| #548 | issue | — | Stop-review gate hook loops until CLAUDE_CODE_STOP_HOOK_BLOCK_CAP (missing `stop_hook_active` guard) | planned v1.3.0 | — |
-| #565 | pr | +67/-0 | fix: honor stop_hook_active in the stop-review-gate hook | planned v1.3.0 | cherry-pick candidate |
+| #548 | issue | — | Stop-review gate hook loops until CLAUDE_CODE_STOP_HOOK_BLOCK_CAP (missing `stop_hook_active` guard) | fixed-in v1.3.0 | — |
+| #565 | pr | +67/-0 | fix: honor stop_hook_active in the stop-review-gate hook | fixed-in v1.3.0 | cherry-pick candidate |
 | #568 | pr | +337/-15 | Archive completed stop-gate review threads | verify | — |
-| #573 | pr | +128/-17 | fix(review-gate): name disable command in stop-hook infra failure messages | planned v1.3.0 | cherry-pick candidate |
-| #589 | issue | — | stop-review-gate: signal-terminated review loses signal metadata in the fail-closed reason | planned v1.3.0 | — |
+| #573 | pr | +128/-17 | fix(review-gate): name disable command in stop-hook infra failure messages | fixed-in v1.3.0 | cherry-pick candidate |
+| #589 | issue | — | stop-review-gate: signal-terminated review loses signal metadata in the fail-closed reason | fixed-in v1.3.0 | — |
 | #611 | issue | — | Stop-review gate: hung jobs pile up into livelock; review --wait can exit 0 without a verdict | verify | — |
 | #662 | pr | +2972/-194 | Harden Codex stop gate supervision | reference-only | reference, huge PR |
 | #676 | issue | — | Stop review gate fails open when hook stdin is malformed JSON | fixed-in 1.1.0 | — |
@@ -325,7 +325,7 @@ Stop-хук ревью-гейта: fail-open/fail-closed, таймауты, mono
 | #709 | pr | +225/-43 | fix(stop-gate): preserve review failure details | verify | — |
 | #764 | issue | — | Stop-review gate is lost in every new git worktree (state keyed by rev-parse --show-toplevel) | planned v1.5.0 | — |
 | #766 | issue | — | Stop-review gate: review timeout equals the hook's own 900s timeout, so a slow review ends the turn with no message | verify | — |
-| #769 | issue | — | Stop review gate has no way to pin the model or reasoning effort it reviews with | planned v1.3.0 | — |
+| #769 | issue | — | Stop review gate has no way to pin the model or reasoning effort it reviews with | fixed-in v1.3.0 | — |
 | #772 | pr | +23/-2 | fix: leave Stop-hook headroom so a timed-out review gate can report | verify | cherry-pick candidate |
 | #777 | issue | — | Positional CLI argv >~1KB gets node child SIGKILLed on macOS+EDR — breaks stop-review-gate and codex-rescue forwarding | verify | — |
 
@@ -365,11 +365,11 @@ Stop-хук ревью-гейта: fail-open/fail-closed, таймауты, mono
 | #393 | issue | — | codex-companion task path: missing-cwd misread as 'not installed', prompt fragments parsed as --model (400 as result), dropped turn errors | verify | — |
 | #408 | pr | +20/-11 | fix(app-server): pass `-c model="..."` to `codex app-server` so options.model takes effect | fixed-in 1.1.0 | — |
 | #463 | issue | — | Make gpt-5-4-prompting skill model-neutral and multi-agent aware | planned v1.3.0 | — |
-| #468 | issue | — | Current Plugin does not support gpt-5.6 model family | planned v1.3.0 | — |
+| #468 | issue | — | Current Plugin does not support gpt-5.6 model family | fixed-in v1.3.0 | — |
 | #471 | pr | +1302/-161 | Support GPT-5.6 models and refresh stale brokers | verify | — |
 | #476 | issue | — | review / adversarial-review silently ignore reasoning effort — --effort unparsed, and turn/start effort omitted on the adversarial path | fixed-in 1.1.0 | — |
 | #481 | issue | — | Job records never capture the resolved model/effort/sandbox a job ran with | planned v1.5.0 | — |
-| #485 | issue | — | codex-rescue agent references stale gpt-5-4-prompting skill; effort hint omits max/ultra (default model is now gpt-5.6-sol) | planned v1.3.0 | — |
+| #485 | issue | — | codex-rescue agent references stale gpt-5-4-prompting skill; effort hint omits max/ultra (default model is now gpt-5.6-sol) | fixed-in v1.3.0 | — |
 | #496 | issue | — | adversarial-review / review can complete the turn without a schema-conforming final message on multi-tool-call reviews at high reasoning effort | verify | — |
 | #512 | issue | — | `task` prompts passed as a single argument are re-tokenized: quotes/backslashes stripped, prose `--model`/`--write` hijacked as real options | planned v1.5.0 | — |
 | #522 | issue | — | /codex:review rejects focus text — breaks interface parity with /codex:adversarial-review and blocks non-English model/effort entry | planned v1.5.0 | — |
@@ -387,7 +387,7 @@ Stop-хук ревью-гейта: fail-open/fail-closed, таймауты, mono
 | #688 | pr | +48/-1 | fix: resolve model aliases on review and adversarial-review | fixed-in 1.1.0 | — |
 | #699 | issue | — | Background jobs: prompt text swallowed as options (-m pytest -> model 404); dead workers never finalized; cancel hangs; stderr discarded | planned v1.5.0 | see #702 |
 | #702 | pr | +104/-36 | fix(task): stop free-form prompt text from hijacking --model (defect 1 of #699) | planned v1.5.0 | fixes #699 |
-| #703 | issue | — | Skill `gpt-5-4-prompting` still targets GPT-5.4, retired from the rate card on 2026-08-31 | planned v1.3.0 | — |
+| #703 | issue | — | Skill `gpt-5-4-prompting` still targets GPT-5.4, retired from the rate card on 2026-08-31 | fixed-in v1.3.0 | — |
 | #705 | issue | — | adversarial-review threads are always ephemeral — no way to verify which model actually ran a review | planned v1.5.0 | — |
 | #746 | pr | +86/-4 | Support --effort on adversarial-review, and surface unrecognised options | verify | cherry-pick candidate |
 | #751 | issue | — | `VALID_REASONING_EFFORTS` rejects `max` and `ultra` locally, so the flagship model's top two reasoning tiers are unreachable from the plugin | verify | see #761 |
@@ -466,7 +466,7 @@ Stop-хук ревью-гейта: fail-open/fail-closed, таймауты, mono
 | #576 | pr | +632/-35 | feat: add automatic user-approved expert handoff | verify | — |
 | #600 | issue | — | /codex:status, /codex:transfer, /codex:cancel, /codex:result fail the Bash permission check — inline `!`…`` body is unmatchable | verify | — |
 | #624 | pr | +157/-6 | Fix transfer resolution after Claude session forks | planned v1.5.0 | — |
-| #721 | issue | — | /codex:transfer is broken when CLAUDE_CONFIG_DIR is set — Claude transcript root hardcoded to ~/.claude/projects | planned v1.3.0 | — |
+| #721 | issue | — | /codex:transfer is broken when CLAUDE_CONFIG_DIR is set — Claude transcript root hardcoded to ~/.claude/projects | fixed-in v1.3.0 | — |
 | #750 | issue | — | `/codex:transfer` is one-shot per session: a second run silently imports nothing, and is indistinguishable from failure | planned v1.5.0 | — |
 
 ## 11. sandbox/config
@@ -525,8 +525,8 @@ MCP elicitation/approval и clientInfo-обвязка app-server.
 | #290 | pr | +99/-11 | Use `--end-of-options` before user-controlled refs in git invocations | verify | cherry-pick candidate |
 | #326 | pr | +21/-0 | Create SECURITY.md for security policy | planned v1.3.0 | cherry-pick candidate |
 | #382 | issue | — | Concurrent Claude Code sessions race on shared ~/.codex — app-server spawned without an isolated CODEX_HOME | verify | — |
-| #609 | issue | — | Plugin state dir has no plugin-identity segment: sibling plugins share one jobs array, and pruneJobs deletes the other plugin's records | planned v1.3.0 | — |
-| #683 | pr | +132/-13 | fix: isolate companion state from sibling plugins | planned v1.3.0 | cherry-pick candidate |
+| #609 | issue | — | Plugin state dir has no plugin-identity segment: sibling plugins share one jobs array, and pruneJobs deletes the other plugin's records | fixed-in v1.3.0 | — |
+| #683 | pr | +132/-13 | fix: isolate companion state from sibling plugins | fixed-in v1.3.0 | cherry-pick candidate |
 
 ## 14. hooks stdin/EAGAIN & misc hooks
 
@@ -550,7 +550,7 @@ EAGAIN/stdin в хуках, CLAUDE_PLUGIN_ROOT/DATA, прочие SessionStart/S
 | #397 | issue | — | /codex:rescue subagent silently fails to delegate — ${CLAUDE_PLUGIN_ROOT} is empty in subagent Bash | verify | — |
 | #448 | issue | — | Plugin hooks fail when CLAUDE_PLUGIN_ROOT is missing on macOS | verify | — |
 | #449 | pr | +143/-3 | fix: tolerate missing CLAUDE_PLUGIN_ROOT in hooks | verify | cherry-pick candidate |
-| #459 | issue | — | Remove unsupported top-level description from hooks.json | planned v1.3.0 | — |
+| #459 | issue | — | Remove unsupported top-level description from hooks.json | fixed-in v1.3.0 | — |
 | #474 | issue | — | Increase `SessionEnd` hook timeout to prevent premature cancellation | verify | — |
 | #491 | pr | +755/-66 | Prevent SessionEnd from killing shared Codex tasks | verify | — |
 | #562 | issue | — | SessionStart hook leaks per-plugin CLAUDE_PLUGIN_DATA into the shared session env file | fixed-in 1.1.0 | — |
@@ -809,9 +809,13 @@ Issue (не PR) со статусом `fixed-in`/`planned`, сгруппиров
 
 #458, #498, #524
 
+### fixed-in 1.3.0
+
+#459, #468, #483, #485, #521, #548, #589, #609, #631, #698, #703, #721, #743, #753, #757, #769, #781, #782
+
 ### planned v1.3.0
 
-#459, #463, #468, #483, #485, #521, #548, #589, #609, #631, #698, #703, #721, #743, #753, #757, #769, #781, #782
+#463
 
 ### planned v1.4.0
 

@@ -130,7 +130,9 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(agent, /Do not call `review`, `adversarial-review`, or `cancel`/i);
   assert.match(agent, /Leave `--effort` unset unless the user explicitly requests a specific reasoning effort/i);
   assert.match(agent, /Leave model unset by default/i);
-  assert.match(agent, /If the user asks for `spark`, map that to `--model gpt-5\.3-codex-spark`/i);
+  assert.match(agent, /If the user asks for a model alias \(`spark`, `astra`, `sol`, `luna`, `terra` or `mini`\), pass it through unchanged with `--model <alias>`/i);
+  assert.match(agent, /primary sort by `priority`, newest family on ties/i);
+  assert.doesNotMatch(agent, /gpt-5\.3-codex-spark/);
   assert.match(agent, /If the user asks for a concrete model name such as `gpt-6-astra`, pass it through with `--model`/i);
   assert.match(agent, /Return the `result` stdout exactly as-is/i);
   assert.match(agent, /If the Bash call fails or Codex cannot be invoked, return the command's exit status and stderr verbatim/i);
@@ -144,7 +146,9 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(runtimeSkill, /That prompt drafting is the only Claude-side work allowed/i);
   assert.match(runtimeSkill, /Leave `--effort` unset unless the user explicitly requests a specific effort/i);
   assert.match(runtimeSkill, /Leave model unset by default/i);
-  assert.match(runtimeSkill, /Map `spark` to `--model gpt-5\.3-codex-spark`/i);
+  assert.match(runtimeSkill, /Pass the aliases `spark`, `astra`, `sol`, `luna`, `terra` and `mini` through as `--model <alias>` unchanged/i);
+  assert.match(runtimeSkill, /primary sort by `priority`, newest family on ties/i);
+  assert.doesNotMatch(runtimeSkill, /gpt-5\.3-codex-spark/);
   assert.match(runtimeSkill, /If the forwarded request includes `--background` or `--wait`, treat that as Claude-side execution control only/i);
   assert.match(runtimeSkill, /Strip it before calling `task`/i);
   assert.match(runtimeSkill, /`--effort`: accepted values are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra`/i);
@@ -187,7 +191,7 @@ test("rescue runs synchronously through the companion and uses Agent only for --
   assert.doesNotMatch(agent, /own `status`/);
   assert.match(agent, /--config/);
   assert.doesNotMatch(runtimeSkill, /return nothing/i);
-  assert.match(runtimeSkill, /the newest listed `\*-sol` model/i);
+  assert.match(runtimeSkill, /resolves each against the local Codex model catalogue/i);
   assert.match(runtimeSkill, /\$agent-compat:skill-router/);
   assert.doesNotMatch(agent, /adding `--write` unless/i);
   assert.doesNotMatch(runtimeSkill, /adding `--write` unless/i);
