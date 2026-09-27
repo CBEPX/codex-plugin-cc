@@ -139,6 +139,39 @@ test("processCommandLine returns null for a pid that is not running", { skip: pr
   assert.equal(processCommandLine(2 ** 31 - 1), null);
 });
 
+// `ps -o command=` is cut at $COLUMNS on Linux procps even when piped: a long
+// install path could lose the `codex-companion.mjs` marker the reaper and the
+// teardowns look for. Linux reads the kernel's copy; other posix asks ps for
+// the unlimited width.
+test("processCommandLine reads /proc/<pid>/cmdline on linux", () => {
+  let readPath = null;
+  const line = processCommandLine(42, {
+    platform: "linux",
+    readFileSyncImpl: (file) => { readPath = file; return `node\0/very/long/${"x/".repeat(80)}codex-companion.mjs\0task-worker\0`; },
+    runCommandImpl: () => assert.fail("linux must not run ps")
+  });
+  assert.equal(readPath, "/proc/42/cmdline");
+  assert.ok(line.includes("codex-companion.mjs task-worker"), line);
+  assert.ok(!line.includes("\0"));
+  assert.equal(processCommandLine(42, { platform: "linux", readFileSyncImpl: () => "" }), null);
+  assert.equal(processCommandLine(42, { platform: "linux", readFileSyncImpl: () => { throw new Error("ENOENT"); } }), null);
+});
+
+test("processCommandLine asks ps for unlimited width off linux", () => {
+  let seen = null;
+  const line = processCommandLine(42, {
+    platform: "darwin",
+    runCommandImpl: (command, args, options) => { seen = { command, args, options }; return { status: 0, stdout: "node /x/codex-companion.mjs task-worker\n", stderr: "", error: null }; }
+  });
+  assert.equal(line, "node /x/codex-companion.mjs task-worker");
+  assert.equal(seen.command, "ps");
+  assert.ok(seen.args.includes("-ww"), seen.args.join(" "));
+  assert.equal(seen.options.env.COLUMNS, "10000");
+  assert.equal(seen.options.env.LC_ALL, "C");
+  assert.equal(seen.options.shell, false);
+  assert.equal(processCommandLine(42, { platform: "darwin", runCommandImpl: () => ({ status: 0, stdout: "  \n", stderr: "", error: null }) }), null);
+});
+
 // A pid alone cannot tell the process that was recorded from the one that
 // inherited the number (#743): identity is the start time, which a recycled pid
 // cannot share.
@@ -207,11 +240,11 @@ test("terminateRecordedProcess signals on a matching identity and refuses when i
 
 test("terminateRecordedProcess falls back to the command line on posix when no identity was recorded", () => {
   const calls = [];
-  const ok = terminateRecordedProcess(4242, { identity: null, platform: "linux", commandLineMatch: /app-server-broker\.mjs/, runCommandImpl: () => ({ status: 0, stdout: "node app-server-broker.mjs serve\n", stderr: "", error: null }), killImpl: (pid, sig) => calls.push([pid, sig]) });
+  const ok = terminateRecordedProcess(4242, { identity: null, platform: "darwin", commandLineMatch: /app-server-broker\.mjs/, runCommandImpl: () => ({ status: 0, stdout: "node app-server-broker.mjs serve\n", stderr: "", error: null }), killImpl: (pid, sig) => calls.push([pid, sig]) });
   assert.equal(ok.attempted, true);
   assert.equal(ok.reason, "command-line-match");
   assert.deepEqual(calls[0], [-4242, "SIGTERM"]);
-  const no = terminateRecordedProcess(4242, { identity: null, platform: "linux", commandLineMatch: /app-server-broker\.mjs/, runCommandImpl: () => ({ status: 0, stdout: "bash\n", stderr: "", error: null }), killImpl: () => calls.push("must not") });
+  const no = terminateRecordedProcess(4242, { identity: null, platform: "darwin", commandLineMatch: /app-server-broker\.mjs/, runCommandImpl: () => ({ status: 0, stdout: "bash\n", stderr: "", error: null }), killImpl: () => calls.push("must not") });
   assert.equal(no.attempted, false);
   assert.equal(calls.length, 1);
 });
@@ -219,7 +252,7 @@ test("terminateRecordedProcess falls back to the command line on posix when no i
 test("terminateRecordedProcess hands a verified pid to an injected terminateImpl", () => {
   const terminated = [];
   const outcome = terminateRecordedProcess(4242, {
-    platform: "linux",
+    platform: "darwin",
     commandLineMatch: () => true,
     runCommandImpl: () => ({ status: 0, stdout: "node x\n", stderr: "", error: null }),
     terminateImpl: (pid) => terminated.push(pid)

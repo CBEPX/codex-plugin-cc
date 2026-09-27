@@ -58,9 +58,11 @@ function looksLikeMissingProcessMessage(text) {
   return /not found|no running instance|cannot find|does not exist|no such process/i.test(text);
 }
 
-// Command line of a running process, or null when it is gone (or the platform
-// has no `ps`). Callers use it to prove a recorded PID is still the process they
-// believe it is before signalling it — PIDs get recycled.
+// Command line of a running process, or null when it is gone, unreadable or
+// empty (or the platform has no `ps`). Callers use it to prove a recorded PID is
+// still the process they believe it is before signalling it — PIDs get recycled.
+// It must be whole: `ps` cuts at $COLUMNS (procps, even when piped), and a cut
+// line can lose the marker a caller matches on.
 export function processCommandLine(pid, options = {}) {
   if (!Number.isFinite(pid)) {
     return null;
@@ -71,8 +73,22 @@ export function processCommandLine(pid, options = {}) {
     return null;
   }
 
+  if (platform === "linux") {
+    try {
+      const readFileSyncImpl = options.readFileSyncImpl ?? fs.readFileSync;
+      const raw = String(readFileSyncImpl(`/proc/${pid}/cmdline`, "utf8"));
+      return raw.split("\0").filter(Boolean).join(" ").trim() || null;
+    } catch {
+      return null;
+    }
+  }
+
   const runCommandImpl = options.runCommandImpl ?? runCommand;
-  const result = runCommandImpl("ps", ["-o", "command=", "-p", String(pid)], { timeoutMs: options.timeoutMs, shell: false });
+  const result = runCommandImpl("ps", ["-ww", "-o", "command=", "-p", String(pid)], {
+    timeoutMs: options.timeoutMs,
+    shell: false,
+    env: { ...process.env, COLUMNS: "10000", LC_ALL: "C" }
+  });
   if (result.error || result.status !== 0) {
     return null;
   }
