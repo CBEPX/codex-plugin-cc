@@ -245,7 +245,13 @@ function sleepSync(ms) {
 const LOCK_ENTRY_GONE = "gone";
 const LOCK_ENTRY_HELD = "held";
 const LOCK_ENTRY_ABANDONED = "abandoned";
-const LOCK_IDENTITY_PROBE_MS = 2000;
+// Every identity probe is bounded by this and by what is left of the wait, so
+// probes can never push an acquisition past its deadline (the SessionEnd budget).
+const LOCK_IDENTITY_PROBE_MS = 500;
+const LOCK_IDENTITY_PROBE_MIN_MS = 50;
+// This process's own identity, per probe implementation; a failed probe is
+// cached too, so a slow `ps` is paid at most once per process.
+const selfLockIdentity = new Map();
 
 // Only the entry having disappeared is an answer. Every other stat failure —
 // EACCES, EIO, ELOOP — says nothing about the owner, and guessing there is how a
@@ -294,7 +300,7 @@ function readLockEntryOwner(entryPath) {
 // check after a long one. (A PID that exists but belongs to another user reads
 // as alive, which is the safe answer.) A stuck live owner is the operator's call —
 // the timeout error names it.
-function judgeLockEntry(entryPath) {
+function judgeLockEntry(entryPath, { deadline = Infinity, getProcessIdentityImpl = getProcessIdentity } = {}) {
   const { present, owner } = readLockEntryOwner(entryPath);
   if (!present) {
     return LOCK_ENTRY_GONE;
@@ -306,8 +312,10 @@ function judgeLockEntry(entryPath) {
       // A live pid that is provably another process is a recycled one (#743).
       // An identity we cannot read proves nothing and keeps the entry.
       // ponytail: win32 lock entries stay PID-liveness only (no identity recorded there)
-      if (typeof owner.identity === "string") {
-        const actual = getProcessIdentity(owner.pid, { timeoutMs: LOCK_IDENTITY_PROBE_MS });
+      // No time left for a probe is the same as a probe that cannot answer.
+      const remaining = deadline - Date.now();
+      if (typeof owner.identity === "string" && remaining >= LOCK_IDENTITY_PROBE_MIN_MS) {
+        const actual = getProcessIdentityImpl(owner.pid, { timeoutMs: Math.min(LOCK_IDENTITY_PROBE_MS, remaining) });
         if (actual && actual !== owner.identity) {
           return LOCK_ENTRY_ABANDONED;
         }
@@ -450,10 +458,12 @@ function lockTimeoutError(lockDir, blockers, waitMs) {
 // display, then stop announcing. A later acquirer is therefore always visible as
 // `choosing` to anyone still deciding, which is what stops it slipping in with a
 // lower number behind a holder's back.
-function acquireTicket(lockDir, waitMs) {
+function acquireTicket(lockDir, waitMs, getProcessIdentityImpl = getProcessIdentity) {
+  // The deadline starts before the self-probe: that probe spends the budget too.
+  const deadline = Date.now() + waitMs;
   fs.mkdirSync(lockDir, { recursive: true });
   const token = `${process.pid}-${randomBytes(8).toString("hex")}`;
-  const identity = process.platform === "win32" ? null : getProcessIdentity(process.pid);
+  const identity = process.platform === "win32" ? null : selfIdentity(getProcessIdentityImpl, waitMs);
   const owner = `${JSON.stringify({ pid: process.pid, startedAt: nowIso(), identity })}\n`;
   const choosingName = `${LOCK_CHOOSING_PREFIX}${token}`;
 
@@ -473,7 +483,7 @@ function acquireTicket(lockDir, waitMs) {
   }
 
   try {
-    waitForTurn(lockDir, ticket, waitMs);
+    waitForTurn(lockDir, ticket, waitMs, deadline, getProcessIdentityImpl);
   } catch (error) {
     // We are not holding the lock, so our ticket must leave the queue — this
     // process is alive, so nothing would ever judge it abandoned and everyone
@@ -485,8 +495,20 @@ function acquireTicket(lockDir, waitMs) {
   return ticket;
 }
 
-function waitForTurn(lockDir, ticket, waitMs) {
-  const deadline = Date.now() + waitMs;
+function selfIdentity(getProcessIdentityImpl, waitMs) {
+  if (selfLockIdentity.has(getProcessIdentityImpl)) {
+    return selfLockIdentity.get(getProcessIdentityImpl);
+  }
+  const timeoutMs = Math.min(LOCK_IDENTITY_PROBE_MS, waitMs);
+  if (!(timeoutMs >= LOCK_IDENTITY_PROBE_MIN_MS)) {
+    return null; // no budget for a probe this time; not cached, a later wait may have one
+  }
+  const identity = getProcessIdentityImpl(process.pid, { timeoutMs });
+  selfLockIdentity.set(getProcessIdentityImpl, identity);
+  return identity;
+}
+
+function waitForTurn(lockDir, ticket, waitMs, deadline, getProcessIdentityImpl) {
   let blockers = [];
   let scanned = false;
   for (;;) {
@@ -515,7 +537,7 @@ function waitForTurn(lockDir, ticket, waitMs) {
     // nothing but its own files.
     const verdicts = blockers.map((blocker) => ({
       blocker,
-      verdict: judgeLockEntry(path.join(lockDir, blocker.name))
+      verdict: judgeLockEntry(path.join(lockDir, blocker.name), { deadline, getProcessIdentityImpl })
     }));
 
     let evicted = false;
@@ -553,7 +575,7 @@ function withLockDir(lockDir, fn, options = {}) {
     }
   }
 
-  const ticket = acquireTicket(lockDir, options.waitMs ?? LOCK_WAIT_MS);
+  const ticket = acquireTicket(lockDir, options.waitMs ?? LOCK_WAIT_MS, options.getProcessIdentityImpl);
   heldLocks.set(lockDir, { depth: 1, ticket });
   try {
     return fn();

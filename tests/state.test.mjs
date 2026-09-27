@@ -19,6 +19,7 @@ import {
   resolveStateDir,
   resolveStateFile,
   saveState,
+  STATE_LOCK_TIMEOUT_CODE,
   upsertJob,
   withStateLock,
   writeJobRequestFile
@@ -365,6 +366,32 @@ test("a ticket whose recorded identity still matches its live holder is kept", {
 
   assert.throws(() => withStateLock(workspace, () => "stolen", { waitMs: 200 }), /state lock/i);
   assert.equal(fs.existsSync(ticket), true, "a live holder's ticket must survive");
+});
+
+// Identity probes spend the acquisition budget, they do not extend it: with
+// several live blockers whose identity is slow to read, the wait still ends near
+// its deadline instead of after one probe timeout per blocker.
+test("slow identity probes stay inside the lock wait budget", { skip: process.platform === "win32" }, () => {
+  const workspace = makeTempDir();
+  saveState(workspace, { jobs: [] });
+  const lockDir = lockDirFor(workspace);
+  for (let index = 1; index <= 4; index += 1) {
+    seedLockEntry(lockDir, `${index}.${process.pid}-slow${index}.ticket`, process.pid, undefined, `darwin:blocker-${index}|x`);
+  }
+  let probes = 0;
+  const slowIdentity = (_pid, { timeoutMs } = {}) => {
+    probes += 1;
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.min(300, timeoutMs ?? 300));
+    return null; // cannot tell: the blockers stay held
+  };
+  const started = Date.now();
+  assert.throws(
+    () => withStateLock(workspace, () => "stolen", { waitMs: 400, getProcessIdentityImpl: slowIdentity }),
+    (error) => error.code === STATE_LOCK_TIMEOUT_CODE
+  );
+  const elapsed = Date.now() - started;
+  assert.ok(probes >= 1, "the injected probe must be used");
+  assert.ok(elapsed < 900, `the wait must end near its 400 ms budget, took ${elapsed} ms`);
 });
 
 test("the lock owner record carries this process's identity", { skip: process.platform === "win32" }, () => {
