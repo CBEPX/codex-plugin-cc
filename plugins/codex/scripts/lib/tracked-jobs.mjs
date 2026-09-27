@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import process from "node:process";
 
-import { getProcessIdentity, isPidAlive } from "./process.mjs";
+import { getProcessIdentity, isPidAlive, processCommandLine } from "./process.mjs";
 
 import {
   readJobFile,
@@ -371,14 +371,20 @@ const REAP_MIN_STEP_MS = 100;
 const IDENTITY_PROBE_MS = 2000;
 
 /**
- * @param {{ lockWaitMs?: number, remainingMs?: () => number, getProcessIdentityImpl?: typeof getProcessIdentity }} [options] Bounds the
+ * @param {{ lockWaitMs?: number, remainingMs?: () => number, getProcessIdentityImpl?: typeof getProcessIdentity, processCommandLineImpl?: typeof processCommandLine, platform?: string }} [options] Bounds the
  * reaper's own state-lock waits. Each dead job costs one acquisition, so a caller
  * working to a deadline passes `remainingMs` and every wait is clamped to what is
  * left of it; once that is spent the remaining jobs are left for the next run
  * rather than reaped past the caller's budget.
  */
 export function reapDeadJobs(workspaceRoot, jobs, options = {}) {
-  const { lockWaitMs, remainingMs, getProcessIdentityImpl = getProcessIdentity } = options;
+  const {
+    lockWaitMs,
+    remainingMs,
+    getProcessIdentityImpl = getProcessIdentity,
+    processCommandLineImpl = processCommandLine,
+    platform = process.platform
+  } = options;
   const waitFor = () => {
     if (!remainingMs) {
       return lockWaitMs;
@@ -420,6 +426,18 @@ export function reapDeadJobs(workspaceRoot, jobs, options = {}) {
       }
       if (actual && actual !== identity) {
         return markJobDead(workspaceRoot, job, `${DEAD_WORKER_MESSAGE} (pid reused: ${pid} now belongs to another process)`, waitFor());
+      }
+    } else if (pid && platform !== "win32") {
+      // A legacy record has no identity; a readable command line that is plainly
+      // not a companion is proof enough to stop waiting on it. Nothing is signalled.
+      let commandLine = null;
+      try {
+        commandLine = processCommandLineImpl(pid, { timeoutMs: remainingMs ? Math.min(IDENTITY_PROBE_MS, remainingMs()) : IDENTITY_PROBE_MS });
+      } catch {
+        commandLine = null;
+      }
+      if (typeof commandLine === "string" && commandLine && !commandLine.includes("codex-companion.mjs")) {
+        return markJobDead(workspaceRoot, job, `${DEAD_WORKER_MESSAGE} (worker pid ${pid} now belongs to an unrelated process)`, waitFor());
       }
     }
     return job;

@@ -247,7 +247,7 @@ test("session end keeps the broker while another session's foreground job is run
   const child = spawnOwnedBroker(workspace, { binDir, sessionDir, endpoint });
 
   // Stands in for the other session's live foreground worker.
-  const foreignWorker = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+  const foreignWorker = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)", "codex-companion.mjs", "task"], {
     cwd: workspace,
     detached: true,
     stdio: "ignore"

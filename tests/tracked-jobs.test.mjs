@@ -23,6 +23,8 @@ import {
   writeJobRequestFile
 } from "../plugins/codex/scripts/lib/state.mjs";
 
+// What a legacy (identity-less) record's live worker looks like to `ps`.
+const LIVE_WORKER_COMMAND_LINE = "node /plugin/scripts/codex-companion.mjs task-worker --job-id job-live";
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const TRACKED_JOBS_URL = pathToFileURL(path.join(ROOT, "plugins", "codex", "scripts", "lib", "tracked-jobs.mjs")).href;
 
@@ -70,7 +72,7 @@ test("reapDeadJobs leaves a running job with a live pid untouched", () => {
   const workspace = makeTempDir();
   seedJob(workspace, { id: "job-live", status: "running", phase: "delegating", pid: process.pid, logFile: null });
 
-  const reaped = reapDeadJobs(workspace, listJobs(workspace));
+  const reaped = reapDeadJobs(workspace, listJobs(workspace), { processCommandLineImpl: () => LIVE_WORKER_COMMAND_LINE });
 
   assert.equal(reaped[0].status, "running");
   assert.equal(readJobFile(resolveJobFile(workspace, "job-live")).status, "running");
@@ -224,7 +226,7 @@ test("reapDeadJobs never touches a live worker or its request payload", () => {
   const workspace = makeTempDir();
   const job = seedQueuedJobWithPayload(workspace, "job-live-payload", { pid: process.pid });
 
-  const reaped = reapDeadJobs(workspace, listJobs(workspace));
+  const reaped = reapDeadJobs(workspace, listJobs(workspace), { processCommandLineImpl: () => LIVE_WORKER_COMMAND_LINE });
 
   assert.equal(reaped[0].status, "queued");
   assert.equal(reaped[0].requestFile, job.requestFile);
@@ -420,6 +422,37 @@ test("reapDeadJobs keeps a running job whose identity still matches", () => {
   const workspace = makeTempDir();
   seedJob(workspace, { id: "job-same", status: "running", phase: "delegating", pid: process.pid, pidIdentity: "linux:same", logFile: null });
   const reaped = reapDeadJobs(workspace, listJobs(workspace), { getProcessIdentityImpl: () => "linux:same" });
+  assert.equal(reaped[0].status, "running");
+});
+
+// A legacy record (no identity) whose pid now runs something that is plainly not
+// a companion worker can never be cancelled or finish: the reaper fails it, by
+// command line, without signalling anything.
+test("reapDeadJobs fails a legacy running job whose pid now runs an unrelated process", () => {
+  const workspace = makeTempDir();
+  seedJob(workspace, { id: "job-legacy-recycled", status: "running", phase: "delegating", pid: process.pid, logFile: null });
+  const reaped = reapDeadJobs(workspace, listJobs(workspace), {
+    platform: "linux",
+    processCommandLineImpl: () => "/usr/sbin/unrelated-daemon"
+  });
+  assert.equal(reaped[0].status, "failed");
+  assert.equal(reaped[0].errorMessage, `worker exited before completing (worker pid ${process.pid} now belongs to an unrelated process)`);
+});
+
+test("reapDeadJobs keeps a legacy running job whose pid still runs the companion", () => {
+  const workspace = makeTempDir();
+  seedJob(workspace, { id: "job-legacy-live", status: "running", phase: "delegating", pid: process.pid, logFile: null });
+  const reaped = reapDeadJobs(workspace, listJobs(workspace), {
+    platform: "linux",
+    processCommandLineImpl: () => "node /x/codex-companion.mjs task-worker --job-id job-legacy-live"
+  });
+  assert.equal(reaped[0].status, "running");
+});
+
+test("reapDeadJobs keeps a legacy running job whose command line cannot be read", () => {
+  const workspace = makeTempDir();
+  seedJob(workspace, { id: "job-legacy-unknown", status: "running", phase: "delegating", pid: process.pid, logFile: null });
+  const reaped = reapDeadJobs(workspace, listJobs(workspace), { platform: "linux", processCommandLineImpl: () => null });
   assert.equal(reaped[0].status, "running");
 });
 

@@ -1822,7 +1822,7 @@ test("cancel stops an active background job and marks it cancelled", async (t) =
 
   // A record without an identity (written by v1.2.x) is only signalled when the
   // pid's command line is still this job's worker (#743).
-  const sleeper = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)", "task-worker", "--job-id", "task-live"], {
+  const sleeper = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)", "codex-companion.mjs", "task-worker", "--job-id", "task-live"], {
     cwd: workspace,
     detached: true,
     stdio: "ignore"
@@ -1919,7 +1919,9 @@ test("cancel stops an active background job and marks it cancelled", async (t) =
 test("cancel through the no-identity command-line fallback refuses a foreign pid and keeps the job running", { skip: process.platform === "win32" }, async (t) => {
   const repo = makeTempDir();
   initGitRepo(repo);
-  const stranger = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { detached: true, stdio: "ignore" });
+  // Still a companion process (the reaper cannot rule it out by command line),
+  // just not this job's worker.
+  const stranger = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)", "codex-companion.mjs", "task-worker", "--job-id", "task-other"], { detached: true, stdio: "ignore" });
   stranger.unref();
   t.after(() => {
     try { process.kill(stranger.pid, "SIGKILL"); } catch {}
