@@ -25,7 +25,7 @@ Execution rules:
 - Leave `--effort` unset unless the user explicitly requests a specific effort.
 - Leave model unset by default. Add `--model` only when the user explicitly asks for one.
 - Map `spark` to `--model gpt-5.3-codex-spark`.
-- Map `sol` to `--model gpt-5.6-sol`, `luna` to `--model gpt-5.6-luna`, `terra` to `--model gpt-5.6-terra`, `mini` to `--model gpt-5.4-mini`.
+- Pass the aliases `astra`, `sol`, `luna`, `terra` and `mini` through as `--model <alias>` unchanged: the companion resolves each against the local Codex model catalogue (e.g. `sol` becomes the newest listed `*-sol` model). Pass a concrete slug through as-is.
 - Never add `--write` unless the user explicitly asked Codex to modify files.
 
 Command selection:

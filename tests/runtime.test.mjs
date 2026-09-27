@@ -2799,10 +2799,24 @@ test("review forwards model, review_model, effort and config overrides into thre
   assert.deepEqual(fakeState.lastThreadStart.config, {
     model_provider: "ollama",
     "foo.bar": 3,
-    model: "gpt-5.6-sol",
-    review_model: "gpt-5.6-sol",
+    model: "gpt-6-sol",
+    review_model: "gpt-6-sol",
     model_reasoning_effort: "max"
   });
+});
+
+test("task --model sol resolves through the model catalogue and rejects an unsupported effort", () => {
+  const repo = makeTempDir();
+  initGitRepo(repo);
+  const binDir = makeTempDir();
+  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  const ok = run("node", [SCRIPT, "task", "--json", "--model", "sol", "--effort", "max", "hello"], { cwd: repo, env: buildEnv(binDir) });
+  assert.equal(ok.status, 0, ok.stderr);
+  assert.equal(JSON.parse(fs.readFileSync(fakeStatePath, "utf8")).lastThreadStart.config.model, "gpt-6-sol");
+  const bad = run("node", [SCRIPT, "task", "--json", "--model", "gpt-5.6-sol", "--effort", "max", "hello"], { cwd: repo, env: buildEnv(binDir) });
+  assert.notEqual(bad.status, 0);
+  assert.match(bad.stderr, /gpt-5\.6-sol supports: low, medium, high/);
 });
 
 test("review accepts slash-command style single-string arguments", () => {
@@ -2884,7 +2898,7 @@ test("task --resume-last cold-resumes without a thread/resume model override", (
   assert.equal(fakeState.lastThreadResume.model, undefined);
   assert.equal(fakeState.lastThreadResume.config, null);
   assert.equal(fakeState.appServerStarts, startsAfterFirst + 1);
-  assert.equal(fakeState.lastTurnStart.model, "gpt-5.6-sol");
+  assert.equal(fakeState.lastTurnStart.model, "gpt-6-sol");
   assert.equal(fakeState.lastTurnStart.effort, "max");
 });
 
@@ -3314,7 +3328,7 @@ test("task --await launches a tracked job, waits, and prints the result", () => 
   const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
   assert.equal(fakeState.lastTurnStart.prompt, "line one \\d+ \"quoted\" 'single'\nline two");
   assert.equal(fakeState.lastTurnStart.effort, "low");
-  assert.equal(fakeState.lastTurnStart.model, "gpt-5.6-sol");
+  assert.equal(fakeState.lastTurnStart.model, "gpt-6-sol");
   const status = run("node", [SCRIPT, "status", out.job.id, "--json"], { cwd: repo, env: buildEnv(binDir) });
   assert.equal(JSON.parse(status.stdout).job.status, "completed");
 });

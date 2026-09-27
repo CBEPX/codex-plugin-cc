@@ -147,7 +147,7 @@ Examples:
 /codex:rescue investigate why the tests started failing
 /codex:rescue fix the failing test with the smallest safe patch
 /codex:rescue --resume apply the top fix from the last run
-/codex:rescue --model gpt-5.6-terra --effort medium investigate the flaky integration test
+/codex:rescue --model gpt-6-astra --effort medium investigate the flaky integration test
 /codex:rescue --model spark fix the issue quickly
 /codex:rescue --background investigate the regression
 ```
@@ -161,8 +161,8 @@ Ask Codex to redesign the database connection to be more resilient.
 **Notes:**
 
 - if you do not pass `--model` or `--effort`, Codex chooses its own defaults.
-- `--effort` accepts `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, and `ultra`. Which of those a given model actually supports is decided by Codex, not by the plugin — run `codex debug models` to see the reasoning levels each model advertises.
-- model aliases: `spark` -> `gpt-5.3-codex-spark`, `sol` -> `gpt-5.6-sol`, `luna` -> `gpt-5.6-luna`, `terra` -> `gpt-5.6-terra`, `mini` -> `gpt-5.4-mini`
+- `--effort` accepts `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, and `ultra`. Which of those a given model supports comes from the local Codex model catalogue: when `--model` names a catalogued model, the plugin rejects an effort that model does not list, and otherwise leaves the check to Codex — run `codex debug models` to see the reasoning levels each model advertises.
+- model aliases resolve against the local Codex model catalogue (`$CODEX_HOME/models_cache.json`, else `codex debug models --bundled`): an alias picks the listed model whose slug ends in `-<alias>`, lowest priority first, newest family on ties; today `sol` -> `gpt-6-sol`, `astra` -> `gpt-6-astra`, `luna` -> `gpt-6-luna`, `terra` -> `gpt-5.6-terra`, `spark` -> `gpt-5.3-codex-spark`, `mini` -> `gpt-5.4-mini`; run `codex debug models` to see yours. An exact model slug passes through unchanged, and when the model is in the catalogue `--effort` is checked against the reasoning levels it lists
 - `--config key=value` (repeatable, also on `/codex:review` and `/codex:adversarial-review`) forwards a `config.toml` override to the Codex thread, e.g. `--config model_provider=ollama`. On `--resume-last` the plugin opens a fresh app-server session (cold resume) so `--config` overrides, sandbox and approval policy take effect; model and effort for the resumed turn are sent on the turn, never on the resume request. In a `--background`/`--await` job record the config **keys** are recorded and the **values** are never stored (they read back as `[redacted]` in `status`/`result`): the real values live only in the job's private 0600 `jobs/<id>.request.json`, which the worker consumes and deletes.
 - follow-up rescue requests can continue the latest Codex task in the repo
 - under the hood, `/codex:rescue` and the `codex-rescue` agent are each a single `scripts/codex-companion.mjs task --await --prompt-stdin <flags>` call: `--await [--await-timeout-ms <ms>]` launches the same tracked background job as `--background`, then waits for it (default 540000 ms), and `--prompt-stdin` reads the prompt as stdin verbatim (so it cannot be combined with `--args-stdin`, `--prompt-file`, or prompt text on the command line). Exit code is 0 when the job completed, 1 when it failed or was cancelled, and 3 when the wait times out while the job is still queued or running — exit 3 prints a `Re-run: node "<abs>" result <id> --wait --timeout-ms 540000` hint, which is the only follow-up call the rescue flow makes.
@@ -256,7 +256,7 @@ To pin the model and reasoning effort the gate's review uses, independently of y
 /codex:setup --review-gate-model inherit --review-gate-effort inherit
 ```
 
-Model aliases (`spark`, `sol`, `luna`, `terra`, `mini`) resolve the same way as for `/codex:rescue`; `inherit` clears the pin so the review uses your Codex config again.
+Model aliases (`spark`, `astra`, `sol`, `luna`, `terra`, `mini`) resolve the same way as for `/codex:rescue`; `inherit` clears the pin so the review uses your Codex config again.
 
 > [!WARNING]
 > The review gate can create a long-running Claude/Codex loop and may drain usage limits quickly. Only enable it when you plan to actively monitor the session.
@@ -306,10 +306,10 @@ The Codex plugin wraps the [Codex app server](https://developers.openai.com/code
 
 ### Common Configurations
 
-If you want to change the default reasoning effort or the default model that gets used by the plugin, you can define that inside your user-level or project-level `config.toml`. For example to always use `gpt-5.6-terra` on `high` for a specific project you can add the following to a `.codex/config.toml` file at the root of the directory you started Claude in:
+If you want to change the default reasoning effort or the default model that gets used by the plugin, you can define that inside your user-level or project-level `config.toml`. For example to always use `gpt-6-astra` on `high` for a specific project you can add the following to a `.codex/config.toml` file at the root of the directory you started Claude in:
 
 ```toml
-model = "gpt-5.6-terra"
+model = "gpt-6-astra"
 model_reasoning_effort = "high"
 ```
 

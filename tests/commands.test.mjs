@@ -109,7 +109,7 @@ test("rescue command absorbs continue semantics", () => {
   assert.doesNotMatch(rescue, /^context:\s*fork\b/m);
   assert.match(rescue, /\[--background\]/);
   assert.match(rescue, /--resume\|--fresh/);
-  assert.match(rescue, /--model <model\|spark\|sol\|luna\|terra\|mini>/);
+  assert.match(rescue, /--model <model\|spark\|astra\|sol\|luna\|terra\|mini>/);
   assert.match(rescue, /--effort <none\|minimal\|low\|medium\|high\|xhigh\|max\|ultra>/);
   assert.match(rescue, /\[--turn-timeout-ms <ms>\]/);
   assert.match(rescue, /task-resume-candidate --json/);
@@ -131,7 +131,7 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(agent, /Leave `--effort` unset unless the user explicitly requests a specific reasoning effort/i);
   assert.match(agent, /Leave model unset by default/i);
   assert.match(agent, /If the user asks for `spark`, map that to `--model gpt-5\.3-codex-spark`/i);
-  assert.match(agent, /If the user asks for a concrete model name such as `gpt-5\.6-terra`, pass it through with `--model`/i);
+  assert.match(agent, /If the user asks for a concrete model name such as `gpt-6-astra`, pass it through with `--model`/i);
   assert.match(agent, /Return the `result` stdout exactly as-is/i);
   assert.match(agent, /If the Bash call fails or Codex cannot be invoked, return the command's exit status and stderr verbatim/i);
   assert.match(agent, /codex-prompting/);
@@ -152,7 +152,7 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(runtimeSkill, /If the Bash call fails or Codex cannot be invoked, return the command's exit status and stderr verbatim/i);
   assert.match(readme, /`codex:codex-rescue` subagent/i);
   assert.match(readme, /if you do not pass `--model` or `--effort`, Codex chooses its own defaults/i);
-  assert.match(readme, /--model gpt-5\.6-terra --effort medium/i);
+  assert.match(readme, /--model gpt-6-astra --effort medium/i);
   assert.match(readme, /`spark` -> `gpt-5\.3-codex-spark`/i);
   assert.match(readme, /continue a previous Codex task/i);
   assert.match(readme, /### `\/codex:setup`/);
@@ -187,7 +187,7 @@ test("rescue runs synchronously through the companion and uses Agent only for --
   assert.doesNotMatch(agent, /own `status`/);
   assert.match(agent, /--config/);
   assert.doesNotMatch(runtimeSkill, /return nothing/i);
-  assert.match(runtimeSkill, /Map `sol` to `--model gpt-5\.6-sol`/i);
+  assert.match(runtimeSkill, /the newest listed `\*-sol` model/i);
   assert.match(runtimeSkill, /\$agent-compat:skill-router/);
   assert.doesNotMatch(agent, /adding `--write` unless/i);
   assert.doesNotMatch(runtimeSkill, /adding `--write` unless/i);

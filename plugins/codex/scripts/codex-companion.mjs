@@ -24,6 +24,7 @@ import {
 import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
 import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
+import { loadModelCatalog, resolveModelAlias, supportedEfforts } from "./lib/model-catalog.mjs";
 import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import {
@@ -93,13 +94,6 @@ const VALID_REASONING_EFFORTS = new Set([
   "max",
   "ultra"
 ]);
-const MODEL_ALIASES = new Map([
-  ["spark", "gpt-5.3-codex-spark"],
-  ["sol", "gpt-5.6-sol"],
-  ["luna", "gpt-5.6-luna"],
-  ["terra", "gpt-5.6-terra"],
-  ["mini", "gpt-5.4-mini"]
-]);
 const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
 
 function printUsage() {
@@ -107,9 +101,9 @@ function printUsage() {
     [
       "Usage:",
       "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--review-gate-model <model|inherit>] [--review-gate-effort <effort|inherit>] [--json]",
-      "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model|spark|sol|luna|terra|mini>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [--turn-timeout-ms <ms>] [--config key=value]...",
-      "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model|spark|sol|luna|terra|mini>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [--turn-timeout-ms <ms>] [--config key=value]... [focus text]",
-      "  node scripts/codex-companion.mjs task [--background|--await [--await-timeout-ms <ms>]] [--prompt-stdin] [--write] [--resume-last|--resume|--fresh] [--model <model|spark|sol|luna|terra|mini>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [--turn-timeout-ms <ms>] [--config key=value]... [prompt]",
+      "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model|spark|astra|sol|luna|terra|mini>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [--turn-timeout-ms <ms>] [--config key=value]...",
+      "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model|spark|astra|sol|luna|terra|mini>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [--turn-timeout-ms <ms>] [--config key=value]... [focus text]",
+      "  node scripts/codex-companion.mjs task [--background|--await [--await-timeout-ms <ms>]] [--prompt-stdin] [--write] [--resume-last|--resume|--fresh] [--model <model|spark|astra|sol|luna|terra|mini>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [--turn-timeout-ms <ms>] [--config key=value]... [prompt]",
       "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--wait [--timeout-ms <ms>]] [--json]",
@@ -147,10 +141,10 @@ function normalizeRequestedModel(model) {
   if (!normalized) {
     return null;
   }
-  return MODEL_ALIASES.get(normalized.toLowerCase()) ?? normalized;
+  return resolveModelAlias(normalized, loadModelCatalog());
 }
 
-function normalizeReasoningEffort(effort) {
+function normalizeReasoningEffort(effort, model = null) {
   if (effort == null) {
     return null;
   }
@@ -162,6 +156,12 @@ function normalizeReasoningEffort(effort) {
     throw new Error(
       `Unsupported reasoning effort "${effort}". Use one of: none, minimal, low, medium, high, xhigh, max, ultra.`
     );
+  }
+  if (model) {
+    const allowed = supportedEfforts(model, loadModelCatalog());
+    if (allowed && !allowed.includes(normalized)) {
+      throw new Error(`Reasoning effort "${normalized}" is not supported by ${model}. ${model} supports: ${allowed.join(", ")}.`);
+    }
   }
   return normalized;
 }
@@ -969,7 +969,7 @@ async function handleReviewCommand(argv, config) {
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
   const model = normalizeRequestedModel(options.model);
-  const effort = normalizeReasoningEffort(options.effort);
+  const effort = normalizeReasoningEffort(options.effort, model);
   const configOverrides = parseConfigOverrides(options.config);
   const turnTimeoutMs = parseTimeoutOption(options["turn-timeout-ms"], "--turn-timeout-ms");
   const focusText = positionals.join(" ").trim();
@@ -1034,7 +1034,7 @@ async function handleTask(argv) {
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
   const model = normalizeRequestedModel(options.model);
-  const effort = normalizeReasoningEffort(options.effort);
+  const effort = normalizeReasoningEffort(options.effort, model);
   const configOverrides = parseConfigOverrides(options.config);
   // Every flag conflict is decided before the prompt is read: `--prompt-stdin`
   // blocks on an open stdin, so a usage error must never wait for EOF.

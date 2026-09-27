@@ -1,0 +1,8 @@
+{ "models": [
+  { "slug": "gpt-6-astra", "visibility": "list", "priority": 1, "supported_reasoning_levels": [ {"effort":"low"}, {"effort":"medium"}, {"effort":"high"}, {"effort":"xhigh"}, {"effort":"max"}, {"effort":"ultra"} ] },
+  { "slug": "gpt-6-sol",   "visibility": "list", "priority": 2, "supported_reasoning_levels": [ {"effort":"low"}, {"effort":"medium"}, {"effort":"high"}, {"effort":"xhigh"}, {"effort":"max"}, {"effort":"ultra"} ] },
+  { "slug": "gpt-5.6-sol", "visibility": "list", "priority": 5, "supported_reasoning_levels": [ {"effort":"low"}, {"effort":"medium"}, {"effort":"high"} ] },
+  { "slug": "gpt-5.6-terra", "visibility": "list", "priority": 6, "supported_reasoning_levels": [ {"effort":"low"}, {"effort":"medium"}, {"effort":"high"}, {"effort":"xhigh"} ] },
+  { "slug": "gpt-reserve", "visibility": "hide", "priority": 9, "supported_reasoning_levels": [ {"effort":"low"} ] },
+  { "slug": "gpt-5.3-codex-spark", "visibility": "list", "priority": 7, "supported_reasoning_levels": [ {"effort":"low"}, {"effort":"medium"}, {"effort":"high"} ] }
+] }

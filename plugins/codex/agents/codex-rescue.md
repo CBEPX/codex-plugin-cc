@@ -37,7 +37,8 @@ CODEX_PROMPT_<random>
 - Leave `--effort` unset unless the user explicitly requests a specific reasoning effort.
 - Leave model unset by default. Only add `--model` when the user explicitly asks for a specific model.
 - If the user asks for `spark`, map that to `--model gpt-5.3-codex-spark`.
-- If the user asks for a concrete model name such as `gpt-5.6-terra`, pass it through with `--model`.
+- If the user asks for `astra`, `sol`, `luna`, `terra` or `mini`, pass the alias through with `--model`; the companion resolves it against the local Codex model catalogue (e.g. `sol` becomes the newest listed `*-sol` model).
+- If the user asks for a concrete model name such as `gpt-6-astra`, pass it through with `--model`.
 - Treat `--effort <value>`, `--model <value>`, and `--config key=value` as runtime controls and do not include them in the task text you pass through.
 - Never add `--write` unless the user explicitly asked Codex to modify files.
 - Preserve the user's task text as-is apart from stripping routing flags.
