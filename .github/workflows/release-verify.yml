@@ -81,7 +81,6 @@ jobs:
     name: Quality (ubuntu, node 24)
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    # Lint/typecheck/changelog/coverage land here in Task 3.
 
     steps:
       - name: Check out release ref
@@ -104,8 +103,17 @@ jobs:
       - name: Version metadata matches the tag
         run: npm run check-version
 
+      - name: Changelog has a section for the version
+        run: npm run check:changelog
+
+      - name: Lint
+        run: npm run lint
+
       - name: Run build
         run: npm run build
+
+      - name: Typecheck tests and scripts
+        run: npm run typecheck:tests
 
       - name: Runtime dependency audit
         run: npm audit --omit=dev

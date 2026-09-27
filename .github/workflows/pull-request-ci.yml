@@ -73,8 +73,7 @@ jobs:
   quality:
     name: Quality (ubuntu, node 24)
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-    # Lint/typecheck/changelog/coverage land here in Task 3.
+    timeout-minutes: 20
 
     steps:
       - name: Check out repository
@@ -92,8 +91,28 @@ jobs:
       - name: Install Codex CLI
         run: npm install -g @openai/codex
 
+      - name: Version metadata matches the package
+        run: npm run check-version
+
+      - name: Changelog has a section for the version
+        run: npm run check:changelog
+
+      - name: Lint
+        run: npm run lint
+
       - name: Run build
         run: npm run build
 
-      - name: Version metadata matches the package
-        run: npm run check-version
+      - name: Typecheck tests and scripts
+        run: npm run typecheck:tests
+
+      - name: Test coverage
+        run: npm run test:coverage
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: coverage
+          path: reports/coverage/
+          retention-days: 14

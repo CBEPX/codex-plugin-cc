@@ -1,0 +1,12 @@
+{
+  "all": true,
+  "include": ["plugins/codex/scripts/**/*.mjs", "scripts/**/*.mjs"],
+  "exclude": ["plugins/codex/.generated/**", "scripts/run-tests.mjs"],
+  "reporter": ["text", "json-summary", "lcov"],
+  "reports-dir": "reports/coverage",
+  "check-coverage": true,
+  "lines": 88,
+  "statements": 88,
+  "branches": 78,
+  "functions": 95
+}

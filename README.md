@@ -379,3 +379,25 @@ If you need to point the built-in OpenAI provider at a different endpoint, set `
 ### Windows
 
 As of v1.3.0, kills issued from stored process records (`/codex:cancel`, `SessionEnd` cleanup, stale-broker replacement, broker teardown) are refused on Windows until process identity lands in v1.4.0. This bounds any leak by the broker idle timeout, and a turn interrupt is still sent regardless — it just cannot be followed by a forced kill on that platform yet.
+
+## Development
+
+The plugin runtime supports Node.js 18.18 or later; the development tooling below
+(eslint, c8, Stryker) needs Node.js 24. `npm run build` also needs the `codex` CLI
+on `PATH`, because it generates the app-server protocol types first.
+
+- `npm run check` — the full local gate: version metadata, changelog, lint,
+  typecheck (`npm run build`), typecheck of tests and scripts, and the test suite.
+- `npm run setup:git-hooks` — points git at `.githooks/` (pre-commit runs lint and
+  typecheck).
+- `npm run test:coverage` — runs the suite under c8 and writes
+  `reports/coverage/`; thresholds live in `.c8rc.json` (long-term target:
+  85% lines, 75% branches, 90% functions).
+- `npm run test:mutation:critical` — Stryker over `args.mjs` and
+  `model-catalog.mjs`, reports in `reports/mutation/` (also runs weekly in CI).
+
+Coverage includes the companion, broker and hook subprocesses that tests spawn,
+because c8 passes `NODE_V8_COVERAGE` to child processes. It has limits: a child
+killed with SIGKILL or `taskkill /F` leaves no coverage dump, a detached broker or
+worker may exit after the report is written, and Windows-only branches are not
+measured on the ubuntu CI job.

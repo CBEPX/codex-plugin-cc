@@ -1,0 +1,13 @@
+{
+  "extends": "./tsconfig.app-server.json",
+  "compilerOptions": {
+    // checkJs: true reports 54 errors in tests/ (v1.4.0); flip once they are fixed.
+    "checkJs": false
+  },
+  "include": [
+    "tests/**/*.mjs",
+    "scripts/**/*.mjs",
+    "plugins/codex/scripts/lib/app-server-protocol.d.ts",
+    "plugins/codex/.generated/app-server-types/**/*.ts"
+  ]
+}
