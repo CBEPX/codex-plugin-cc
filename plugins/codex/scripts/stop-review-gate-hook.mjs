@@ -15,6 +15,11 @@ import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
 const STOP_REVIEW_TIMEOUT_MINUTES = 13;
 const STOP_REVIEW_TIMEOUT_MS = STOP_REVIEW_TIMEOUT_MINUTES * 60 * 1000;
+// Tests only: shorten the review timeout instead of waiting the full 13 minutes.
+const STOP_REVIEW_TIMEOUT_OVERRIDE_MS = Number(process.env.CODEX_STOP_REVIEW_TIMEOUT_MS) > 0 ? Number(process.env.CODEX_STOP_REVIEW_TIMEOUT_MS) : 0;
+const DEFAULT_MAX_ROUNDS = 3;
+const ESCAPE_HATCH = "Disable with /codex:setup --disable-review-gate.";
+const MANUAL_HINT = `Run /codex:review --wait manually. ${ESCAPE_HATCH}`;
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = path.resolve(SCRIPT_DIR, "..");
 const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
@@ -39,15 +44,15 @@ function logNote(message) {
   process.stderr.write(`${message}\n`);
 }
 
-// Optional cap on how many consecutive stop-gate rounds run in one session.
-// Unset or 0 keeps the previous unbounded behavior.
+// Cap on how many consecutive gate-induced rounds run in one session.
+// Unset or invalid → DEFAULT_MAX_ROUNDS; an explicit 0 keeps the rounds unbounded.
 function getMaxRounds() {
   const raw = process.env.CODEX_REVIEW_GATE_MAX_ROUNDS;
   if (raw == null || raw === "") {
-    return 0;
+    return DEFAULT_MAX_ROUNDS;
   }
   const parsed = Number.parseInt(raw, 10);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_MAX_ROUNDS;
 }
 
 function gateSessionId(input) {
@@ -108,7 +113,7 @@ function parseStopReviewOutput(rawOutput) {
     return {
       ok: false,
       reason:
-        "The stop-time Codex review task returned no final output. Run /codex:review --wait manually or bypass the gate."
+        `The stop-time Codex review task returned no final output. ${MANUAL_HINT}`
     };
   }
 
@@ -127,31 +132,46 @@ function parseStopReviewOutput(rawOutput) {
   return {
     ok: false,
     reason:
-      "The stop-time Codex review task returned an unexpected answer. Run /codex:review --wait manually or bypass the gate."
+      `The stop-time Codex review task returned an unexpected answer. ${MANUAL_HINT}`
   };
 }
 
-function runStopReview(cwd, input = {}) {
+function runStopReview(cwd, input = {}, config = {}) {
   const scriptPath = path.join(SCRIPT_DIR, "codex-companion.mjs");
   const prompt = buildStopReviewPrompt(input);
   const childEnv = {
     ...process.env,
     ...(input.session_id ? { [SESSION_ID_ENV]: input.session_id } : {})
   };
-  const result = spawnSync(process.execPath, [scriptPath, "task", "--json", prompt], {
+  const args = [scriptPath, "task", "--json"];
+  if (config.stopReviewGateModel) {
+    args.push("--model", config.stopReviewGateModel);
+  }
+  if (config.stopReviewGateEffort) {
+    args.push("--effort", config.stopReviewGateEffort);
+  }
+  args.push(prompt);
+  const result = spawnSync(process.execPath, args, {
     cwd,
     env: childEnv,
     encoding: "utf8",
-    timeout: STOP_REVIEW_TIMEOUT_MS,
+    timeout: STOP_REVIEW_TIMEOUT_OVERRIDE_MS || STOP_REVIEW_TIMEOUT_MS,
     killSignal: "SIGKILL",
     maxBuffer: 16 * 1024 * 1024
   });
 
   if (result.error?.code === "ETIMEDOUT") {
+    const limit = STOP_REVIEW_TIMEOUT_OVERRIDE_MS ? `${STOP_REVIEW_TIMEOUT_OVERRIDE_MS} ms` : `${STOP_REVIEW_TIMEOUT_MINUTES} minutes`;
     return {
       ok: false,
-      reason:
-        `The stop-time Codex review task timed out after ${STOP_REVIEW_TIMEOUT_MINUTES} minutes. Run /codex:review --wait manually or bypass the gate.`
+      reason: `The stop-time Codex review task timed out after ${limit} and was terminated by signal ${result.signal ?? "SIGKILL"}. ${MANUAL_HINT}`
+    };
+  }
+
+  if (result.signal) {
+    return {
+      ok: false,
+      reason: `The stop-time Codex review task was terminated by signal ${result.signal}. ${MANUAL_HINT}`
     };
   }
 
@@ -160,8 +180,8 @@ function runStopReview(cwd, input = {}) {
     return {
       ok: false,
       reason: detail
-        ? `The stop-time Codex review task failed: ${detail}`
-        : "The stop-time Codex review task failed. Run /codex:review --wait manually or bypass the gate."
+        ? `The stop-time Codex review task failed: ${detail} ${ESCAPE_HATCH}`
+        : `The stop-time Codex review task failed. ${MANUAL_HINT}`
     };
   }
 
@@ -172,7 +192,7 @@ function runStopReview(cwd, input = {}) {
     return {
       ok: false,
       reason:
-        "The stop-time Codex review task returned invalid JSON. Run /codex:review --wait manually or bypass the gate."
+        `The stop-time Codex review task returned invalid JSON. ${MANUAL_HINT}`
     };
   }
 }
@@ -225,7 +245,7 @@ function main() {
     return;
   }
 
-  const review = runStopReview(cwd, input);
+  const review = runStopReview(cwd, input, config);
   if (!review.ok) {
     writeGateRounds(workspaceRoot, sessionId, priorRounds + 1);
     emitDecision({

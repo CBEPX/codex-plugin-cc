@@ -237,6 +237,7 @@ test("hooks keep session-end cleanup and stop gating enabled", () => {
   assert.match(source, /SessionEnd/);
   assert.match(source, /stop-review-gate-hook\.mjs/);
   assert.match(source, /session-lifecycle-hook\.mjs/);
+  assert.equal("description" in JSON.parse(source), false);
 });
 
 test("session start hook allows enough time to restore session state", () => {
@@ -250,7 +251,7 @@ test("setup command can offer Codex install and still points users to codex logi
   const setup = read("commands/setup.md");
   const readme = fs.readFileSync(path.join(ROOT, "README.md"), "utf8");
 
-  assert.match(setup, /argument-hint:\s*'\[--enable-review-gate\|--disable-review-gate\]'/);
+  assert.match(setup, /argument-hint:\s*'\[--enable-review-gate\|--disable-review-gate\] \[--review-gate-model <model\|inherit>\] \[--review-gate-effort <effort\|inherit>\]'/);
   assert.match(setup, /AskUserQuestion/);
   assert.match(setup, /npm install -g @openai\/codex/);
   assert.match(setup, /codex-companion\.mjs" setup --json --args-stdin <<'CODEX_ARGS'/);

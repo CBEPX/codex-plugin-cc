@@ -106,7 +106,7 @@ function printUsage() {
   console.log(
     [
       "Usage:",
-      "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
+      "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--review-gate-model <model|inherit>] [--review-gate-effort <effort|inherit>] [--json]",
       "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model|spark|sol|luna|terra|mini>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [--turn-timeout-ms <ms>] [--config key=value]...",
       "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model|spark|sol|luna|terra|mini>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [--turn-timeout-ms <ms>] [--config key=value]... [focus text]",
       "  node scripts/codex-companion.mjs task [--background|--await [--await-timeout-ms <ms>]] [--prompt-stdin] [--write] [--resume-last|--resume|--fresh] [--model <model|spark|sol|luna|terra|mini>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [--turn-timeout-ms <ms>] [--config key=value]... [prompt]",
@@ -305,6 +305,8 @@ async function buildSetupReport(cwd, actionsTaken = []) {
     auth: authStatus,
     sessionRuntime: getSessionRuntimeStatus(process.env, workspaceRoot),
     reviewGateEnabled: Boolean(config.stopReviewGate),
+    reviewGateModel: config.stopReviewGateModel ?? null,
+    reviewGateEffort: config.stopReviewGateEffort ?? null,
     actionsTaken,
     nextSteps
   };
@@ -312,7 +314,7 @@ async function buildSetupReport(cwd, actionsTaken = []) {
 
 async function handleSetup(argv) {
   const { options } = parseCommandInput(argv, {
-    valueOptions: ["cwd"],
+    valueOptions: ["cwd", "review-gate-model", "review-gate-effort"],
     booleanOptions: ["json", "enable-review-gate", "disable-review-gate"]
   });
   if (maybePrintCommandHelp(options)) {
@@ -333,6 +335,16 @@ async function handleSetup(argv) {
   } else if (options["disable-review-gate"]) {
     setConfig(workspaceRoot, "stopReviewGate", false);
     actionsTaken.push(`Disabled the stop-time review gate for ${workspaceRoot}.`);
+  }
+  if (options["review-gate-model"] != null) {
+    const value = String(options["review-gate-model"]).trim().toLowerCase() === "inherit" ? null : normalizeRequestedModel(options["review-gate-model"]);
+    setConfig(workspaceRoot, "stopReviewGateModel", value);
+    actionsTaken.push(value ? `Stop-time review gate model set to ${value}.` : "Stop-time review gate model now inherits Codex config.");
+  }
+  if (options["review-gate-effort"] != null) {
+    const value = String(options["review-gate-effort"]).trim().toLowerCase() === "inherit" ? null : normalizeReasoningEffort(options["review-gate-effort"]);
+    setConfig(workspaceRoot, "stopReviewGateEffort", value);
+    actionsTaken.push(value ? `Stop-time review gate effort set to ${value}.` : "Stop-time review gate effort now inherits Codex config.");
   }
 
   const finalReport = await buildSetupReport(cwd, actionsTaken);

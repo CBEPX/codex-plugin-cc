@@ -247,21 +247,30 @@ You can also use `/codex:setup` to manage the optional review gate.
 /codex:setup --disable-review-gate
 ```
 
-When the review gate is enabled, the plugin uses a `Stop` hook to run a targeted Codex review based on Claude's response. If that review finds issues, the stop is blocked so Claude can address them first.
+When the review gate is enabled, the plugin uses a `Stop` hook to run a targeted Codex review based on Claude's response. If that review finds issues, the stop is blocked so Claude can address them first. When the review itself fails (timeout, killed by a signal, invalid output), the block reason says why and ends with `Disable with /codex:setup --disable-review-gate.`
+
+To pin the model and reasoning effort the gate's review uses, independently of your Codex config:
+
+```bash
+/codex:setup --review-gate-model spark --review-gate-effort low
+/codex:setup --review-gate-model inherit --review-gate-effort inherit
+```
+
+Model aliases (`spark`, `sol`, `luna`, `terra`, `mini`) resolve the same way as for `/codex:rescue`; `inherit` clears the pin so the review uses your Codex config again.
 
 > [!WARNING]
 > The review gate can create a long-running Claude/Codex loop and may drain usage limits quickly. Only enable it when you plan to actively monitor the session.
 
 #### Bounding the review gate
 
-By default the gate keeps blocking the stop until Codex is satisfied, which is what can create the loop above. Set `CODEX_REVIEW_GATE_MAX_ROUNDS` to cap how many consecutive gate rounds run in a single session before the stop is allowed through:
+By default the gate blocks at most 3 consecutive rounds in a single session, then lets the stop through. Set `CODEX_REVIEW_GATE_MAX_ROUNDS` to change that cap:
 
 ```bash
 # allow at most 5 stop-gate review rounds per session, then let the stop proceed
 export CODEX_REVIEW_GATE_MAX_ROUNDS=5
 ```
 
-When unset or `0`, the gate is unbounded (the previous behavior). The count is per session, increments on each blocked round (tracked via `stop_hook_active`), and resets once a stop is allowed or a fresh user turn begins.
+When unset, the cap is 3. Set it to `0` explicitly to keep the gate unbounded (the pre-1.3.0 behavior). The count is per session, increments on each blocked round (tracked via `stop_hook_active`), and resets once a stop is allowed or a fresh user turn begins.
 
 ## Typical Flows
 

@@ -2394,6 +2394,59 @@ test("stop hook runs a stop-time review task and blocks on findings when the rev
   assert.match(status.stdout, /Codex Stop Gate Review/);
 });
 
+test("stop gate forwards the configured model and effort to the review task (#769)", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  const setup = run("node", [SCRIPT, "setup", "--enable-review-gate", "--review-gate-model", "spark", "--review-gate-effort", "low", "--json"], { cwd: repo, env: buildEnv(binDir) });
+  assert.equal(setup.status, 0, setup.stderr);
+  const payload = JSON.parse(setup.stdout);
+  assert.equal(payload.reviewGateModel, "gpt-5.3-codex-spark");
+  assert.equal(payload.reviewGateEffort, "low");
+  const hook = run("node", [STOP_HOOK], { cwd: repo, env: buildEnv(binDir), input: JSON.stringify({ cwd: repo, session_id: "sess-gate-model", last_assistant_message: "done" }) });
+  assert.equal(hook.status, 0, hook.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
+  assert.equal(fakeState.lastThreadStart.config.model, "gpt-5.3-codex-spark");
+  assert.equal(fakeState.lastThreadStart.config.model_reasoning_effort, "low");
+  const cleared = run("node", [SCRIPT, "setup", "--review-gate-model", "inherit", "--json"], { cwd: repo, env: buildEnv(binDir) });
+  assert.equal(JSON.parse(cleared.stdout).reviewGateModel, null);
+});
+
+test("stop gate stops blocking after three gate-induced rounds by default (#548)", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  run("node", [SCRIPT, "setup", "--enable-review-gate"], { cwd: repo, env: buildEnv(binDir) });
+  const env = { ...buildEnv(binDir) };
+  delete env.CODEX_REVIEW_GATE_MAX_ROUNDS;
+  const input = (active) => JSON.stringify({ cwd: repo, session_id: "sess-rounds", stop_hook_active: active, last_assistant_message: "I completed the refactor." });
+  const decisions = [];
+  for (const active of [false, true, true, true]) {
+    const r = run("node", [STOP_HOOK], { cwd: repo, env, input: input(active) });
+    assert.equal(r.status, 0, r.stderr);
+    decisions.push(r.stdout.trim() ? JSON.parse(r.stdout).decision : "allow");
+  }
+  assert.deepEqual(decisions, ["block", "block", "block", "allow"]);
+});
+
+test("stop gate names the signal when the review task is killed and always names the escape hatch (#589/#483)", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  run("node", [SCRIPT, "setup", "--enable-review-gate"], { cwd: repo, env: buildEnv(binDir) });
+  const env = buildEnv(binDir, { FAKE_CODEX_TURN_DELAY_MS: "60000", CODEX_STOP_REVIEW_TIMEOUT_MS: "800" });
+  const r = run("node", [STOP_HOOK], { cwd: repo, env, input: JSON.stringify({ cwd: repo, session_id: "sess-signal", last_assistant_message: "x" }) });
+  assert.equal(r.status, 0, r.stderr);
+  const payload = JSON.parse(r.stdout);
+  assert.equal(payload.decision, "block");
+  assert.match(payload.reason, /timed out after 0\.8 minutes|terminated by signal SIGKILL/);
+  assert.match(payload.reason, /Disable with \/codex:setup --disable-review-gate\./);
+});
+
 test("stop hook blocks when hook input is malformed JSON", () => {
   const blocked = run(process.execPath, [STOP_HOOK], {
     cwd: ROOT,
