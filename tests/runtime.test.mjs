@@ -18,7 +18,8 @@ import {
   resolveJobRequestFile,
   resolveStateDir,
   upsertJob,
-  writeJobFile
+  writeJobFile,
+  writeJobPidFile
 } from "../plugins/codex/scripts/lib/state.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -1910,11 +1911,12 @@ test("cancel stops an active background job and marks it cancelled", async (t) =
   assert.match(fs.readFileSync(logFile, "utf8"), /Cancelled by user/);
 });
 
-// The #743 scenario: a record from before identities existed names a pid the OS
-// has since handed to an unrelated process. Liveness says "alive", so the reaper
-// keeps the job; cancel must still refuse to signal a process that is not this
-// job's worker, and say so.
-test("cancel refuses to signal a worker whose recorded identity no longer matches and says so", { skip: process.platform === "win32" }, async (t) => {
+// The #743 scenario through the no-identity command-line fallback: a record from
+// before identities existed names a pid the OS has since handed to an unrelated
+// process. Liveness says "alive", so the reaper keeps the job; cancel must refuse
+// to signal a process that is not this job's worker, say so, and not claim the
+// job was cancelled — it stays running (sidecar kept) until the pid goes away.
+test("cancel through the no-identity command-line fallback refuses a foreign pid and keeps the job running", { skip: process.platform === "win32" }, async (t) => {
   const repo = makeTempDir();
   initGitRepo(repo);
   const stranger = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { detached: true, stdio: "ignore" });
@@ -1934,14 +1936,30 @@ test("cancel refuses to signal a worker whose recorded identity no longer matche
   };
   writeJobFile(repo, job.id, job);
   upsertJob(repo, job);
+  writeJobPidFile(repo, job.id, stranger.pid);
 
   const cancel = run("node", [SCRIPT, "cancel", job.id], { cwd: repo });
 
-  assert.equal(cancel.status, 0, cancel.stderr);
-  assert.match(cancel.stdout, new RegExp(`worker pid ${stranger.pid} left running: identity-mismatch`));
+  assert.equal(cancel.status, 1, cancel.stderr);
+  assert.match(cancel.stdout, new RegExp(`cancellation not confirmed: worker pid ${stranger.pid} left running \\(identity-mismatch\\)`));
+  assert.match(cancel.stdout, /the job stays running until the worker exits/);
+  const cancelJson = run("node", [SCRIPT, "cancel", job.id, "--json"], { cwd: repo });
+  assert.equal(cancelJson.status, 1, cancelJson.stderr);
+  assert.deepEqual(JSON.parse(cancelJson.stdout), { jobId: job.id, status: "running", cancellationPending: true, reason: "identity-mismatch" });
   const json = run("node", [SCRIPT, "status", job.id, "--json"], { cwd: repo });
   assert.equal(json.status, 0, json.stderr);
+  assert.equal(JSON.parse(json.stdout).job.status, "running");
+  assert.equal(fs.existsSync(resolveJobPidFile(repo, job.id)), true, "the pid sidecar must survive a refused cancel");
   process.kill(stranger.pid, 0); // still alive: throws ESRCH if cancel signalled it
+
+  // Once the pid is gone the job reaches a terminal state the normal way.
+  process.kill(stranger.pid, "SIGKILL");
+  await waitFor(() => {
+    try { process.kill(stranger.pid, 0); return false; } catch (error) { return error?.code === "ESRCH"; }
+  });
+  const after = run("node", [SCRIPT, "status", job.id, "--json"], { cwd: repo });
+  assert.equal(after.status, 0, after.stderr);
+  assert.notEqual(JSON.parse(after.stdout).job.status, "running");
 });
 
 // The parent records the worker's identity next to its pid, so cancel can prove

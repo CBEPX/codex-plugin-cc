@@ -25,7 +25,7 @@ import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
 import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
 import { loadModelCatalog, resolveModelAlias, supportedEfforts } from "./lib/model-catalog.mjs";
-import { binaryAvailable, getProcessIdentity, terminateRecordedProcess, workerCommandLine } from "./lib/process.mjs";
+import { binaryAvailable, getProcessIdentity, isPidAlive, terminateRecordedProcess, workerCommandLine } from "./lib/process.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import {
   consumeJobRequestFile,
@@ -1322,6 +1322,20 @@ async function handleCancel(argv) {
   // Only a pid that is provably still this job's worker is signalled (#743).
   const { pid, identity } = resolveJobPid(workspaceRoot, job);
   const kill = terminateRecordedProcess(pid, { identity, commandLineMatch: workerCommandLine(job.id) });
+  // A worker we may not signal but that is still alive would overwrite a
+  // `cancelled` record with its own result: the job stays running, and the
+  // sidecar stays so a later cancel or the reaper can still find it.
+  if (pid && !kill.attempted && isPidAlive(pid) === true) {
+    const pending = `cancellation not confirmed: worker pid ${pid} left running (${kill.reason})`;
+    appendLogLine(job.logFile, pending);
+    process.exitCode = 1;
+    outputCommandResult(
+      { jobId: job.id, status: "running", cancellationPending: true, reason: kill.reason },
+      `${pending}\nThe turn interrupt was sent; the job stays running until the worker exits. Re-run cancel or wait for result.\n`,
+      options.json
+    );
+    return;
+  }
   const leftRunning = pid && !kill.attempted ? `worker pid ${pid} left running: ${kill.reason}` : null;
   if (leftRunning) {
     appendLogLine(job.logFile, leftRunning);
