@@ -3,16 +3,24 @@ name: Pull Request CI
 on:
   pull_request:
   push:
-    branches: [main, "release/**"]
+    branches: [main, "release/**", "ci/**"]
 
 permissions:
   contents: read
 
 jobs:
   ci:
-    name: CI
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+    name: CI (${{ matrix.os }}, node ${{ matrix.node }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    # Spike: Windows is exploratory until the test harness runs there
+    # (fake codex is a shebang script; see docs/superpowers/plans step 0).
+    continue-on-error: ${{ startsWith(matrix.os, 'windows') }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        node: [18, 22, 24]
 
     steps:
       - name: Check out repository
@@ -21,7 +29,7 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
         with:
-          node-version: 22
+          node-version: ${{ matrix.node }}
           cache: npm
 
       - name: Install dependencies
@@ -31,9 +39,25 @@ jobs:
         run: npm install -g @openai/codex
 
       - name: Run test suite
-        run: npm test
+        shell: bash
+        run: |
+          set +e
+          npm test 2>&1 | tee test-output.log
+          status=${PIPESTATUS[0]}
+          echo "## Test summary (${{ matrix.os }}, node ${{ matrix.node }})" >> "$GITHUB_STEP_SUMMARY"
+          { rg -e 'ℹ (tests|pass|fail)' -e '^not ok' test-output.log || grep -E 'ℹ (tests|pass|fail)|^not ok' test-output.log; } >> "$GITHUB_STEP_SUMMARY" || true
+          exit "$status"
+
+      - name: Upload test log
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: test-log-${{ matrix.os }}-node${{ matrix.node }}
+          path: test-output.log
+          retention-days: 7
 
       - name: No leaked test processes
+        if: runner.os != 'Windows'
         run: |
           sleep 10
           if pgrep -f codex-plugin-test- ; then echo "leaked test processes" >&2; exit 1; fi
