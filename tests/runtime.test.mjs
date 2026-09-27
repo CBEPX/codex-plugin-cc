@@ -1912,10 +1912,12 @@ test("cancel stops an active background job and marks it cancelled", async (t) =
 });
 
 // The #743 scenario through the no-identity command-line fallback: a record from
-// before identities existed names a pid the OS has since handed to an unrelated
-// process. Liveness says "alive", so the reaper keeps the job; cancel must refuse
-// to signal a process that is not this job's worker, say so, and not claim the
-// job was cancelled — it stays running (sidecar kept) until the pid goes away.
+// before identities existed names a pid the OS has since handed to another
+// companion process. The reaper cannot rule a companion out by command line, so
+// it keeps the job; cancel must refuse to signal a process that is not this
+// job's worker, say so, and not claim the job was cancelled — it stays running
+// (sidecar kept) until the pid goes away. (A pid now running something that is
+// not a companion at all is reaped instead; see tests/tracked-jobs.test.mjs.)
 test("cancel through the no-identity command-line fallback refuses a foreign pid and keeps the job running", { skip: process.platform === "win32" }, async (t) => {
   const repo = makeTempDir();
   initGitRepo(repo);
