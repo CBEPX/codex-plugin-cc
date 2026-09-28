@@ -1,6 +1,6 @@
 # codex-plugin-cc v1.4.1 — Windows process identity and the kill path
 
-Date: 2026-09-28 (rev. 7 after Codex plan reviews `01a0e764-…`, `01a0e775-…`, `01a0e788-…`, `01a0e799-…`, `01a0e7a8-…`, `01a0e7b7-04c7-7571-8eaf-ee8d9352a21c`). Roadmap: `~/.claude/plans/glistening-chasing-backus.md`, sections «v1.4.1» and «Дизайн: process identity». Base: `main` at 5662171 (v1.4.0).
+Date: 2026-09-28 (rev. 8 after Codex plan reviews `01a0e764-…`, `01a0e775-…`, `01a0e788-…`, `01a0e799-…`, `01a0e7a8-…`, `01a0e7b7-…`, `01a0e7c2-069f-75d0-b141-23aea5fc153a`). Roadmap: `~/.claude/plans/glistening-chasing-backus.md`, sections «v1.4.1» and «Дизайн: process identity». Base: `main` at 5662171 (v1.4.0).
 
 ## 1. Goal
 
@@ -95,7 +95,7 @@ JS mapping — the exit code classifies, the protocol lines refine, and any cont
 
 - CLM/AppLocker: scripts exit 244 at the guard → `identity-unavailable`, records kept at SessionEnd, behaviour otherwise equals v1.4.0; README says so. No CLM E2E (needs a lockdown policy the runner does not have); the guard is unit-tested by script text.
 - PowerShell 5.1 missing or root invalid: breaker, v1.4.0 behaviour.
-- No Job Object: descendants spawned after the snapshot survive; documented; the broker idle timeout and the reaper bound the leak.
+- No Job Object: a descendant spawned after the snapshot survives the kill; like a survivor that outlives its root, it has no lifetime bound and no later cleanup attempt from the plugin (it belongs to nobody the plugin records); documented in README.
 - No orphan tracking: a survivor reported by a kill is logged with its identity but not followed by any record; if Windows users report leaked subtrees, v1.4.2 adds a per-job `orphans` record with a single owner of its lifecycle (the plan reviews of this release enumerate the writers it must reconcile).
 - A process the plugin may not open (`.Handle` access denied) is `identity-unavailable`, never killed by number.
 - Upstream comments only after the user approves; the «verify» bucket gets retest asks.
