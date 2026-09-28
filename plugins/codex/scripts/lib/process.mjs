@@ -193,6 +193,11 @@ export function processCommandLine(pid, options = {}) {
     }
   }
 
+  // A spent budget is no probe (spawnSync would read 0 as "no timeout").
+  if (options.timeoutMs !== undefined && !(options.timeoutMs > 0)) {
+    return null;
+  }
+
   const runCommandImpl = options.runCommandImpl ?? runCommand;
   const result = runCommandImpl("ps", ["-ww", "-o", "command=", "-p", String(pid)], {
     timeoutMs: options.timeoutMs,

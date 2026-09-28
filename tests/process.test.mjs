@@ -192,6 +192,18 @@ test("processCommandLine asks ps for unlimited width off linux", () => {
   assert.equal(processCommandLine(42, { platform: "darwin", runCommandImpl: () => ({ status: 0, stdout: "  \n", stderr: "", error: null }) }), null);
 });
 
+// spawnSync reads a timeout of 0 as "no timeout": a spent budget must be no
+// probe at all, not a probe with no bound.
+test("processCommandLine treats a spent budget as no probe on the ps branch", () => {
+  for (const timeoutMs of [0, -1]) {
+    assert.equal(processCommandLine(42, { platform: "darwin", timeoutMs, runCommandImpl: () => assert.fail("must not spawn ps") }), null);
+  }
+  // A fractional positive budget is clamped by runCommand and still probes; an unset one probes too.
+  for (const options of [{ timeoutMs: 0.3 }, {}]) {
+    assert.equal(processCommandLine(42, { platform: "darwin", ...options, runCommandImpl: () => ({ status: 0, stdout: "node x\n", stderr: "", error: null }) }), "node x");
+  }
+});
+
 // A pid alone cannot tell the process that was recorded from the one that
 // inherited the number (#743): identity is the start time, which a recycled pid
 // cannot share.
