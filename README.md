@@ -7,8 +7,6 @@ Use Codex from inside Claude Code for code reviews or to delegate tasks to Codex
 This plugin is for Claude Code users who want an easy way to start using Codex from the workflow
 they already have.
 
-<video src="./docs/plugin-demo.webm" controls muted playsinline autoplay></video>
-
 ## What You Get
 
 - `/codex:review` for a normal read-only Codex review
@@ -388,11 +386,13 @@ If you need to point the built-in OpenAI provider at a different endpoint, set `
 
 ### Windows
 
-As of v1.3.0, kills issued from stored process records (`/codex:cancel`, `SessionEnd` cleanup, stale-broker replacement, broker teardown) are refused on Windows until process identity lands in v1.4.0. This bounds any leak by the broker idle timeout, and a turn interrupt is still sent regardless — it just cannot be followed by a forced kill on that platform yet.
+As of v1.4.0, the plugin no longer spawns commands through `$SHELL` on Windows (usually Git Bash, which mangled `taskkill` and other arguments): `codex`, `npm` and `git` are resolved with `where.exe`, `.exe` files run directly and `.cmd` shims run through `cmd.exe`. This is the spawn path behind the commands, `/codex:review`, `/codex:adversarial-review` and background `task`/`--await` jobs. Separately, the `Stop`, `SessionStart` and `SessionEnd` hooks now read stdin with a bounded deadline instead of a blocking read, so a disabled review gate no longer hangs until the hook timeout on Windows. `/codex:transfer`'s own Windows-specific issues (verbatim `\\?\` paths, ledger lookups) are unrelated to this change and are not fixed in v1.4.0.
 
-As of v1.4.0, the plugin no longer runs commands through `$SHELL` on Windows (usually Git Bash, which mangled `taskkill` arguments). It finds `codex`, `npm` and `git` with `where.exe`, runs `.exe` files directly and runs `.cmd` shims through `cmd.exe`. The catch: a `codex` or `npm` that only exists inside Git Bash (an alias, a shell function or a bash-only `PATH` entry) is no longer found. Put `codex.cmd` or `codex.exe` on the Windows `PATH`; a global `npm install -g @openai/codex` already does that.
+Still limited until v1.4.1: kills issued from stored process records — `/codex:cancel`, `SessionEnd` cleanup of a still-running job, stale-broker replacement, and broker teardown — refuse to signal a stored pid (reason `identity-unavailable`) because process identity verification has not landed yet; that is now targeted for v1.4.1, not v1.4.0. This bounds any leak by the broker idle timeout, and a turn interrupt is still sent regardless — it just cannot be followed by a forced kill on that platform yet.
 
-When `CLAUDE_PLUGIN_DATA` is not set, job state falls back to a per-user directory: `%LOCALAPPDATA%\codex-companion` on Windows as of v1.4.0 (a private `codex-companion-<uid>` directory under the system temp directory elsewhere). If a pre-1.4.0 state root under `%TEMP%\codex-companion-user` already exists, it keeps being used (with a one-line notice) until you remove it; nothing is migrated. On Windows, state reads and writes also retry briefly when another process holds `state.json` or a lock ticket open.
+Requirements: `where.exe` and `cmd.exe` ship with Windows, so nothing extra needs installing for them, and PowerShell is not required in v1.4.0. `codex` and `npm` must be on the Windows `PATH` as `.cmd`/`.exe` (a global `npm install -g @openai/codex` already does that for `codex`); a `codex` or `npm` that only exists inside Git Bash (an alias, a shell function or a bash-only `PATH` entry) is no longer found.
+
+When `CLAUDE_PLUGIN_DATA` is not set, job state falls back to a per-user directory: `%LOCALAPPDATA%\codex-companion` on Windows as of v1.4.0 (a private `codex-companion-<uid>` directory under the system temp directory elsewhere). If a pre-1.4.0 state root under `%TEMP%\codex-companion-user` already exists, it keeps being used (with a one-line notice) until you remove it; nothing is migrated. On Windows, state reads and writes also retry briefly (up to 20 attempts, roughly 300 ms worst case) on `EPERM`/`EBUSY`/`EACCES` when another process holds `state.json` or a lock ticket open.
 
 ## Development
 

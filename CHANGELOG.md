@@ -1,5 +1,29 @@
 # Changelog
 
+## 1.4.0 — 2026-09-28
+
+### Fixed
+- Windows: commands are no longer spawned through `$SHELL` (usually Git Bash under Claude Code, which mangled `taskkill /PID /T /F` and other arguments); executables are resolved with `where.exe`, `.exe`/`.com` files run directly, and `.cmd`/`.bat` shims (including a global `npm install -g @openai/codex`) run through `cmd.exe` with every argument escaped for both `cmd /c` and the shim's own `%*` re-parse (#525, #647, #656, #669, #708, #287, #409, #735).
+- Windows: the broker and app-server child processes no longer flash a visible console window on spawn (`windowsHide: true`) (#440, #451).
+- The `Stop`, `SessionStart` and `SessionEnd` hooks read stdin with a bounded deadline (2 s / 5 s / 1 s respectively) and a 1 MiB limit instead of a blocking `readFileSync(0)`; a disabled Stop review gate no longer hangs until the 900 s hook timeout when stdin never arrives, and the companion no longer crashes with `EAGAIN` reading a non-blocking stdin under concurrent sessions (#530, #544, #120, #247, #123, #150, #165).
+- `--args-stdin` (and `$ARGUMENTS`) no longer eats a backslash that does not escape a quote, another backslash or whitespace, so Windows paths such as `C:\Users\me\project\file.mjs` survive; `\\server\share` is a documented limitation, and `--prompt-stdin` remains available for byte-exact text.
+- Windows: reads and writes of `state.json` and lock tickets retry briefly (bounded, roughly 300 ms worst case) on `EPERM`/`EBUSY`/`EACCES` instead of failing outright when another process holds the file open.
+
+### Added
+- `SECURITY.md` (supported versions, GitHub Security Advisories reporting) (#326).
+- Node 24 development tooling: ESLint, a `typecheck:tests` script over `tests/**` and `scripts/**` (`checkJs` is off for now — turning it on surfaced 54 pre-existing findings, deferred), `c8` coverage (`npm run test:coverage`, thresholds in `.c8rc.json`), Stryker mutation testing over the critical `args.mjs`/`model-catalog.mjs` pair (`npm run test:mutation:critical`), a `check:changelog` gate that keeps `CHANGELOG.md` and `plugins/codex/CHANGELOG.md` byte-identical, Dependabot, and `npm run setup:git-hooks` (pre-commit lint + typecheck).
+- CI: one workflow run per SHA (push limited to `main`, release branches checked via manual `workflow_dispatch`, with a `concurrency` group cancelling superseded runs) and a new `quality` job on Node 24 alongside the existing OS × Node matrix.
+
+### Changed
+- The per-user fallback state root used when `CLAUDE_PLUGIN_DATA` is unset is now `%LOCALAPPDATA%\codex-companion` on Windows. A pre-1.4.0 root under `%TEMP%\codex-companion-user` keeps being used, with a one-line stderr notice, until it is removed by hand — nothing is migrated automatically. This transitional notice only applies to an unversioned/dev checkout: a marketplace install's state-root hash is derived from `CLAUDE_PLUGIN_ROOT`, which already includes the plugin version in the marketplace cache, so a normal upgrade never sees the legacy root.
+- `BROKER_BUSY_RETRY_MS` widened from 1000 to 3000 ms; the "teardown only after the broker confirmed idle" invariant is unchanged.
+- Deferred v1.3.0 review minors folded in: `CODEX_REVIEW_GATE_MAX_ROUNDS` rejects a non-integer, negative or otherwise malformed value (falls back to 3 with a warning) instead of misreading it; `setup --review-gate-model ""` / `--review-gate-effort ""` now fails with `--<flag> needs a value; use inherit to clear it.` instead of writing anything; a job id used to build the `workerCommandLine` match is now regex-escaped; the `kill-failed` broker-teardown reason is documented in the README's reason table. Also added (test coverage only, no behavior change): a catalogue-only model alias resolving correctly on a priority tie, and the fallback-root refusal covering a non-standard directory mode.
+
+### Known limitations
+- Kills issued from stored process records (`/codex:cancel`, `SessionEnd` cleanup, stale-broker replacement, broker teardown) are still refused on Windows (`identity-unavailable`); process identity verification is now targeted for v1.4.1, not v1.4.0 as previously stated. This bounds any leak by the broker idle timeout, and the turn interrupt is still sent regardless.
+
+Ported with reference to upstream PRs by mohammad-malik, mittalpk, stantheman0128, tmchow, D2758695161, ikbear, e345ee, tanakauo.
+
 ## 1.3.0 — 2026-09-27
 
 ### Fixed
