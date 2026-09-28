@@ -40,3 +40,11 @@ resetWindowsIdentityCircuit();
 timed("getProcessIdentity(self) default", () => getProcessIdentity(process.pid));
 resetWindowsIdentityCircuit();
 timed("getProcessIdentities([self]) 60s", () => [...getProcessIdentities([process.pid], { timeoutMs: 60000 })]);
+// Hypothesis: without LOCALAPPDATA PowerShell cannot persist its module analysis
+// cache, so every launch is a 20-30 s "first use". Clean env + LOCALAPPDATA only.
+for (const extra of [{ LOCALAPPDATA: process.env.LOCALAPPDATA }, { LOCALAPPDATA: process.env.LOCALAPPDATA }, { PSModuleAnalysisCachePath: path.win32.join(process.env.TEMP, "codex-psmac.cache") }, { PSModuleAnalysisCachePath: path.win32.join(process.env.TEMP, "codex-psmac.cache") }]) {
+  const t3 = Date.now();
+  const r = spawnSync(systemPowerShell(root), ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encodePowerShell(probe([process.pid]))],
+    { cwd: path.win32.join(root, "System32"), env: { ...powerShellEnvironment(root, process.env), ...extra }, encoding: "utf8", windowsHide: true, timeout: 60000, shell: false });
+  console.log(`== clean env + ${Object.keys(extra)[0]} (${Date.now() - t3} ms): status`, r.status, "stdout:", JSON.stringify(r.stdout), "stderr-len:", r.stderr.length);
+}
