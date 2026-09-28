@@ -242,7 +242,7 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
     // No shell on Windows either: resolve codex.cmd/codex.exe and launch it the
     // way runCommand does. Unresolved fails as ENOENT without spawning, so a
     // codex.exe planted in the workspace never runs.
-    let launch = { file: "codex", args: ["app-server"], windowsVerbatimArguments: false };
+    let launch = { file: "codex", args: ["app-server"], env, windowsVerbatimArguments: false };
     if (process.platform === "win32") {
       const resolved = resolveExecutable("codex", { cwd: this.cwd, env });
       if (resolved === null) {
@@ -252,7 +252,7 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
     }
     this.proc = spawn(launch.file, launch.args, {
       cwd: this.cwd,
-      env,
+      env: launch.env,
       stdio: ["pipe", "pipe", "pipe"],
       shell: false,
       windowsVerbatimArguments: launch.windowsVerbatimArguments,

@@ -338,10 +338,12 @@ test("quoteForCmd escapes every argument so cmd.exe and the shim's %* both pass 
 });
 
 test("buildLaunch runs .exe directly and .cmd through cmd.exe /d /s /c with verbatim arguments", () => {
-  assert.deepEqual(buildLaunch("C:\\bin\\codex.exe", ["a b"], {}), { file: "C:\\bin\\codex.exe", args: ["a b"], windowsVerbatimArguments: false });
+  assert.deepEqual(buildLaunch("C:\\bin\\codex.exe", ["a b"], {}), { file: "C:\\bin\\codex.exe", args: ["a b"], env: {}, windowsVerbatimArguments: false });
   assert.deepEqual(buildLaunch("C:\\Program Files\\npm\\codex.cmd", ["app-server", "a&b"], { ComSpec: "C:\\Windows\\system32\\cmd.exe" }), {
     file: "C:\\Windows\\system32\\cmd.exe",
     args: ["/d", "/s", "/v:off", "/c", '"C:\\Program^ Files\\npm\\codex.cmd ^^^"app-server^^^" ^^^"a^^^&b^^^""'],
+    // cmd.exe must not find the shim's bare `node` in the cwd.
+    env: { ComSpec: "C:\\Windows\\system32\\cmd.exe", NoDefaultCurrentDirectoryInExePath: "1" },
     windowsVerbatimArguments: true
   });
   assert.equal(buildLaunch("C:\\x\\run.BAT", [], {}).file, "C:\\Windows\\System32\\cmd.exe");
@@ -362,6 +364,7 @@ test("runCommand on win32 resolves a bare name with where.exe and launches the s
   assert.deepEqual(calls[1].args, ["/d", "/s", "/v:off", "/c", '"C:\\npm\\codex.cmd ^^^"--version^^^""']);
   assert.equal(calls[1].options.shell, false);
   assert.equal(calls[1].options.windowsVerbatimArguments, true);
+  assert.equal(calls[1].options.env.NoDefaultCurrentDirectoryInExePath, "1");
 
   // A path skips where.exe; a bare name that resolves to nothing is ENOENT without any spawn.
   calls.length = 0;
@@ -387,7 +390,10 @@ test("runCommand round-trips awkward arguments through a .cmd shim in a director
   fs.writeFileSync(path.join(dir, "argv-shim.cmd"), '@echo off\r\nnode "%~dp0argv.cjs" %*\r\n');
   const args = ["plain", "with space", 'q"uote', "", "%PATH%", "a&b", "trail\\", "^caret", "!bang!", "C:\\Program Files (x86)\\x"];
   const env = { ...process.env, PATH: `${dir};${process.env.PATH}` };
-  const result = runCommand("argv-shim", args, { env });
+  // A `node.cmd` planted in the cwd must not be what the shim's bare `node` resolves to.
+  const repo = makeTempDir();
+  fs.writeFileSync(path.join(repo, "node.cmd"), "@echo off\r\necho HIJACKED\r\n");
+  const result = runCommand("argv-shim", args, { env, cwd: repo });
   assert.equal(result.error, null);
   assert.equal(result.status, 0, result.stderr);
   assert.deepEqual(JSON.parse(result.stdout), args);

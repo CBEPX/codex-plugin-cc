@@ -63,10 +63,17 @@ export function quoteForCmd(arg) {
 
 export function buildLaunch(file, args, env = process.env) {
   if (!/\.(bat|cmd)$/i.test(file)) {
-    return { file, args, windowsVerbatimArguments: false };
+    return { file, args, env, windowsVerbatimArguments: false };
   }
   const line = [file.replace(CMD_META, "^$1"), ...args.map(quoteForCmd)].join(" ");
-  return { file: env?.ComSpec || systemExe("cmd.exe", env), args: ["/d", "/s", "/v:off", "/c", `"${line}"`], windowsVerbatimArguments: true };
+  return {
+    file: env?.ComSpec || systemExe("cmd.exe", env),
+    args: ["/d", "/s", "/v:off", "/c", `"${line}"`],
+    // The shim itself runs a bare `node`, which cmd.exe would look up in the
+    // cwd (the reviewed repo) before PATH; this flag turns that off.
+    env: { ...env, NoDefaultCurrentDirectoryInExePath: "1" },
+    windowsVerbatimArguments: true
+  };
 }
 
 // Shaped like spawnSync's own ENOENT so binaryAvailable() reads it as "not found".
@@ -83,10 +90,10 @@ export function runCommand(command, args = [], options = {}) {
   if (target === null) {
     return { command, args, status: null, signal: null, stdout: "", stderr: "", error: notFound(command) };
   }
-  const launch = windows ? buildLaunch(target, args, options.env) : { file: command, args };
+  const launch = windows ? buildLaunch(target, args, options.env) : { file: command, args, env: options.env };
   const result = (options.spawnSyncImpl ?? spawnSync)(launch.file, launch.args, {
     cwd: options.cwd,
-    env: options.env,
+    env: launch.env,
     encoding: "utf8",
     input: options.input,
     maxBuffer: options.maxBuffer,
