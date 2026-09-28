@@ -8,7 +8,7 @@
 
 **Tech Stack:** Node ≥18.18, ESM `.mjs`, `node --test` (`scripts/run-tests.mjs`), fake Codex fixture, Windows PowerShell 5.1 (in-box), .NET `System.Diagnostics.Process`, CIM `Win32_Process` (снимок дерева), GitHub Actions с обязательным Windows.
 
-**Spec:** `docs/superpowers/specs/2026-09-28-codex-plugin-cc-v1.4.1-design.md` (rev. 8); roadmap `/Users/g.mehrenin/.claude/plans/glistening-chasing-backus.md`, разделы «v1.4.1» и «Дизайн: process identity».
+**Spec:** `docs/superpowers/specs/2026-09-28-codex-plugin-cc-v1.4.1-design.md` (rev. 9); roadmap `/Users/g.mehrenin/.claude/plans/glistening-chasing-backus.md`, разделы «v1.4.1» и «Дизайн: process identity».
 
 ## Global Constraints
 
@@ -71,12 +71,24 @@ test("processCommandLine treats a spent budget as no probe on the ps branch", ()
 ```bash
           if [ "$RUNNER_OS" = "Windows" ]; then
             set +e
-            powershell -NoProfile -Command "\$ErrorActionPreference = 'Stop'; try { \$p = @(Get-CimInstance Win32_Process | Where-Object { \$_.CommandLine -match 'codex-plugin-test-' -and \$_.ProcessId -ne \$PID }) } catch { Write-Error \$_; exit 2 }; \$p | Select-Object ProcessId,ParentProcessId,Name,@{n='Cmd';e={\$_.CommandLine.Substring(0,[Math]::Min(160,\$_.CommandLine.Length))}} | Format-Table -AutoSize | Out-String -Width 220 | Write-Host; Write-Output \$p.Count" > leak-count.txt
+            # Same launch rules as the plugin (spec §2): absolute in-box path, no bare name, no profile.
+            # stdout carries only protocol lines (`LEAK <pid> <ppid>` per process, then `COUNT <n>`);
+            # the human-readable table goes to stderr so nothing parsed is ever localised text.
+            "$SYSTEMROOT/System32/WindowsPowerShell/v1.0/powershell.exe" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "\$ErrorActionPreference = 'Stop'; try { \$p = @(Get-CimInstance Win32_Process | Where-Object { \$_.CommandLine -match 'codex-plugin-test-' -and \$_.ProcessId -ne \$PID }) } catch { [Console]::Error.WriteLine(\$_.ToString()); exit 2 }; \$p | Select-Object ProcessId,ParentProcessId,Name,@{n='Cmd';e={\$_.CommandLine.Substring(0,[Math]::Min(160,\$_.CommandLine.Length))}} | Format-Table -AutoSize | Out-String -Width 220 | ForEach-Object { [Console]::Error.WriteLine(\$_) }; foreach (\$x in \$p) { [Console]::Out.WriteLine('LEAK ' + [int]\$x.ProcessId + ' ' + [int]\$x.ParentProcessId) }; [Console]::Out.WriteLine('COUNT ' + \$p.Count)" > leak-count.txt 2> leak-table.txt
             ps_status=$?
             set -e
-            leaked=$(tail -1 leak-count.txt | tr -d '\r ')
-            echo "Leaked test processes after 10 s: ${leaked:-?} (powershell exit ${ps_status})" | tee -a "$GITHUB_STEP_SUMMARY"
-            if [ "$ps_status" != "0" ] || [ "$leaked" != "0" ]; then cat leak-count.txt | tee -a "$GITHUB_STEP_SUMMARY"; exit 1; fi
+            leaked=""
+            while IFS= read -r line; do
+              line=${line%$'\r'}
+              case "$line" in
+                "COUNT "*) leaked=${line#COUNT } ;;
+                "LEAK "*) ;;
+                *) echo "unexpected leak-check output: $line" >&2; leaked="" ; break ;;
+              esac
+            done < leak-count.txt
+            case "$leaked" in ''|*[!0-9]*) leaked="?" ;; esac
+            echo "Leaked test processes after 10 s: ${leaked} (powershell exit ${ps_status})" | tee -a "$GITHUB_STEP_SUMMARY"
+            if [ "$ps_status" != "0" ] || [ "$leaked" != "0" ]; then cat leak-count.txt leak-table.txt | tee -a "$GITHUB_STEP_SUMMARY"; exit 1; fi
           elif pgrep -af codex-plugin-test- ; then echo "leaked test processes" >&2; exit 1; fi
 ```
 
@@ -96,7 +108,7 @@ test("processCommandLine treats a spent budget as no probe on the ps branch", ()
 - `export const WIN32_MAX_PID = 2147483647; export const isWin32Pid = (pid) => Number.isInteger(pid) && pid >= 1 && pid <= WIN32_MAX_PID;`
 - `export function systemRoot(env, { existsSyncImpl } = {})` → `string|null` (`^[A-Za-z]:\\[^\\/]+` + существует `<root>\System32\WindowsPowerShell\v1.0\powershell.exe`).
 - `export function systemPowerShell(root)`, `export function powerShellEnvironment(root, env)`, `export function encodePowerShell(script)` — как в spec §2.
-- `export function parseProtocolLines(stdout)` → `string[] | null`: непустые строки, каждая `^[A-Z]+( \d+)*$`, иначе `null`.
+- `export function parseProtocolLines(stdout)` → `string[] | null`: строки по `\r?\n` **без `trim()`** (только один завершающий перевод строки отбрасывается), каждая `^[A-Z]+( \d+)*$`, иначе `null` — пробел, TAB, NBSP или пустая строка внутри делают ответ невалидным.
 - `export function runPowerShell(script, { timeoutMs, env, runCommandImpl, existsSyncImpl, now })` → `{ status: number|null, stdout: string, timedOut: boolean, unavailable: boolean }`; breaker трипается на invalid root, `ENOENT`, `ETIMEDOUT`, exit 244; `timeoutMs` должен быть конечным и `≥ 1`.
 - Константы: `WINDOWS_PROCESS_MISSING_EXIT = 241`, `WINDOWS_IDENTITY_MISMATCH_EXIT = 242`, `WINDOWS_TERMINATION_FAILED_EXIT = 243`, `WINDOWS_IDENTITY_UNAVAILABLE_EXIT = 244`; `export function resetWindowsIdentityCircuit()`.
 
@@ -128,9 +140,10 @@ test("powerShellEnvironment is minimal and never inherits the job's variables", 
 test("parseProtocolLines accepts only upper-case words followed by integers", () => {
   assert.deepEqual(parseProtocolLines("KILL\r\nSURVIVOR 4300 1337\r\nSURVIVOR 4301 1338\r\n"), ["KILL", "SURVIVOR 4300 1337", "SURVIVOR 4301 1338"]);
   assert.deepEqual(parseProtocolLines(""), []);
-  for (const junk of ["failure 5\r\n", "OK\r\nZugriff verweigert\r\n", "4242 1337\r\nINFO: x\r\n"]) {
+  for (const junk of ["failure 5\r\n", "OK\r\nZugriff verweigert\r\n", "4242 1337\r\nINFO: x\r\n", "KILL\nOK\t\n", "KILL\nOK\u00a0\n", "KILL\n\nOK\n", " OK\n", "OK\n\n"]) {
     assert.equal(parseProtocolLines(junk), null, JSON.stringify(junk));
   }
+  assert.deepEqual(parseProtocolLines("OK"), ["OK"], "a final newline is optional, nothing else is");
 });
 
 test("runPowerShell launches the in-box powershell.exe by absolute path, clean env, System32 cwd and an encoded script", () => {
@@ -245,7 +258,12 @@ export function encodePowerShell(script) {
 // Scripts speak a machine-only protocol: upper-case words and integers. One
 // foreign line (a localised error, a stray prompt) voids the whole answer.
 export function parseProtocolLines(stdout) {
-  const lines = String(stdout ?? "").split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  // No trimming: a line is the exact text between line breaks. Only the single
+  // newline that terminates the last line is optional.
+  const lines = String(stdout ?? "").split(/\r?\n/);
+  if (lines.length > 0 && lines[lines.length - 1] === "") {
+    lines.pop();
+  }
   return lines.every((line) => PROTOCOL_LINE.test(line)) ? lines : null;
 }
 
@@ -447,7 +465,7 @@ export function getProcessIdentities(pids, options = {}) {
 ### Task 4: Verify-and-kill на win32 в `terminateRecordedProcess`
 
 **Files:**
-- Modify: `plugins/codex/scripts/lib/process.mjs` (`terminateRecordedProcess` ~274–326; новые `terminateWindowsRecordedProcess`, `terminateScript`, `fileTimeNow`)
+- Modify: `plugins/codex/scripts/lib/process.mjs` (`terminateRecordedProcess` ~274–326; новые `terminateWindowsRecordedProcess`, `terminateScript`, `fileTimeAt`)
 - Modify: `plugins/codex/scripts/lib/broker-lifecycle.mjs:318-341` (комментарии; enum причин + `process-missing`)
 - Modify: `README.md` таблица причин teardown (`process-missing`, `kill-failed` c survivors, метод `handle`)
 - Test: `tests/process.test.mjs`
@@ -632,10 +650,12 @@ function terminateWindowsRecordedProcess(pid, identity, options) {
   const run = runPowerShell(terminateScript(pid, fileTime, excludePids, deadline), { ...options, timeoutMs });
   // An exact KILL line anywhere proves the destructive phase began; a clean
   // sequence is required for anything stronger than "attempted".
-  const rawLines = String(run.stdout ?? "").split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-  const clean = parseProtocolLines(run.stdout) !== null;
+  // `rawLines` are exact lines (no trim): "KILL" must be the whole line.
+  const rawLines = String(run.stdout ?? "").split(/\r?\n/);
+  const protocol = parseProtocolLines(run.stdout);
+  const clean = protocol !== null;
   const killStarted = rawLines.includes("KILL");
-  const survivorRows = rawLines.slice(1).map((line) => /^SURVIVOR (\d+) (\d+)$/.exec(line));
+  const survivorRows = (protocol ?? rawLines).slice(1).map((line) => /^SURVIVOR (\d+) (\d+)$/.exec(line));
   const failed = (extra) => ({ attempted: true, delivered: false, method: "handle", reason: "kill-failed", ...extra });
   const unverified = () => failed({ survivors: [], unverified: true });
   // The exit code classifies, the protocol refines, a contradiction is unknown:
@@ -648,7 +668,7 @@ function terminateWindowsRecordedProcess(pid, identity, options) {
   }
   switch (run.status) {
     case 0:
-      if (clean && rawLines.length === 2 && killStarted && rawLines[1] === "OK") {
+      if (clean && protocol.length === 2 && protocol[0] === "KILL" && protocol[1] === "OK") {
         return { attempted: true, delivered: true, method: "handle", reason: "identity-match" };
       }
       return killStarted ? unverified() : refused("identity-unavailable");
@@ -680,7 +700,7 @@ function terminateWindowsRecordedProcess(pid, identity, options) {
 - Modify: `plugins/codex/scripts/lib/tracked-jobs.mjs:380-440` (`reapDeadJobs`: win32 batch)
 - Modify: `plugins/codex/scripts/lib/job-control.mjs` (новая `cancelDecision`; `readStoredJob` там уже объявлена — не импортировать её из `state.mjs`)
 - Modify: `plugins/codex/scripts/codex-companion.mjs:1340-1365` (cancel: `excludePids`, survivors в ответе/логе на win32)
-- Modify: `plugins/codex/scripts/session-lifecycle-hook.mjs` (константы ~22–45; `cleanupSessionJobs` ~98–166 → `export`; teardown ~298–322; `main()` в конце файла (~347) запускается только при прямом исполнении: `if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) { void main(); }` с `import { pathToFileURL } from "node:url"` — иначе `import` модуля из теста читал бы hook stdin; `hooks.json` вызывает файл напрямую, поведение хука не меняется)
+- Modify: `plugins/codex/scripts/session-lifecycle-hook.mjs` (константы ~22–45; `cleanupSessionJobs` ~98–166 → `export`; teardown ~298–322; существующий `main().catch((error) => { process.stderr.write(…); process.exit(1); })` (~347–350) целиком, без изменений, оборачивается в `if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) { … }` с `import { pathToFileURL } from "node:url"` — иначе `import` модуля из теста читал бы hook stdin; `.catch` остаётся, чтобы ошибка записи state по-прежнему печаталась одной строкой с exit 1, а не unhandled rejection; `hooks.json` вызывает файл напрямую, поведение хука при прямом запуске не меняется)
 - Modify: `plugins/codex/scripts/lib/broker-lifecycle.mjs:342-380` (`teardownBrokerSession`: опции `platform`, `keepOnUnknown`, `terminateRecordedProcessImpl`; поле `kept`)
 - Modify: `plugins/codex/scripts/app-server-broker.mjs` (~294–315, `broker/shutdown`: тестовый knob `CODEX_COMPANION_BROKER_HANG_ON_SHUTDOWN=1`)
 - Modify: `tests/tracked-jobs.test.mjs:408,417,424` (явный `platform: "linux"`) и `:490` («runTrackedJob records the worker identity…»: на win32 ожидать `^win32:\d+$`, равный `getProcessIdentity(process.pid)` того же процесса, вместо `null`), `tests/broker-stale-pid.test.mjs:1365,1381` (`deepEqual` + `kept: false`)
@@ -764,30 +784,91 @@ export function cancelDecision({ pid, kill, alive, platform = process.platform }
 ```
 
   Тест-таблица (`tests/process.test.mjs` или `tests/job-control.test.mjs`): `[{attempted:true,delivered:true}, alive:false] → not pending`; `[{attempted:true,delivered:false,survivors:[{pid:4301,identity:"win32:7"}]}, alive:false, win32] → pending "kill-failed" survivors [{4301,…}]`; то же на `linux` → not pending (posix как v1.4.0); `[{attempted:false,reason:"identity-unavailable"}, alive:true] → pending "identity-unavailable"`; `[{attempted:true,delivered:false,unverified:true}, alive:false, win32] → pending`; `[{attempted:false,reason:"process-missing"}, alive:false] → not pending`; `[{attempted:true,delivered:false}, alive:true, linux] → pending "not-delivered"`.
-  В `codex-companion.mjs` (~1340): импортировать `loadBrokerSession` (`./lib/broker-lifecycle.mjs`), `cancelDecision` и `renderCancelPending` (`./lib/job-control.mjs`); `const brokerPid = process.platform === "win32" ? loadBrokerSession(workspaceRoot)?.pid : null; const kill = terminateRecordedProcess(pid, { identity, commandLineMatch: workerCommandLine(job.id), excludePids: Number.isInteger(brokerPid) ? [brokerPid] : [] }); const decision = cancelDecision({ pid, kill, alive: isPidAlive(pid) });` — при `decision.pending`: `const rendered = renderCancelPending(decision, pid, job.id); appendLogLine(job.logFile, rendered.logLine); if (rendered.diagnostic) process.stderr.write(rendered.diagnostic); process.exitCode = 1; outputCommandResult(rendered.json, rendered.text, options.json); return;` где `renderCancelPending(decision, pid, jobId)` (`lib/job-control.mjs`) → `{ json: { jobId, status: "running", cancellationPending: true, reason, ...(survivors.length ? { survivors } : {}) }, text: <прежний текст pending>, logLine: <прежняя pending-строка> + (survivors ? ` worker tree survivors: ${survivors.map(s => `${s.pid}:${s.identity ?? "unknown"}`).join(" ")}` : decision.reason === "kill-failed" ? " (unverified)" : ""), diagnostic: survivors.length ? `[codex] worker tree survivors: …\n` : null }`; на posix `survivors` всегда `[]`, поэтому `json`/`text`/`logLine` совпадают с v1.4.0 байт-в-байт (существующие posix-тесты cancel без изменений; legacy win32-тест `runtime.test.mjs:1922` тоже). Тесты: unit `renderCancelPending` (с survivors — `json.survivors` = список, `logLine` содержит `4301:win32:7`, `diagnostic` не null; с `unverified` и пустым списком — без поля `survivors`, `logLine` содержит `(unverified)`, `diagnostic` null; posix-форма `not-delivered` — `json` deepEqual v1.4.0), плюс runtime-тест на posix через существующий путь `cancel --json` с не-доставленным kill (уже есть, `runtime.test.mjs:1954`) — stdout должен парситься как один JSON, что и доказывает, что диагностика не попадает в stdout.
-
-- [ ] **Step 5: хук** — `export function killStepMs(platform = process.platform) { return platform === "win32" ? 4000 : IDENTITY_PROBE_MS; }`; в `cleanupSessionJobs(cwd, sessionId, lockWaitMs, remainingMs, deps = {})` с `const { platform = process.platform, terminateRecordedProcessImpl = terminateRecordedProcess, brokerPid = null } = deps;` — **все** платформенные ветки и `killStepMs(platform)` используют этот `platform`; `let outcome = null;` объявляется **до** `try` (сейчас `const outcome` внутри `try`); `probeMs = Math.floor(Math.min(killStepMs(platform), remainingMs() / 2))`; `excludePids` = `brokerPid` (хук передаёт pid брокера сессии на win32, `null` иначе); решение о сохранении job'а по **всему дереву текущего исхода**: `const unresolved = platform === "win32" && ((outcome?.survivors?.length > 0) || outcome?.unverified === true); if (reason && isPidAlive(pid) === false && !unresolved) { reason = null; }` и при `unresolved` — `process.stderr.write(\`[codex] SessionEnd left ${job.id} tree survivors: ${outcome.survivors.map((s) => \`${s.pid}:${s.identity ?? "unknown"}\`).join(" ") || "unverified"}\n\`)` (job остаётся через `kept`; следующий SessionEnd оценит его заново — записей о survivors нет по решению spec §1). Teardown: `timeoutMs: process.platform === "win32" ? stepBudget(killStepMs()) : Math.floor(stepBudget(IDENTITY_PROBE_MS) / 2)`, `keepOnUnknown: true`; после teardown `if (!teardown.kept && loadBrokerSession(cwd)?.endpoint === brokerEndpoint) clearBrokerSession(cwd);` и `kept=${teardown.kept}` в строке решения. Бюджет: на win32 kill каждого job'а ≤ `min(4000, remaining/2)` — с 12 s хватает на два job'а и teardown; остальное — `budget-exhausted` как сегодня. Тесты (`tests/commands.test.mjs` или новый `tests/session-lifecycle-hook.test.mjs`, импорт `{ cleanupSessionJobs, killStepMs }` из `../plugins/codex/scripts/session-lifecycle-hook.mjs` — после guard'а `main()` импорт безопасен; посадка записей через `upsertJob`/`writeJobFile` как в тестах reaper): `killStepMs("win32") === 4000`, `killStepMs("linux") === 2000`; `cleanupSessionJobs(repo, sessionId, 1000, () => 8000, { platform: "win32", terminateRecordedProcessImpl })`: outcome `{attempted:true, delivered:false, reason:"kill-failed", survivors:[{pid:4301, identity:"win32:7"}]}` при мёртвом root → job сохранён, stderr содержит `tree survivors: 4301:win32:7`; тот же outcome на `platform: "linux"` при мёртвом root → job удалён (posix как v1.4.0); `no-pid` и успешный kill → job удалён как сегодня.
-- [ ] **Step 6: `teardownBrokerSession` kept** — опции `platform = process.platform`, `keepOnUnknown = false`, `terminateRecordedProcessImpl = terminateRecordedProcess`; `let outcome = null;` **до** `try`; после kill: `const unknown = platform === "win32" && (["identity-unavailable", "kill-failed"].includes(reason) || outcome?.unverified === true || outcome?.survivors?.length > 0); const kept = keepOnUnknown && !signalled && unknown;` (мёртвый root не отменяет unknown; `identity-mismatch`/`process-missing`/`no-pid` → не kept; posix → `unknown` всегда false); при `kept` пропустить unlink pid/log/endpoint-файлов; вернуть `{ signalled, reason, kept }`. `ensureBrokerSession` вызывает teardown **без** `keepOnUnknown` (stale replacement не меняется). Обновить `deepEqual` в `tests/broker-stale-pid.test.mjs:1365,1381` (`kept: false`). Тесты: `platform:"win32", keepOnUnknown:true` + impl `identity-unavailable` → `kept:true`, файлы на месте; impl `{attempted:true,delivered:false,reason:"kill-failed",survivors:[{pid:7,identity:"win32:9"}]}` при несуществующем root pid → `kept:true`; `process-missing` → `kept:false`, файлы удалены; `identity-mismatch` → `kept:false`; `no-pid` (pid null) → `kept:false`; `identity-unavailable` на `platform:"linux"` или без `keepOnUnknown` → `kept:false`, файлы удалены.
-- [ ] **Step 7: broker knob** — в обработчике `broker/shutdown` (`app-server-broker.mjs` ~310), до `await shutdownAndExit(server)`: `if (process.platform === "win32" && process.env.CODEX_COMPANION_BROKER_HANG_ON_SHUTDOWN === "1") { send(socket, { id: message.id, result: {} }); process.stderr.write("[broker] test knob: acknowledged shutdown, staying up\n"); continue; }`. Только для тестов; README не упоминать.
-- [ ] **Step 8: runtime win32-ожидания** — `tests/runtime.test.mjs`: ~1914–1920 оставить (legacy без identity); ~2167 `cancel sends turn interrupt`: убрать `IS_WIN && status === 1`; ~2436–2476 «session end preserves background jobs»: убрать win32-ветку; ~3885–3895 turn-timeout/cancel: убрать `if (IS_WIN)`, общий путь `status 0`, `/cancelled/i`, `assert.equal(await exited, 1)`; «session end fully cleans up jobs»: без win32-ветки; снять skip с 2004 (regex → `/^(linux|darwin|win32):/`) и 4115; оставить skip на 1954 и 3906. На уровне модуля: `import { isPidAlive } from "../plugins/codex/scripts/lib/process.mjs"; const isAlive = (pid) => isPidAlive(pid) === true;` (локальный одноимённый helper — переименовать).
-- [ ] **Step 9: helper `cimTree`** (`tests/helpers.mjs`, только для Windows-тестов; бросает при ошибке, а не возвращает `[]`):
+  В `lib/job-control.mjs` рядом с `cancelDecision` (строки ниже — полностью, без сокращений; текст pending и строка лога скопированы из `codex-companion.mjs:1348–1353` v1.4.0 байт-в-байт):
 
 ```js
-// Every pid under `rootPid` by ParentProcessId (BFS), with executable names — for
-// Windows-only tests that assert a whole tree died or survived. Throws when the
-// enumeration fails: a silent [] would make "everything is gone" vacuously true.
-export function cimTree(rootPid, env = process.env) {
-  const script = `$ErrorActionPreference = 'Stop'; $all = @(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name); $q = @(${rootPid}); $out = @(); $seen = @{}; while ($q.Count -gt 0) { $p = $q[0]; $q = @($q | Select-Object -Skip 1); if ($seen.ContainsKey($p)) { continue }; $seen[$p] = $true; $row = $all | Where-Object { $_.ProcessId -eq $p } | Select-Object -First 1; if ($row) { $out += @{ pid = [int]$row.ProcessId; name = [string]$row.Name } }; foreach ($c in ($all | Where-Object { $_.ParentProcessId -eq $p })) { $q += [int]$c.ProcessId } }; Write-Output (ConvertTo-Json @($out) -Compress)`;
-  const result = spawnSync(path.join(process.env.SystemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"), ["-NoProfile", "-NonInteractive", "-Command", script], { encoding: "utf8", env, windowsHide: true, timeout: 20000 });
-  if (result.error || result.status !== 0) {
-    throw new Error(`cimTree failed: ${result.error?.message ?? `exit ${result.status}`}\n${result.stderr}`);
+// Pending cancel, rendered once for the three sinks. On posix `survivors` is
+// always [] and `reason` is v1.4.0's, so json/text/logLine are byte-identical
+// to v1.4.0 there; only win32 adds a survivors suffix and a stderr diagnostic.
+export function renderCancelPending(decision, pid, jobId) {
+  const survivors = decision.survivors ?? [];
+  const pending = `cancellation not confirmed: worker pid ${pid} left running (${decision.reason})`;
+  const survivorText = survivors.map((s) => `${s.pid}:${s.identity ?? "unknown"}`).join(" ");
+  const suffix = survivors.length > 0
+    ? ` worker tree survivors: ${survivorText}`
+    : decision.reason === "kill-failed" ? " (unverified)" : "";
+  return {
+    json: { jobId, status: "running", cancellationPending: true, reason: decision.reason, ...(survivors.length > 0 ? { survivors } : {}) },
+    text: `${pending}\nThe turn interrupt was sent; the job stays running until the worker exits. Re-run cancel or wait for result.\n`,
+    logLine: `${pending}${suffix}`,
+    diagnostic: survivors.length > 0 ? `[codex] worker tree survivors: ${survivorText}\n` : null,
+  };
+}
+
+// The caller's side of a pending cancel: one JSON document or the text on
+// stdout, the diagnostic (if any) on stderr, one line in the job log.
+export function emitCancelPending(decision, pid, jobId, { json, appendLog, stdout = process.stdout, stderr = process.stderr }) {
+  const rendered = renderCancelPending(decision, pid, jobId);
+  appendLog(rendered.logLine);
+  if (rendered.diagnostic) {
+    stderr.write(rendered.diagnostic);
   }
-  const parsed = JSON.parse(result.stdout.trim() || "[]");
-  return Array.isArray(parsed) ? parsed : [parsed];
+  stdout.write(json ? `${JSON.stringify(rendered.json, null, 2)}\n` : rendered.text);
+  return rendered;
 }
 ```
 
-- [ ] **Step 10: Windows-only E2E** (`{ skip: !IS_WIN, timeout: 90_000 }`, `tests/runtime.test.mjs`; `ROOT` — корень репозитория из helpers; импорты `cimTree`, `upsertJob`, `loadBrokerSession`, `resolveStateDir`, `pathToFileURL`; `SESSION_HOOK` уже есть; во всех тестах `t.after` для root регистрируется **сразу после получения pid**, для дерева — сразу после `cimTree`):
+  В `codex-companion.mjs` (~1340): импортировать `loadBrokerSession` (`./lib/broker-lifecycle.mjs`), `cancelDecision` и `emitCancelPending` (`./lib/job-control.mjs`); заменить блок `if (pid && (!kill.attempted || !kill.delivered) && isPidAlive(pid) === true) { … }` (1346–1356) на:
+
+```js
+  const brokerPid = process.platform === "win32" ? loadBrokerSession(workspaceRoot)?.pid : null;
+  const kill = terminateRecordedProcess(pid, { identity, commandLineMatch: workerCommandLine(job.id), excludePids: Number.isInteger(brokerPid) ? [brokerPid] : [] });
+  const decision = cancelDecision({ pid, kill, alive: isPidAlive(pid) });
+  if (decision.pending) {
+    emitCancelPending(decision, pid, job.id, { json: options.json, appendLog: (line) => appendLogLine(job.logFile, line) });
+    process.exitCode = 1;
+    return;
+  }
+```
+
+  (`JSON.stringify(rendered.json, null, 2)` + `\n` = то, что `outputResult` печатал через `console.log`, поэтому posix-вывод `cancel --json` не меняется; существующие posix-тесты cancel и legacy win32-тест `runtime.test.mjs:1922` проходят без правок.)
+
+  Тесты (`tests/job-control.test.mjs`, рядом с таблицей `cancelDecision`):
+  - `renderCancelPending({ pending: true, reason: "kill-failed", survivors: [{ pid: 4301, identity: "win32:7" }] }, 4300, "job-1")` → `json.survivors` deepEqual списку, `logLine` заканчивается на ` worker tree survivors: 4301:win32:7`, `diagnostic === "[codex] worker tree survivors: 4301:win32:7\n"`;
+  - `renderCancelPending({ pending: true, reason: "kill-failed", survivors: [] }, 4300, "job-1")` → нет поля `survivors`, `logLine` заканчивается на ` (unverified)`, `diagnostic === null`;
+  - `renderCancelPending({ pending: true, reason: "not-delivered", survivors: [] }, 4300, "job-1")` → `json` deepEqual `{ jobId: "job-1", status: "running", cancellationPending: true, reason: "not-delivered" }`, `logLine === "cancellation not confirmed: worker pid 4300 left running (not-delivered)"`, `diagnostic === null` (posix v1.4.0);
+  - `emitCancelPending` с survivors и `json: true` и подменёнными writer'ами (`{ write: (chunk) => out.push(chunk) }` для stdout/stderr, `appendLog: (l) => log.push(l)`): `out` — ровно один chunk, `JSON.parse(out[0])` возвращает объект с `survivors`; `err` — ровно один chunk `[codex] worker tree survivors: 4301:win32:7\n`; `log` — одна строка с суффиксом survivors; тот же вызов с `json: false` → `out[0]` равен `rendered.text`, stderr тот же. Это и есть доказательство, что диагностика никогда не попадает в stdout; существующий `runtime.test.mjs:1954` (identity-mismatch без survivors) остаётся как posix-регрессия.
+
+- [ ] **Step 9: helper `cimTree`** (`tests/helpers.mjs`, только для Windows-тестов; бросает при ошибке, а не возвращает `[]`):
+
+```js
+// Every pid under `rootPid` by ParentProcessId (BFS), with a coarse executable
+// class — for Windows-only tests that assert a whole tree died or survived.
+// Runs through the plugin's own launcher (validated root, clean env, System32
+// cwd, -EncodedCommand) and speaks its protocol: `NODE <pid>`, `CMD <pid>` or
+// `OTHER <pid>` per node, nothing else. Throws when the enumeration fails or the
+// output is not clean: a silent [] would make "everything is gone" vacuously true.
+export function cimTree(rootPid, env = process.env) {
+  const script = `$ErrorActionPreference = 'Stop'; $all = @(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name); $q = @(${rootPid}); $seen = @{}; while ($q.Count -gt 0) { $p = $q[0]; $q = @($q | Select-Object -Skip 1); if ($seen.ContainsKey($p)) { continue }; $seen[$p] = $true; $row = $all | Where-Object { $_.ProcessId -eq $p } | Select-Object -First 1; if ($row) { $w = if ($row.Name -match '^(?i)node\\.exe$') { 'NODE' } elseif ($row.Name -match '^(?i)cmd\\.exe$') { 'CMD' } else { 'OTHER' }; [Console]::Out.WriteLine($w + ' ' + [int]$row.ProcessId) }; foreach ($c in ($all | Where-Object { $_.ParentProcessId -eq $p })) { $q += [int]$c.ProcessId } }`;
+  resetWindowsIdentityCircuit();
+  const run = runPowerShell(script, { env, timeoutMs: 20000 });
+  const lines = run.unavailable || run.status !== 0 ? null : parseProtocolLines(run.stdout);
+  if (lines === null) {
+    throw new Error(`cimTree failed: status ${run.status} unavailable ${run.unavailable} timedOut ${run.timedOut}\n${run.stdout}`);
+  }
+  return lines.map((line) => {
+    const row = /^(NODE|CMD|OTHER) (\d+)$/.exec(line);
+    if (!row) {
+      throw new Error(`cimTree: unexpected line ${JSON.stringify(line)}`);
+    }
+    return { pid: Number(row[2]), name: row[1] === "NODE" ? "node.exe" : row[1] === "CMD" ? "cmd.exe" : "other" };
+  });
+}
+```
+
+  (`tests/helpers.mjs` импортирует `runPowerShell`, `parseProtocolLines`, `resetWindowsIdentityCircuit` из `../plugins/codex/scripts/lib/process.mjs`; `resetWindowsIdentityCircuit` перед вызовом — чтобы breaker, сработавший в предыдущем тесте, не превратил enumeration в ложный throw. Имена `node.exe`/`cmd.exe` сохранены ради существующих `/^cmd\.exe$/i` в Step 10.)
+
+- [ ] **Step 10: Windows-only E2E** (`{ skip: !IS_WIN, timeout: 90_000 }`, `tests/runtime.test.mjs`; `ROOT` — уже объявленный локально в `tests/runtime.test.mjs:25` (helpers его не экспортирует); импорты `cimTree`, `upsertJob`, `loadBrokerSession`, `resolveStateDir`, `pathToFileURL`; `SESSION_HOOK` уже есть; во всех тестах `t.after` для root регистрируется **сразу после получения pid**, для дерева — сразу после `cimTree`):
 
 ```js
 test("cancel on Windows kills a direct worker and the codex.cmd tree under it", { skip: !IS_WIN, timeout: 90_000 }, async (t) => {
@@ -928,7 +1009,7 @@ test("a planted PowerShell in the workspace or a relative PATH entry is never wh
 ### Task 6: Документация
 
 **Files:**
-- Modify: `README.md` («### Windows», ~385–395: удалить «Still limited until v1.4.1 …»; требования: Windows PowerShell 5.1 in-box; Constrained Language Mode/AppLocker → kill из записи отказывает (`identity-unavailable`), записи брокера сохраняются до следующей попытки; потомки, появившиеся после снимка, вне гарантии; **survivor kill'а, переживший смерть root, — известная утечка без верхней границы и без повторной попытки: pid и identity в ответе/логе — диагностика для оператора**; общий брокер никогда не убивается вместе с worker'ом), таблица причин (`process-missing`, `kill-failed` с survivors, метод `handle`).
+- Modify: `README.md` («### Windows», ~385–395: удалить «Still limited until v1.4.1 …»; исправить два утверждения про `where.exe` (строки 389 и 393 — с v1.4.0 `codex`/`npm`/`git` ищутся файловым `resolveExecutable` по абсолютным записям `PATH` × `PATHEXT`, относительные записи `PATH` и cwd пропускаются, `where.exe` не вызывается; требования: только `cmd.exe` для `.cmd`-шимов и, с v1.4.1, Windows PowerShell 5.1 in-box); добавить потолки из `process.mjs:57–64`: аргумент с CR/LF отвергается ошибкой, `%VAR:a=b%` внутри аргумента `.cmd`-шима остаётся документированным ограничением; требования: Windows PowerShell 5.1 in-box; Constrained Language Mode/AppLocker → kill из записи отказывает (`identity-unavailable`), записи брокера сохраняются до следующей попытки; потомки, появившиеся после снимка, вне гарантии; **survivor kill'а, переживший смерть root, — известная утечка без верхней границы и без повторной попытки: pid и identity в ответе/логе — диагностика для оператора**; общий брокер никогда не убивается вместе с worker'ом), таблица причин (`process-missing`, `kill-failed` с survivors, метод `handle`).
 - Modify: `CHANGELOG.md` + `plugins/codex/CHANGELOG.md` (`## 1.4.1 — <день релизного коммита>`: Fixed — kill из записей на Windows через закреплённые handle'ы (#743 win32, #423/#577, #336, #416, #487, #718), leak-шаг обязателен; Changed — `status` на Windows делает одну пробу на все живые job'ы; survivors kill'а сообщаются с identity (`cancellationPending` + `survivors`), job не считается cancelled при живом root; сопровождение survivors записями — вне v1.4.1; записи брокера сохраняются при неизвестном исходе SessionEnd (Windows); ps-guard `≤ 0`; `teardownBrokerSession` результат содержит `kept`).
 - Modify: `docs/superpowers/triage/2026-09-27-upstream-triage.md` — статусы `fixed-in v1.4.1`.
 - Test: `tests/commands.test.mjs` README-assertions.
