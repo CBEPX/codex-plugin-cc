@@ -18,6 +18,7 @@ import {
   resolveFallbackStateRoot,
   resolveStateDir,
   resolveStateFile,
+  retryOnWindows,
   saveState,
   STATE_LOCK_TIMEOUT_CODE,
   upsertJob,
@@ -161,8 +162,7 @@ test("saveState drops the private request payload of pruned jobs", () => {
 // `loadState` turns that into "no jobs" — which is how a SessionEnd with a live
 // job decided the workspace was idle and shut the shared broker down. Writers
 // must swap the file in atomically so a reader sees the old or the new one.
-// Windows refuses rename over an open reader (EPERM); product retry lands in Task 7, which un-skips this.
-test("concurrent writers never leave a torn state.json for a reader", { skip: IS_WIN }, async () => {
+test("concurrent writers never leave a torn state.json for a reader", async () => {
   const workspace = makeTempDir();
   const jobs = Array.from({ length: 50 }, (_, index) => ({
     id: `job-${index}`,
@@ -198,7 +198,8 @@ test("concurrent writers never leave a torn state.json for a reader", { skip: IS
   let reads = 0;
   const deadline = Date.now() + 2000;
   while (Date.now() < deadline) {
-    const raw = fs.readFileSync(stateFile, "utf8");
+    // Reads like `loadState`: on Windows a read racing the rename may see EBUSY.
+    const raw = retryOnWindows(() => fs.readFileSync(stateFile, "utf8"), ["EBUSY"]);
     let parsed;
     try {
       parsed = JSON.parse(raw);
@@ -882,4 +883,90 @@ test("fallback state root refuses a symlinked user directory", { skip: process.p
   fs.chmodSync(target, 0o700);
   fs.symlinkSync(target, path.join(tmp, `codex-companion-${process.getuid()}`));
   assert.throws(() => resolveFallbackStateRoot({ env: {}, tmpdir: tmp, pluginRoot: makeTempDir() }), /Refusing to use shared state directory/);
+});
+
+function failingOp(times, code) {
+  const errors = [];
+  const op = () => {
+    if (errors.length < times) {
+      const error = Object.assign(new Error(`${code} #${errors.length + 1}`), { code });
+      errors.push(error);
+      throw error;
+    }
+    return "ok";
+  };
+  return { op, errors };
+}
+
+test("retryOnWindows rides out transient EPERM on win32 and rethrows the last error after 20 attempts", () => {
+  const recovers = failingOp(19, "EPERM");
+  assert.equal(retryOnWindows(recovers.op, ["EPERM", "EBUSY"], { platform: "win32" }), "ok");
+  assert.equal(recovers.errors.length, 19);
+
+  const exhausted = failingOp(Infinity, "EPERM");
+  assert.throws(
+    () => retryOnWindows(exhausted.op, ["EPERM"], { platform: "win32" }),
+    (error) => error === exhausted.errors[19]
+  );
+  assert.equal(exhausted.errors.length, 20);
+});
+
+test("retryOnWindows never retries on posix or for codes it was not given", () => {
+  const posix = failingOp(1, "EPERM");
+  assert.throws(() => retryOnWindows(posix.op, ["EPERM"], { platform: "linux" }), (error) => error === posix.errors[0]);
+  assert.equal(posix.errors.length, 1);
+
+  const gone = failingOp(1, "ENOENT");
+  assert.throws(() => retryOnWindows(gone.op, ["EPERM", "EBUSY"], { platform: "win32" }), (error) => error === gone.errors[0]);
+  assert.equal(gone.errors.length, 1);
+});
+
+test("fallback state root on Windows lives under %LOCALAPPDATA%, else under tmpdir", () => {
+  const tmp = makeTempDir();
+  const local = makeTempDir();
+  const pluginRoot = makeTempDir();
+  const root = resolveFallbackStateRoot({ env: { LOCALAPPDATA: local }, platform: "win32", tmpdir: tmp, uid: null, pluginRoot });
+  assert.ok(root.startsWith(path.join(local, "codex-companion") + path.sep), root);
+
+  const noLocal = resolveFallbackStateRoot({ env: {}, platform: "win32", tmpdir: tmp, uid: null, pluginRoot });
+  assert.ok(noLocal.startsWith(path.join(tmp, "codex-companion-user") + path.sep), noLocal);
+});
+
+function captureStderr(fn) {
+  const lines = [];
+  const original = process.stderr.write;
+  process.stderr.write = (chunk) => {
+    lines.push(String(chunk));
+    return true;
+  };
+  try {
+    return { value: fn(), lines };
+  } finally {
+    process.stderr.write = original;
+  }
+}
+
+test("fallback state root on Windows keeps an existing tmpdir root until the new one exists, with one notice", () => {
+  const tmp = makeTempDir();
+  const local = makeTempDir();
+  const pluginRoot = makeTempDir();
+  const options = { env: { LOCALAPPDATA: local }, platform: "win32", tmpdir: tmp, uid: null, pluginRoot };
+  const legacy = resolveFallbackStateRoot({ ...options, env: {} });
+  fs.mkdirSync(legacy, { recursive: true });
+
+  const first = captureStderr(() => resolveFallbackStateRoot(options));
+  assert.equal(first.value, legacy);
+  assert.equal(first.lines.length, 1);
+  assert.ok(first.lines[0].includes(legacy), first.lines[0]);
+  assert.equal(fs.existsSync(path.join(local, "codex-companion")), false, "nothing is migrated or created");
+
+  const again = captureStderr(() => resolveFallbackStateRoot(options));
+  assert.equal(again.value, legacy);
+  assert.deepEqual(again.lines, [], "the notice is printed once per process");
+
+  const newRoot = path.join(local, "codex-companion", path.basename(legacy));
+  fs.mkdirSync(newRoot, { recursive: true });
+  const moved = captureStderr(() => resolveFallbackStateRoot(options));
+  assert.equal(moved.value, newRoot, "once the new root exists it wins");
+  assert.deepEqual(moved.lines, []);
 });

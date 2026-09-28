@@ -28,8 +28,13 @@ function defaultState() {
   };
 }
 
+// Legacy roots this process has already announced, so one command prints the
+// notice once although every state path resolves the root again.
+const announcedLegacyRoots = new Set();
+
 export function resolveFallbackStateRoot({
   env = process.env,
+  platform = process.platform,
   tmpdir = os.tmpdir(),
   uid = typeof process.getuid === "function" ? process.getuid() : null,
   pluginRoot = env.CLAUDE_PLUGIN_ROOT || SCRIPT_ROOT
@@ -40,9 +45,28 @@ export function resolveFallbackStateRoot({
   } catch {
     // keep as given
   }
-  const userDir = path.join(tmpdir, `codex-companion-${uid ?? "user"}`);
+  // ponytail: plugin identity = hash of the install root; sibling plugins/forks get separate roots (#609)
+  const pluginHash = createHash("sha256").update(canonicalPluginRoot).digest("hex").slice(0, 12);
+  let userDir = path.join(tmpdir, `codex-companion-${uid ?? "user"}`);
+  if (platform === "win32" && env.LOCALAPPDATA) {
+    // %LOCALAPPDATA% is per-user and ACL'd to its owner: on Windows that is the
+    // control the POSIX owner/mode check below provides (mode 0o700 is a no-op there).
+    const legacyRoot = path.join(userDir, pluginHash);
+    userDir = path.join(env.LOCALAPPDATA, "codex-companion");
+    // Checked before anything is created: a pre-1.4.0 root keeps its jobs until the
+    // new one exists. Nothing is migrated.
+    if (!fs.existsSync(path.join(userDir, pluginHash)) && fs.existsSync(legacyRoot)) {
+      if (!announcedLegacyRoots.has(legacyRoot)) {
+        announcedLegacyRoots.add(legacyRoot);
+        process.stderr.write(
+          `codex-companion: using the existing state root ${legacyRoot}; new state goes to ${userDir} once that one is removed.\n`
+        );
+      }
+      return legacyRoot;
+    }
+  }
   fs.mkdirSync(userDir, { recursive: true, mode: 0o700 });
-  if (process.platform !== "win32") {
+  if (platform !== "win32") {
     // lstat: a planted symlink would pass a following stat and could be retargeted later.
     const stats = fs.lstatSync(userDir);
     if (!stats.isDirectory() || (uid !== null && stats.uid !== uid) || (stats.mode & 0o077) !== 0) {
@@ -51,8 +75,7 @@ export function resolveFallbackStateRoot({
       );
     }
   }
-  // ponytail: plugin identity = hash of the install root; sibling plugins/forks get separate roots (#609)
-  return path.join(userDir, createHash("sha256").update(canonicalPluginRoot).digest("hex").slice(0, 12));
+  return path.join(userDir, pluginHash);
 }
 
 export function resolveStateDir(cwd) {
@@ -156,7 +179,7 @@ export function loadState(cwd) {
   }
 
   try {
-    const parsed = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+    const parsed = JSON.parse(retryOnWindows(() => fs.readFileSync(stateFile, "utf8"), ["EBUSY"]));
     return migrateStoredConfigValues(cwd, {
       ...defaultState(),
       ...parsed,
@@ -187,8 +210,30 @@ function pruneJobs(jobs) {
 function writeFileAtomic(filePath, contents, options = "utf8") {
   const tempFile = `${filePath}.${process.pid}.tmp`;
   fs.writeFileSync(tempFile, contents, options);
-  fs.renameSync(tempFile, filePath);
+  // ponytail: Windows refuses rename over an open reader; bounded retry, no lock
+  retryOnWindows(() => fs.renameSync(tempFile, filePath), ["EPERM", "EBUSY", "EACCES"]);
   return filePath;
+}
+
+const WIN32_RETRY_ATTEMPTS = 20;
+const WIN32_RETRY_PAUSE_MS = 15;
+
+// Windows reports a file that another process is renaming, replacing or deleting
+// as EPERM/EBUSY (EACCES for some renames) where POSIX would just succeed or say
+// ENOENT. Those clear within milliseconds, so `op` is retried a bounded number of
+// times — only on win32 and only for `codes` — and the last error is then thrown
+// unchanged. Worst case stalls the caller ~20 x 15 ms = 300 ms.
+export function retryOnWindows(op, codes, { platform = process.platform } = {}) {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      return op();
+    } catch (error) {
+      if (platform !== "win32" || attempt >= WIN32_RETRY_ATTEMPTS || !codes.includes(error?.code)) {
+        throw error;
+      }
+      sleepSync(WIN32_RETRY_PAUSE_MS);
+    }
+  }
 }
 
 function removeFileIfExists(filePath) {
@@ -270,7 +315,9 @@ function statLockEntry(entryPath) {
 
 // Only the entry having disappeared is an answer here too. A read that fails for
 // any other reason (EACCES, EIO, EISDIR) says nothing about the owner, so it fails
-// the acquisition rather than letting the entry be aged out.
+// the acquisition rather than letting the entry be aged out. On Windows a read
+// that races a peer's rename or unlink of the same name gets EPERM/EBUSY instead
+// of ENOENT; that alone is retried briefly, and still thrown once retries run out.
 //
 // Content that reads but does not parse is different: entries are published by
 // rename, so a live holder's entry is never half-written — junk can only be debris,
@@ -278,7 +325,7 @@ function statLockEntry(entryPath) {
 function readLockEntryOwner(entryPath) {
   let contents;
   try {
-    contents = fs.readFileSync(entryPath, "utf8");
+    contents = retryOnWindows(() => fs.readFileSync(entryPath, "utf8"), ["EPERM", "EBUSY"]);
   } catch (error) {
     if (error.code === "ENOENT") {
       return { present: false, owner: null };

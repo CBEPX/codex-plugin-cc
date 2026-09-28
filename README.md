@@ -382,6 +382,8 @@ As of v1.3.0, kills issued from stored process records (`/codex:cancel`, `Sessio
 
 As of v1.4.0, the plugin no longer runs commands through `$SHELL` on Windows (usually Git Bash, which mangled `taskkill` arguments). It finds `codex`, `npm` and `git` with `where.exe`, runs `.exe` files directly and runs `.cmd` shims through `cmd.exe`. The catch: a `codex` or `npm` that only exists inside Git Bash (an alias, a shell function or a bash-only `PATH` entry) is no longer found. Put `codex.cmd` or `codex.exe` on the Windows `PATH`; a global `npm install -g @openai/codex` already does that.
 
+When `CLAUDE_PLUGIN_DATA` is not set, job state falls back to a per-user directory: `%LOCALAPPDATA%\codex-companion` on Windows as of v1.4.0 (a private `codex-companion-<uid>` directory under the system temp directory elsewhere). If a pre-1.4.0 state root under `%TEMP%\codex-companion-user` already exists, it keeps being used (with a one-line notice) until you remove it; nothing is migrated. On Windows, state writes also retry briefly when another process holds `state.json` or a lock ticket open.
+
 ## Development
 
 The plugin runtime supports Node.js 18.18 or later; the development tooling below
