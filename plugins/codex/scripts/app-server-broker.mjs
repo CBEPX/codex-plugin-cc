@@ -376,6 +376,11 @@ async function main() {
     socket.on("close", () => {
       sockets.delete(socket);
       clearSocketOwnership(socket);
+      // Observable marker for callers (tests, operators) that need to know the
+      // broker has actually processed this socket's close — not just that the
+      // OS closed it — before a busy/idle check that counts `sockets` can be
+      // trusted.
+      process.stderr.write(`[broker] client disconnected (${sockets.size} remaining)\n`);
       armIdleTimer();
     });
 
@@ -391,6 +396,14 @@ async function main() {
   });
 
   process.on("SIGINT", () => {
+    void shutdownAndExit(server);
+  });
+
+  // The shared app-server dying takes the broker with it: every client sees its
+  // socket close and ends its turn as failed instead of waiting on a runtime
+  // that no longer exists.
+  void appClient.exitPromise.then(() => {
+    process.stderr.write(`[broker] app-server exited${appClient.exitError ? ` (${appClient.exitError.message})` : ""}; shutting down\n`);
     void shutdownAndExit(server);
   });
 

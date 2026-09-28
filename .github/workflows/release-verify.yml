@@ -19,10 +19,16 @@ permissions:
   contents: read
 
 jobs:
-  verify:
-    name: Verify
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+  ci:
+    name: CI (${{ matrix.os }}, node ${{ matrix.node }})
+    runs-on: ${{ matrix.os }}
+    # Windows runners have been seen 2-3x slower for hours at a time.
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        node: [18, 22, 24]
 
     steps:
       - name: Check out release ref
@@ -33,7 +39,7 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
         with:
-          node-version: 22
+          node-version: ${{ matrix.node }}
           cache: npm
 
       - name: Install dependencies
@@ -42,25 +48,82 @@ jobs:
       - name: Install Codex CLI
         run: npm install -g @openai/codex
 
-      - name: Codex version
-        run: codex --version
+      - name: Run test suite
+        shell: bash
+        run: |
+          set +e
+          npm test 2>&1 | tee test-output.log
+          status=${PIPESTATUS[0]}
+          echo "## Test summary (${{ matrix.os }}, node ${{ matrix.node }})" >> "$GITHUB_STEP_SUMMARY"
+          { rg -e 'ℹ (tests|pass|fail)' -e '^# (tests|pass|fail)' -e '^not ok' -e '^✖' test-output.log || grep -E 'ℹ (tests|pass|fail)|^# (tests|pass|fail)|^not ok|^✖' test-output.log; } >> "$GITHUB_STEP_SUMMARY" || true
+          exit "$status"
+
+      - name: Upload test log
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: test-log-${{ matrix.os }}-node${{ matrix.node }}
+          path: test-output.log
+          retention-days: 7
+
+      # Same check as the local gate. Windows is reported, not enforced, until
+      # the Windows kill path lands (v1.4.1); it runs even after a red suite so
+      # the leak list is always available.
+      - name: No leaked test processes
+        if: always()
+        shell: bash
+        run: |
+          sleep 10
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            powershell -NoProfile -Command "\$p = @(Get-CimInstance Win32_Process | Where-Object { \$_.CommandLine -match 'codex-plugin-test-' }); Write-Output ('Leaked test processes after 10 s: ' + \$p.Count); \$p | Select-Object ProcessId,ParentProcessId,Name,@{n='Cmd';e={\$_.CommandLine.Substring(0,[Math]::Min(160,\$_.CommandLine.Length))}} | Format-Table -AutoSize | Out-String -Width 220" | tee -a "$GITHUB_STEP_SUMMARY"
+          elif pgrep -af codex-plugin-test- ; then echo "leaked test processes" >&2; exit 1; fi
+
+
+      - name: Run build
+        run: npm run build
+
+  quality:
+    name: Quality (ubuntu, node 24)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out release ref
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.ref || github.ref_name }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Codex CLI
+        run: npm install -g @openai/codex
 
       - name: Version metadata matches the tag
         run: npm run check-version
 
-      - name: Run test suite
-        run: npm test
+      - name: Changelog has a section for the version
+        run: npm run check:changelog
 
-      - name: No leaked test processes
-        run: |
-          sleep 10
-          if pgrep -f codex-plugin-test- ; then echo "leaked test processes" >&2; exit 1; fi
+      - name: Lint
+        run: npm run lint
 
       - name: Run build
         run: npm run build
+
+      - name: Typecheck tests and scripts
+        run: npm run typecheck:tests
 
       - name: Runtime dependency audit
         run: npm audit --omit=dev
 
       - name: Pack (dry run)
-        run: npm pack --dry-run
+        run: |
+          npm pack --dry-run
+          rm -f ./*.tgz

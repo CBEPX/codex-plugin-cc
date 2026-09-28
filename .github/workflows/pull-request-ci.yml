@@ -3,7 +3,12 @@ name: Pull Request CI
 on:
   pull_request:
   push:
-    branches: [main, "release/**", "ci/**"]
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -12,10 +17,8 @@ jobs:
   ci:
     name: CI (${{ matrix.os }}, node ${{ matrix.node }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
-    # Spike: Windows is exploratory until the test harness runs there
-    # (fake codex is a shebang script; see docs/superpowers/plans step 0).
-    continue-on-error: ${{ startsWith(matrix.os, 'windows') }}
+    # Windows runners have been seen 2-3x slower for hours at a time.
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
@@ -45,7 +48,7 @@ jobs:
           npm test 2>&1 | tee test-output.log
           status=${PIPESTATUS[0]}
           echo "## Test summary (${{ matrix.os }}, node ${{ matrix.node }})" >> "$GITHUB_STEP_SUMMARY"
-          { rg -e 'ℹ (tests|pass|fail)' -e '^not ok' test-output.log || grep -E 'ℹ (tests|pass|fail)|^not ok' test-output.log; } >> "$GITHUB_STEP_SUMMARY" || true
+          { rg -e 'ℹ (tests|pass|fail)' -e '^# (tests|pass|fail)' -e '^not ok' -e '^✖' test-output.log || grep -E 'ℹ (tests|pass|fail)|^# (tests|pass|fail)|^not ok|^✖' test-output.log; } >> "$GITHUB_STEP_SUMMARY" || true
           exit "$status"
 
       - name: Upload test log
@@ -56,11 +59,64 @@ jobs:
           path: test-output.log
           retention-days: 7
 
+      # Same check as the local gate. Windows is reported, not enforced, until
+      # the Windows kill path lands (v1.4.1); it runs even after a red suite so
+      # the leak list is always available.
       - name: No leaked test processes
-        if: runner.os != 'Windows'
+        if: always()
+        shell: bash
         run: |
           sleep 10
-          if pgrep -f codex-plugin-test- ; then echo "leaked test processes" >&2; exit 1; fi
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            powershell -NoProfile -Command "\$p = @(Get-CimInstance Win32_Process | Where-Object { \$_.CommandLine -match 'codex-plugin-test-' }); Write-Output ('Leaked test processes after 10 s: ' + \$p.Count); \$p | Select-Object ProcessId,ParentProcessId,Name,@{n='Cmd';e={\$_.CommandLine.Substring(0,[Math]::Min(160,\$_.CommandLine.Length))}} | Format-Table -AutoSize | Out-String -Width 220" | tee -a "$GITHUB_STEP_SUMMARY"
+          elif pgrep -af codex-plugin-test- ; then echo "leaked test processes" >&2; exit 1; fi
 
       - name: Run build
         run: npm run build
+
+  quality:
+    name: Quality (ubuntu, node 24)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up Node.js
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Codex CLI
+        run: npm install -g @openai/codex
+
+      - name: Version metadata matches the package
+        run: npm run check-version
+
+      - name: Changelog has a section for the version
+        run: npm run check:changelog
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Run build
+        run: npm run build
+
+      - name: Typecheck tests and scripts
+        run: npm run typecheck:tests
+
+      - name: Test coverage
+        run: npm run test:coverage
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: coverage
+          path: reports/coverage/
+          retention-days: 14

@@ -14,7 +14,7 @@ import { spawn } from "node:child_process";
 import readline from "node:readline";
 import { parseBrokerEndpoint } from "./broker-endpoint.mjs";
 import { ensureBrokerSession, loadBrokerSession } from "./broker-lifecycle.mjs";
-import { terminateProcessTree } from "./process.mjs";
+import { buildLaunch, notFound, resolveExecutable, terminateProcessTree } from "./process.mjs";
 
 const PLUGIN_MANIFEST_URL = new URL("../../.claude-plugin/plugin.json", import.meta.url);
 const PLUGIN_MANIFEST = JSON.parse(fs.readFileSync(PLUGIN_MANIFEST_URL, "utf8"));
@@ -238,11 +238,24 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
   }
 
   async initialize() {
-    this.proc = spawn("codex", ["app-server"], {
+    const env = this.options.env ?? process.env;
+    // No shell on Windows either: resolve codex.cmd/codex.exe and launch it the
+    // way runCommand does. Unresolved fails as ENOENT without spawning, so a
+    // codex.exe planted in the workspace never runs.
+    let launch = { file: "codex", args: ["app-server"], env, windowsVerbatimArguments: false };
+    if (process.platform === "win32") {
+      const resolved = resolveExecutable("codex", { cwd: this.cwd, env });
+      if (resolved === null) {
+        throw notFound("codex");
+      }
+      launch = buildLaunch(resolved, ["app-server"], env);
+    }
+    this.proc = spawn(launch.file, launch.args, {
       cwd: this.cwd,
-      env: this.options.env ?? process.env,
+      env: launch.env,
       stdio: ["pipe", "pipe", "pipe"],
-      shell: process.platform === "win32" ? (process.env.SHELL || true) : false,
+      shell: false,
+      windowsVerbatimArguments: launch.windowsVerbatimArguments,
       windowsHide: true
     });
 
@@ -280,8 +293,9 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
     this.notify("initialized", {});
   }
 
-  // On Windows with shell: true the direct child is cmd.exe, so the whole tree
-  // has to go — `taskkill /T /F` is the only escalation available there.
+  // On Windows a codex.cmd shim makes the direct child cmd.exe (running node,
+  // running codex), so the whole tree has to go — `taskkill /T /F` on the live
+  // handle's pid is the only escalation available there.
   terminateChild(signal) {
     if (!this.proc || this.proc.exitCode !== null || this.proc.signalCode !== null) {
       return;

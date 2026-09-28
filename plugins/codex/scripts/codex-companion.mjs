@@ -334,6 +334,11 @@ async function handleSetup(argv) {
   const isInherit = (value) => String(value).trim().toLowerCase() === "inherit";
   const modelGiven = options["review-gate-model"] != null;
   const effortGiven = options["review-gate-effort"] != null;
+  for (const flag of ["review-gate-model", "review-gate-effort"]) {
+    if (options[flag] != null && String(options[flag]).trim() === "") {
+      throw new Error(`--${flag} needs a value; use inherit to clear it.`);
+    }
+  }
   const config = getConfig(workspaceRoot);
   const newModel = modelGiven && !isInherit(options["review-gate-model"]) ? normalizeRequestedModel(options["review-gate-model"]) : null;
   const effectiveModel = modelGiven ? newModel : (config.stopReviewGateModel ?? null);

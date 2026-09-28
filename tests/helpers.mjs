@@ -4,6 +4,13 @@ import path from "node:path";
 import process from "node:process";
 import { spawnSync } from "node:child_process";
 
+export const IS_WIN = process.platform === "win32";
+
+// Fake a home directory for both POSIX (HOME) and Windows (USERPROFILE) lookups.
+export function homeEnv(home) {
+  return { HOME: home, USERPROFILE: home };
+}
+
 export function makeTempDir(prefix = "codex-plugin-test-") {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 }
@@ -19,7 +26,8 @@ export function run(command, args, options = {}) {
     encoding: "utf8",
     input: options.input,
     timeout: options.timeout,
-    shell: options.shell ?? (process.platform === "win32" && !path.isAbsolute(command)),
+    // Tests spawn process.execPath / git directly, never through a shell.
+    shell: options.shell ?? false,
     windowsHide: true
   });
 }

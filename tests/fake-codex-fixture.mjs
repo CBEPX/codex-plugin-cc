@@ -6,7 +6,8 @@ import { writeExecutable } from "./helpers.mjs";
 
 export function installFakeCodex(binDir, behavior = "review-ok") {
   const statePath = path.join(binDir, "fake-codex-state.json");
-  const scriptPath = path.join(binDir, "codex");
+  // Windows runs the body through a codex.cmd shim (below), so it needs a .cjs name.
+  const scriptPath = path.join(binDir, process.platform === "win32" ? "codex.cjs" : "codex");
   const source = `#!/usr/bin/env node
 const fs = require("node:fs");
 const crypto = require("node:crypto");
@@ -559,7 +560,19 @@ rl.on("line", (line) => {
             method: "item/completed",
             params: { threadId: thread.id, turnId, item: { type: "agentMessage", id: "msg_" + turnId, text: JSON.stringify({ error: "quota exhausted" }, null, 2), phase: "final_answer" } }
           });
-          send({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(turnId, "failed") } });
+          // FAKE_CODEX_EXIT_AFTER_FINAL_ANSWER: the server dies before any
+          // terminal notification; FAKE_CODEX_TURN_DELAY_MS stands in for a slow
+          // relay between the final answer and that notification.
+          if (process.env.FAKE_CODEX_EXIT_AFTER_FINAL_ANSWER === "1") {
+            setTimeout(() => process.exit(0), 50);
+            break;
+          }
+          const failed = () => send({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(turnId, "failed") } });
+          if (TURN_DELAY_MS > 0) {
+            setTimeout(failed, TURN_DELAY_MS);
+          } else {
+            failed();
+          }
           break;
         }
 
@@ -764,10 +777,10 @@ rl.on("line", (line) => {
 `;
   writeExecutable(scriptPath, source);
 
-  // On Windows, npm global binaries are invoked via .cmd wrappers.
-  // Create a codex.cmd so the fake binary is discoverable by spawn with shell: true.
+  // On Windows, npm global binaries are invoked via .cmd wrappers; the companion
+  // resolves codex.cmd with where.exe and launches it through cmd.exe.
   if (process.platform === "win32") {
-    const cmdWrapper = `@echo off\r\nnode "%~dp0codex" %*\r\n`;
+    const cmdWrapper = `@echo off\r\nnode "%~dp0codex.cjs" %*\r\n`;
     fs.writeFileSync(path.join(binDir, "codex.cmd"), cmdWrapper, { encoding: "utf8" });
   }
 }

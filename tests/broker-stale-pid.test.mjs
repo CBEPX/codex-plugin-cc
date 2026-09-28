@@ -8,7 +8,7 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
-import { makeTempDir, run } from "./helpers.mjs";
+import { IS_WIN, makeTempDir, run } from "./helpers.mjs";
 import { createBrokerEndpoint, parseBrokerEndpoint } from "../plugins/codex/scripts/lib/broker-endpoint.mjs";
 import {
   clearBrokerSession,
@@ -118,7 +118,7 @@ test("session end teardown does not signal a recycled pid that is not this broke
   });
 
   try {
-    const cleanup = run("node", [SESSION_HOOK, "SessionEnd"], {
+    const cleanup = run(process.execPath, [SESSION_HOOK, "SessionEnd"], {
       cwd: workspace,
       env: process.env,
       input: JSON.stringify({ hook_event_name: "SessionEnd", cwd: workspace })
@@ -132,7 +132,11 @@ test("session end teardown does not signal a recycled pid that is not this broke
     try {
       process.kill(-impostor.pid, "SIGKILL");
     } catch {
-      // Already gone.
+      try {
+        process.kill(impostor.pid, "SIGKILL");
+      } catch {
+        // Already gone.
+      }
     }
     clearBrokerSession(workspace);
   }
@@ -155,7 +159,7 @@ function spawnOwnedBroker(workspace, { binDir, sessionDir, endpoint, env }) {
 }
 
 function runSessionEndHook(workspace, { env = process.env, sessionId = null } = {}) {
-  return run("node", [SESSION_HOOK, "SessionEnd"], {
+  return run(process.execPath, [SESSION_HOOK, "SessionEnd"], {
     cwd: workspace,
     env: sessionId ? { ...env, CODEX_COMPANION_SESSION_ID: sessionId } : env,
     input: JSON.stringify({
@@ -170,7 +174,7 @@ function runSessionEndHook(workspace, { env = process.env, sessionId = null } = 
 // server could never accept the hook's connection. Anything that answers the hook
 // from within the test has to run it asynchronously.
 function runSessionEndHookAsync(workspace, { env = process.env, sessionId = null } = {}) {
-  const child = spawn("node", [SESSION_HOOK, "SessionEnd"], {
+  const child = spawn(process.execPath, [SESSION_HOOK, "SessionEnd"], {
     cwd: workspace,
     env: sessionId ? { ...env, CODEX_COMPANION_SESSION_ID: sessionId } : env,
     stdio: ["pipe", "pipe", "pipe"]
@@ -348,7 +352,7 @@ test("session end keeps the broker while an owned background job runs, and the b
     FAKE_CODEX_TURN_DELAY_MS: "3000"
   });
 
-  const launched = run("node", [SCRIPT, "task", "--background", "--json", "keep me running"], { cwd: workspace, env });
+  const launched = run(process.execPath, [SCRIPT, "task", "--background", "--json", "keep me running"], { cwd: workspace, env });
   assert.equal(launched.status, 0, launched.stderr);
   const { jobId } = JSON.parse(launched.stdout);
 
@@ -423,7 +427,7 @@ test("session end does not clear the record of a replacement broker started duri
   });
 
   try {
-    const hook = spawn("node", [SESSION_HOOK, "SessionEnd"], { cwd: workspace, env: process.env, stdio: ["pipe", "pipe", "pipe"] });
+    const hook = spawn(process.execPath, [SESSION_HOOK, "SessionEnd"], { cwd: workspace, env: process.env, stdio: ["pipe", "pipe", "pipe"] });
     hook.stdin.end(JSON.stringify({ hook_event_name: "SessionEnd", cwd: workspace }));
     const code = await new Promise((resolve) => hook.on("exit", resolve));
 
@@ -440,7 +444,8 @@ test("session end does not clear the record of a replacement broker started duri
 // active-background check trusts that stale `running` record, every later
 // SessionEnd in the workspace takes the early return and the broker — plus its
 // app-server child — lingers forever.
-test("session end reaps a SIGKILLed background worker instead of keeping its broker alive", async (t) => {
+// Windows: the scenario kills the worker's process group with kill(-pid), which is POSIX-only.
+test("session end reaps a SIGKILLed background worker instead of keeping its broker alive", { skip: IS_WIN }, async (t) => {
   const binDir = makeTempDir();
   installFakeCodex(binDir);
   const workspace = makeTempDir();
@@ -451,7 +456,7 @@ test("session end reaps a SIGKILLed background worker instead of keeping its bro
     FAKE_CODEX_TURN_DELAY_MS: "20000"
   });
 
-  const launched = run("node", [SCRIPT, "task", "--background", "--json", "die mid-turn"], { cwd: workspace, env });
+  const launched = run(process.execPath, [SCRIPT, "task", "--background", "--json", "die mid-turn"], { cwd: workspace, env });
   assert.equal(launched.status, 0, launched.stderr);
   const { jobId } = JSON.parse(launched.stdout);
 
@@ -479,14 +484,41 @@ test("session end reaps a SIGKILLed background worker instead of keeping its bro
     clearBrokerSession(workspace);
   });
 
+  // The broker's log already has at least one "client disconnected" line from
+  // its own readiness probe (`ensureBrokerSession` connects and immediately
+  // closes). Count before the kill so the wait below is for a *new*
+  // disconnect, not one already on record.
+  const countDisconnects = () =>
+    (fs.readFileSync(broker.logFile, "utf8").match(/client disconnected/g) ?? []).length;
+  const disconnectsBeforeKill = countDisconnects();
+
   process.kill(-running.pid, "SIGKILL");
   await waitUntil(() => (isAlive(running.pid) ? null : "dead"));
+
+  // The killed worker's socket close is async on the broker's side: `sockets`
+  // (and therefore its busy check) is only accurate once the broker's own
+  // "close" handler has run for THIS socket. Wait for that observable log
+  // line rather than a fixed sleep, so this isn't racing the broker's event
+  // loop.
+  await waitUntil(() => (countDisconnects() > disconnectsBeforeKill ? "disconnected" : null));
 
   const cleanup = runSessionEndHook(workspace, { env, sessionId: "sess-current" });
   assert.equal(cleanup.status, 0, cleanup.stderr);
 
   const exited = await waitUntil(() => (isAlive(broker.pid) ? null : "exited"), { timeoutMs: 5000 });
-  assert.equal(exited, "exited", `a dead worker must not keep the broker alive; hook said: ${cleanup.stderr.trim()}`);
+  // Read only on failure: a broker that did exit has already removed its log.
+  const brokerLogTail = () => {
+    try {
+      return fs.readFileSync(broker.logFile, "utf8").split("\n").slice(-20).join("\n");
+    } catch {
+      return "(broker log gone)";
+    }
+  };
+  assert.equal(
+    exited,
+    "exited",
+    `a dead worker must not keep the broker alive; hook said: ${cleanup.stderr.trim()}\nbroker log tail:\n${exited === "exited" ? "" : brokerLogTail()}`
+  );
   assert.equal(loadBrokerSession(workspace), null, "the broker record must be cleared");
 
   const job = JSON.parse(fs.readFileSync(stateFile, "utf8")).jobs.find((entry) => entry.id === jobId);
@@ -974,7 +1006,9 @@ test("ensureBrokerSession kills a live unreachable broker before replacing it (#
     retryTimeoutMs: 300
   });
   try {
-    assert.deepEqual(killed, [process.pid], "the unreachable but live broker must be signalled");
+    // win32 (v1.3.0 documented refusal): a record without an identity is never
+    // signalled (identity-unavailable until v1.4.1), so nothing is killed there.
+    assert.deepEqual(killed, IS_WIN ? [] : [process.pid], "the unreachable but live broker must be signalled");
     assert.ok(probes >= 1);
     assert.ok(session && session.endpoint !== staleEndpoint, "a fresh broker must be spawned");
     assert.equal(loadBrokerSession(workspace)?.endpoint, session.endpoint);
@@ -1095,17 +1129,17 @@ test("SessionEnd leaves a recorded broker pid alone when its identity no longer 
   const sessionDir = makeTempDir("cxc-");
   const endpoint = createBrokerEndpoint(sessionDir);
   saveBrokerSession(workspace, { endpoint, pidFile: null, logFile: null, sessionDir, pid: process.pid, pidIdentity: "darwin:definitely-not-this|nope" });
-  const hook = run("node", [SESSION_HOOK, "SessionEnd"], { cwd: workspace, env: buildEnv(binDir), input: JSON.stringify({ cwd: workspace, session_id: "sess-identity" }) });
+  const hook = run(process.execPath, [SESSION_HOOK, "SessionEnd"], { cwd: workspace, env: buildEnv(binDir), input: JSON.stringify({ cwd: workspace, session_id: "sess-identity" }) });
   assert.equal(hook.status, 0, hook.stderr);
   assert.match(hook.stderr, /signalled=false/);
   assert.match(hook.stderr, /identity-mismatch/);
   clearBrokerSession(workspace);
 });
 
-// A broker this call just spawned that never becomes ready is killed through the
-// child handle: its pid cannot have been recycled while the handle says it has
-// not exited, so no identity is consulted.
-test("ensureBrokerSession kills a fresh broker that never becomes ready", async () => {
+// A broker this call just spawned that never becomes ready is killed as a process
+// group: its pid cannot have been recycled while the child handle says it has not
+// exited, so no identity is consulted. The handle's own kill is only the fallback.
+test("ensureBrokerSession kills a fresh broker that never becomes ready as a process group", async () => {
   const binDir = makeTempDir();
   installFakeCodex(binDir);
   const workspace = makeTempDir();
@@ -1185,7 +1219,9 @@ test("ensureBrokerSession re-verifies a legacy broker's ownership after the read
     retryTimeoutMs: 300
   });
   try {
-    assert.ok(probes >= 2, "ownership must be checked again at kill time");
+    // win32 (v1.3.0 documented refusal): teardown refuses an identity-less record
+    // before any kill-time recheck, so only the first probe happens there.
+    if (!IS_WIN) assert.ok(probes >= 2, "ownership must be checked again at kill time");
     assert.deepEqual(killed, []);
     assert.ok(session);
   } finally {

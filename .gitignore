@@ -151,3 +151,5 @@ plugins/codex/.generated/
 
 # git worktrees (project-local)
 .worktrees/
+reports/
+.stryker-tmp/

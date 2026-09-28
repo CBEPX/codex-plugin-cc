@@ -12,6 +12,8 @@
  *   threadId: string,
  *   rootThreadId: string,
  *   threadIds: Set<string>,
+ *   sawSubagents: boolean,
+ *   timingOut: boolean,
  *   threadTurnIds: Map<string, string>,
  *   threadLabels: Map<string, string>,
  *   turnId: string | null,
@@ -273,12 +275,18 @@ function labelForThread(state, threadId) {
   return state.threadLabels.get(threadId) ?? threadId;
 }
 
+// Any thread announced on this connection is taken as part of this turn's tree
+// (`thread/started` is applied unconditionally). That holds because the broker is
+// single-tenant: it serves one client's turn at a time and answers others `busy`.
 function registerThread(state, threadId, options = {}) {
   if (!threadId) {
     return;
   }
 
   state.threadIds.add(threadId);
+  if (threadId !== state.threadId) {
+    state.sawSubagents = true;
+  }
   const label =
     options.threadName ??
     options.name ??
@@ -369,6 +377,12 @@ function createTurnCaptureState(threadId, options = {}) {
     threadId,
     rootThreadId: threadId,
     threadIds: new Set([threadId]),
+    // Set once any non-main thread joins the turn: only then may completion be
+    // inferred instead of waited for.
+    sawSubagents: false,
+    // The turn-timeout path owns the outcome once it starts (it may close the
+    // transport itself), so the transport-exit finalizer stands down.
+    timingOut: false,
     threadTurnIds: new Map(),
     threadLabels: new Map(),
     turnId: null,
@@ -430,6 +444,12 @@ function completeTurn(state, turn = null, options = {}) {
 
 function scheduleInferredCompletion(state) {
   if (state.completed || state.finalTurn || !state.finalAnswerSeen) {
+    return;
+  }
+  // Inference exists for subagent flows whose main turn/completed never comes.
+  // A plain turn always gets one; guessing 250 ms after the final answer would
+  // turn a merely delayed `turn/completed` with status "failed" into "completed".
+  if (!state.sawSubagents) {
     return;
   }
 
@@ -696,6 +716,7 @@ async function failTurnOnTimeout(client, state, timeoutMs) {
   if (state.completed) {
     return;
   }
+  state.timingOut = true;
   const timeoutMessage = `turn timed out after ${timeoutMs} ms`;
   state.error = { message: timeoutMessage };
   emitProgress(state.onProgress, `Turn timed out after ${timeoutMs} ms; interrupting.`, "failed");
@@ -779,6 +800,19 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
       routeNotification(message);
     }
     state.bufferedNotifications.length = 0;
+
+    // A transport that dies before the terminal notification ends the turn as
+    // failed with whatever was captured; otherwise the completion never settles
+    // (a foreground run would exit silently, a background job stay "running").
+    void client.exitPromise.then(() => {
+      if (state.completed || state.timingOut) {
+        return;
+      }
+      const error = client.exitError ?? new Error("codex app-server connection closed before the turn completed.");
+      state.error = error;
+      emitProgress(state.onProgress, `Codex transport closed: ${error.message}`, "failed");
+      completeTurn(state, { id: state.turnId ?? "transport-closed-turn", status: "failed", error });
+    });
 
     if (response.turn?.status && response.turn.status !== "inProgress") {
       completeTurn(state, response.turn);

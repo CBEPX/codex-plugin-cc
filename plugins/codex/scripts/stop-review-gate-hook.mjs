@@ -7,8 +7,9 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { getCodexAvailability } from "./lib/codex.mjs";
+import { readHookInput } from "./lib/hook-input.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
-import { getConfig, setConfig, listJobs } from "./lib/state.mjs";
+import { getConfig, setConfig, listJobs, resolveStateFile, retryOnWindows } from "./lib/state.mjs";
 import { sortJobsNewestFirst } from "./lib/job-control.mjs";
 import { reapDeadJobs, SESSION_ID_ENV } from "./lib/tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
@@ -25,14 +26,6 @@ const ROOT_DIR = path.resolve(SCRIPT_DIR, "..");
 const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
 const GATE_ROUNDS_CONFIG_KEY = "stopReviewGateRoundsBySession";
 
-function readHookInput() {
-  const raw = fs.readFileSync(0, "utf8").trim();
-  if (!raw) {
-    return {};
-  }
-  return JSON.parse(raw);
-}
-
 function emitDecision(payload) {
   process.stdout.write(`${JSON.stringify(payload)}\n`);
 }
@@ -45,14 +38,19 @@ function logNote(message) {
 }
 
 // Cap on how many consecutive gate-induced rounds run in one session.
-// Unset or invalid → DEFAULT_MAX_ROUNDS; an explicit 0 keeps the rounds unbounded.
+// Unset → DEFAULT_MAX_ROUNDS; an explicit 0 keeps the rounds unbounded; anything
+// but a non-negative integer (0.5, 0x10, -1) → DEFAULT_MAX_ROUNDS with a warning.
 function getMaxRounds() {
   const raw = process.env.CODEX_REVIEW_GATE_MAX_ROUNDS;
   if (raw == null || raw === "") {
     return DEFAULT_MAX_ROUNDS;
   }
-  const parsed = Number.parseInt(raw, 10);
-  return Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_MAX_ROUNDS;
+  const parsed = /^\s*\d+\s*$/.test(raw) ? Number(raw) : Number.NaN;
+  if (Number.isInteger(parsed) && parsed >= 0) {
+    return parsed;
+  }
+  logNote(`Ignoring CODEX_REVIEW_GATE_MAX_ROUNDS=${JSON.stringify(raw)}: not a plain digit string; using ${DEFAULT_MAX_ROUNDS}.`);
+  return DEFAULT_MAX_ROUNDS;
 }
 
 function gateSessionId(input) {
@@ -150,10 +148,13 @@ function runStopReview(cwd, input = {}, config = {}) {
   if (config.stopReviewGateEffort) {
     args.push("--effort", config.stopReviewGateEffort);
   }
-  args.push(prompt);
+  // Via stdin, not argv: a long last_assistant_message overruns the argv limit
+  // (32 KiB on Windows, 128 KiB per argument on Linux).
+  args.push("--prompt-stdin");
   const result = spawnSync(process.execPath, args, {
     cwd,
     env: childEnv,
+    input: prompt,
     encoding: "utf8",
     timeout: Math.max(1, Math.floor(STOP_REVIEW_TIMEOUT_OVERRIDE_MS || STOP_REVIEW_TIMEOUT_MS)),
     killSignal: "SIGKILL",
@@ -197,14 +198,34 @@ function runStopReview(cwd, input = {}, config = {}) {
   }
 }
 
-function main() {
-  let input;
+// Read directly, not via getConfig: loadState turns an unreadable or corrupt
+// state file into defaults (gate off), which must not open the gate. Only a
+// missing file means "never configured"; EACCES on the file or a parent (where
+// existsSync would also say false) keeps the gate closed.
+function gateEnabledForProject() {
   try {
-    input = readHookInput();
-  } catch {
+    const stateFile = resolveStateFile(resolveWorkspaceRoot(process.env.CLAUDE_PROJECT_DIR || process.cwd()));
+    return Boolean(JSON.parse(retryOnWindows(() => fs.readFileSync(stateFile, "utf8"), ["EPERM", "EBUSY"])).config?.stopReviewGate);
+  } catch (error) {
+    return error?.code !== "ENOENT";
+  }
+}
+
+async function main() {
+  const { input, error } = await readHookInput();
+  if (error) {
+    // Gate off (as stored, unreadable counts as on): allow when nothing arrived
+    // (#530) or the input overflowed, since a disabled gate never blocked. Every
+    // other case (gate on, partial input, invalid JSON, read error) blocks.
+    if (((error.code === "timeout" && error.bytes === 0) || error.code === "overflow") && !gateEnabledForProject()) {
+      return;
+    }
     emitDecision({
       decision: "block",
-      reason: "The stop review gate could not read or parse hook input; refusing to fail open."
+      reason:
+        error.code === "invalid-json"
+          ? "The stop review gate could not read or parse hook input; refusing to fail open."
+          : `The stop review gate could not read hook input (${error.message}); refusing to fail open. ${ESCAPE_HATCH}`
     });
     return;
   }
@@ -259,10 +280,8 @@ function main() {
   logNote(runningTaskNote);
 }
 
-try {
-  main();
-} catch (error) {
+main().catch((error) => {
   const message = error instanceof Error ? error.message : String(error);
   process.stderr.write(`${message}\n`);
   process.exitCode = 1;
-}
+});

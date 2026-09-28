@@ -7,7 +7,7 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
-import { makeTempDir, run } from "./helpers.mjs";
+import { IS_WIN, makeTempDir, run } from "./helpers.mjs";
 import { createBrokerEndpoint, parseBrokerEndpoint } from "../plugins/codex/scripts/lib/broker-endpoint.mjs";
 import { clearBrokerSession, loadBrokerSession, saveBrokerSession, waitForBrokerEndpoint } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
 
@@ -362,7 +362,8 @@ test("broker refuses shutdown while a client is connected but has not spoken yet
 // exit), that made the broker ignore SIGTERM outright — the process a SessionEnd
 // had just signalled stayed alive, which is what CI caught on a worker whose
 // socket had not been cleaned up yet.
-test("broker exits on SIGTERM even when a client never answers the FIN", async () => {
+// Windows: kill("SIGTERM") is TerminateProcess, so the graceful-SIGTERM clean exit (code 0) is not modelled.
+test("broker exits on SIGTERM even when a client never answers the FIN", { skip: IS_WIN }, async () => {
   const binDir = makeTempDir();
   installFakeCodex(binDir);
   const sessionDir = makeTempDir("cxc-");
@@ -403,7 +404,8 @@ function processesMatching(pattern) {
 // `return`, and *its* caller then exited the process: out from under the child
 // still being killed, the sockets still being closed, and the endpoint, pid file
 // and ownership record still on disk.
-test("a second shutdown trigger does not exit before the first has cleaned up", async () => {
+// Windows: graceful SIGTERM handling is not modelled (TerminateProcess), and pgrep does not exist.
+test("a second shutdown trigger does not exit before the first has cleaned up", { skip: IS_WIN }, async () => {
   const binDir = makeTempDir();
   installFakeCodex(binDir);
   const workspace = makeTempDir();

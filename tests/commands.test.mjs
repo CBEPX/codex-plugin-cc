@@ -7,8 +7,9 @@ import { fileURLToPath } from "node:url";
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PLUGIN_ROOT = path.join(ROOT, "plugins", "codex");
 
-function read(relativePath) {
-  return fs.readFileSync(path.join(PLUGIN_ROOT, relativePath), "utf8");
+// Normalise CRLF so a Windows checkout (autocrlf) does not break line-anchored regexes.
+function read(relativePath, root = PLUGIN_ROOT) {
+  return fs.readFileSync(path.join(root, relativePath), "utf8").replace(/\r\n/g, "\n");
 }
 
 test("review command uses AskUserQuestion and background Bash while staying review-only", () => {
@@ -89,7 +90,7 @@ test("continue is not exposed as a user-facing command", () => {
 test("rescue command absorbs continue semantics", () => {
   const rescue = read("commands/rescue.md");
   const agent = read("agents/codex-rescue.md");
-  const readme = fs.readFileSync(path.join(ROOT, "README.md"), "utf8");
+  const readme = read("README.md", ROOT);
   const runtimeSkill = read("skills/codex-cli-runtime/SKILL.md");
 
   assert.match(rescue, /show the output verbatim, then your assessment/i);
@@ -172,9 +173,9 @@ test("rescue command absorbs continue semantics", () => {
 });
 
 test("rescue runs synchronously through the companion and uses Agent only for --background", () => {
-  const rescue = fs.readFileSync(path.join(PLUGIN_ROOT, "commands", "rescue.md"), "utf8");
-  const agent = fs.readFileSync(path.join(PLUGIN_ROOT, "agents", "codex-rescue.md"), "utf8");
-  const runtimeSkill = fs.readFileSync(path.join(PLUGIN_ROOT, "skills", "codex-cli-runtime", "SKILL.md"), "utf8");
+  const rescue = read("commands/rescue.md");
+  const agent = read("agents/codex-rescue.md");
+  const runtimeSkill = read("skills/codex-cli-runtime/SKILL.md");
   assert.match(rescue, /task --await --prompt-stdin/);
   assert.match(rescue, /the output ends with a `Re-run:` line/i);
   assert.match(rescue, /`--background`: invoke the `Agent` tool with `codex:codex-rescue`/);
@@ -253,7 +254,7 @@ test("session start hook allows enough time to restore session state", () => {
 
 test("setup command can offer Codex install and still points users to codex login", () => {
   const setup = read("commands/setup.md");
-  const readme = fs.readFileSync(path.join(ROOT, "README.md"), "utf8");
+  const readme = read("README.md", ROOT);
 
   assert.match(setup, /argument-hint:\s*'\[--enable-review-gate\|--disable-review-gate\] \[--review-gate-model <model\|inherit>\] \[--review-gate-effort <effort\|inherit>\]'/);
   assert.match(setup, /AskUserQuestion/);
@@ -268,7 +269,7 @@ test("setup command can offer Codex install and still points users to codex logi
 test("stop gate script timeout is shorter than the Stop hook timeout and its message matches", () => {
   const hooks = JSON.parse(fs.readFileSync(path.join(PLUGIN_ROOT, "hooks", "hooks.json"), "utf8"));
   const stopTimeoutSeconds = hooks.hooks.Stop[0].hooks[0].timeout;
-  const source = fs.readFileSync(path.join(PLUGIN_ROOT, "scripts", "stop-review-gate-hook.mjs"), "utf8");
+  const source = read("scripts/stop-review-gate-hook.mjs");
   const minutes = source.match(/const STOP_REVIEW_TIMEOUT_MINUTES = (\d+);/);
   assert.ok(minutes, "STOP_REVIEW_TIMEOUT_MINUTES must be a named constant");
   assert.match(source, /const STOP_REVIEW_TIMEOUT_MS = STOP_REVIEW_TIMEOUT_MINUTES \* 60 \* 1000;/);
@@ -417,7 +418,7 @@ test("SKILL.md execution rules describe the single-call flow, not the old two-st
 // could be retrieved. Automation cannot act on a published contract that claims
 // both return 0 for a failed job one line after saying `--await` returns 1.
 test("README keeps the task --await and result exit-code contracts apart", () => {
-  const readme = fs.readFileSync(path.join(ROOT, "README.md"), "utf8");
+  const readme = read("README.md", ROOT);
 
   assert.match(
     readme,
@@ -437,7 +438,7 @@ test("README keeps the task --await and result exit-code contracts apart", () =>
 });
 
 test("README documents the fork's own install commands", () => {
-  const readme = fs.readFileSync(path.join(ROOT, "README.md"), "utf8");
+  const readme = read("README.md", ROOT);
 
   assert.match(readme, /plugin marketplace add CBEPX\/codex-plugin-cc/);
   assert.match(readme, /plugin install codex@cbepx/);
@@ -475,5 +476,12 @@ test("the SessionEnd hook timeout stays above the hook's own budget", () => {
   assert.ok(
     timeoutSeconds * 1000 > budgetMs,
     `hooks.json SessionEnd timeout (${timeoutSeconds}s) must exceed the hook budget (${budgetMs}ms)`
+  );
+  // The budget starts only after the bounded stdin read, so the timeout covers both.
+  const readMs = Number(/readHookInput\(\{ timeoutMs: process\.argv\[2\] === "SessionEnd" \? (\d+) :/.exec(source)?.[1]);
+  assert.ok(Number.isFinite(readMs), "the hook must bound its SessionEnd stdin read with an explicit timeoutMs");
+  assert.ok(
+    timeoutSeconds * 1000 > budgetMs + readMs,
+    `hooks.json SessionEnd timeout (${timeoutSeconds}s) must exceed the stdin read (${readMs}ms) plus the budget (${budgetMs}ms)`
   );
 });

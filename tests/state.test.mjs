@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-import { makeTempDir, run } from "./helpers.mjs";
+import { IS_WIN, makeTempDir, run } from "./helpers.mjs";
 import { getProcessIdentity } from "../plugins/codex/scripts/lib/process.mjs";
 import {
   consumeJobRequestFile,
@@ -18,6 +18,7 @@ import {
   resolveFallbackStateRoot,
   resolveStateDir,
   resolveStateFile,
+  retryOnWindows,
   saveState,
   STATE_LOCK_TIMEOUT_CODE,
   upsertJob,
@@ -35,13 +36,14 @@ const STATE_MODULE = path.resolve(
   "state.mjs"
 );
 
-test("resolveStateDir uses a temp-backed per-workspace directory", () => {
+test("resolveStateDir uses a per-user fallback root per workspace", () => {
   const workspace = makeTempDir();
   const stateDir = resolveStateDir(workspace);
+  // Windows with %LOCALAPPDATA% set (CI runners have it) roots under it; everywhere else the temp dir.
+  const expectedRoot = process.platform === "win32" && process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, "codex-companion") : os.tmpdir();
 
-  assert.equal(stateDir.startsWith(os.tmpdir()), true);
+  assert.equal(stateDir.startsWith(expectedRoot), true, stateDir);
   assert.match(path.basename(stateDir), /.+-[a-f0-9]{16}$/);
-  assert.match(stateDir, new RegExp(`^${os.tmpdir().replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
 });
 
 test("resolveStateDir uses CLAUDE_PLUGIN_DATA when it is provided", () => {
@@ -138,7 +140,8 @@ test("job request payloads are written owner-only and consumed exactly once", ()
 
   const requestFile = writeJobRequestFile(workspace, "task-1", payload);
   assert.equal(requestFile, resolveJobRequestFile(workspace, "task-1"));
-  assert.equal(fs.statSync(requestFile).mode & 0o777, 0o600);
+  // Windows has no POSIX mode bits; the owner-only invariant is not modelled there.
+  if (!IS_WIN) assert.equal(fs.statSync(requestFile).mode & 0o777, 0o600);
 
   assert.deepEqual(consumeJobRequestFile(workspace, "task-1"), payload);
   assert.equal(fs.existsSync(requestFile), false);
@@ -171,20 +174,23 @@ test("concurrent writers never leave a torn state.json for a reader", async () =
   saveState(workspace, { jobs });
   const stateFile = resolveStateFile(workspace);
 
-  const writer = spawn(
-    process.execPath,
-    [
-      "--input-type=module",
-      "-e",
-      `import { saveState } from ${JSON.stringify(pathToFileURL(STATE_MODULE).href)};
-       const jobs = ${JSON.stringify(jobs)};
-       const deadline = Date.now() + 2000;
-       while (Date.now() < deadline) {
-         saveState(${JSON.stringify(workspace)}, { jobs });
-       }`
-    ],
-    { env: process.env, stdio: ["ignore", "ignore", "pipe"] }
+  // The writer source is >100 KiB, over the Windows command-line limit, so it
+  // goes through a temp module instead of `-e`.
+  const writerFile = path.join(makeTempDir(), "writer.mjs");
+  fs.writeFileSync(
+    writerFile,
+    `import { saveState } from ${JSON.stringify(pathToFileURL(STATE_MODULE).href)};
+     const jobs = ${JSON.stringify(jobs)};
+     const deadline = Date.now() + 2000;
+     while (Date.now() < deadline) {
+       saveState(${JSON.stringify(workspace)}, { jobs });
+     }`
   );
+  const writer = spawn(process.execPath, [writerFile], { env: process.env, stdio: ["ignore", "ignore", "pipe"] });
+  const writerExit = new Promise((resolve, reject) => {
+    writer.on("error", reject);
+    writer.on("exit", (code, signal) => resolve({ code, signal }));
+  });
   let writerStderr = "";
   writer.stderr.on("data", (chunk) => {
     writerStderr += chunk;
@@ -193,7 +199,8 @@ test("concurrent writers never leave a torn state.json for a reader", async () =
   let reads = 0;
   const deadline = Date.now() + 2000;
   while (Date.now() < deadline) {
-    const raw = fs.readFileSync(stateFile, "utf8");
+    // Reads like `loadState`: on Windows a read racing the rename may see EPERM/EBUSY.
+    const raw = retryOnWindows(() => fs.readFileSync(stateFile, "utf8"), ["EPERM", "EBUSY"]);
     let parsed;
     try {
       parsed = JSON.parse(raw);
@@ -204,7 +211,7 @@ test("concurrent writers never leave a torn state.json for a reader", async () =
     reads += 1;
   }
 
-  await new Promise((resolve) => writer.on("exit", resolve));
+  assert.deepEqual(await writerExit, { code: 0, signal: null }, writerStderr);
   assert.equal(writerStderr, "");
   assert.ok(reads > 100, `expected the reader to race the writer, got ${reads} reads`);
 });
@@ -868,7 +875,16 @@ test("fallback state root refuses a pre-existing world-accessible directory", { 
   const tmp = makeTempDir();
   const shared = path.join(tmp, `codex-companion-${process.getuid()}`);
   fs.mkdirSync(shared, { mode: 0o755 });
+  fs.chmodSync(shared, 0o755); // mkdir's mode is masked by the umask
   assert.throws(() => resolveFallbackStateRoot({ env: {}, tmpdir: tmp, pluginRoot: makeTempDir() }), /Refusing to use shared state directory/);
+});
+
+test("fallback state root refuses a user directory owned by another uid", { skip: process.platform === "win32" }, () => {
+  const tmp = makeTempDir();
+  assert.throws(
+    () => resolveFallbackStateRoot({ env: {}, tmpdir: tmp, uid: process.getuid() + 1, pluginRoot: makeTempDir() }),
+    /Refusing to use shared state directory/
+  );
 });
 
 test("fallback state root refuses a symlinked user directory", { skip: process.platform === "win32" }, () => {
@@ -877,4 +893,90 @@ test("fallback state root refuses a symlinked user directory", { skip: process.p
   fs.chmodSync(target, 0o700);
   fs.symlinkSync(target, path.join(tmp, `codex-companion-${process.getuid()}`));
   assert.throws(() => resolveFallbackStateRoot({ env: {}, tmpdir: tmp, pluginRoot: makeTempDir() }), /Refusing to use shared state directory/);
+});
+
+function failingOp(times, code) {
+  const errors = [];
+  const op = () => {
+    if (errors.length < times) {
+      const error = Object.assign(new Error(`${code} #${errors.length + 1}`), { code });
+      errors.push(error);
+      throw error;
+    }
+    return "ok";
+  };
+  return { op, errors };
+}
+
+test("retryOnWindows rides out transient EPERM on win32 and rethrows the last error after 20 attempts", () => {
+  const recovers = failingOp(19, "EPERM");
+  assert.equal(retryOnWindows(recovers.op, ["EPERM", "EBUSY"], { platform: "win32" }), "ok");
+  assert.equal(recovers.errors.length, 19);
+
+  const exhausted = failingOp(Infinity, "EPERM");
+  assert.throws(
+    () => retryOnWindows(exhausted.op, ["EPERM"], { platform: "win32" }),
+    (error) => error === exhausted.errors[19]
+  );
+  assert.equal(exhausted.errors.length, 20);
+});
+
+test("retryOnWindows never retries on posix or for codes it was not given", () => {
+  const posix = failingOp(1, "EPERM");
+  assert.throws(() => retryOnWindows(posix.op, ["EPERM"], { platform: "linux" }), (error) => error === posix.errors[0]);
+  assert.equal(posix.errors.length, 1);
+
+  const gone = failingOp(1, "ENOENT");
+  assert.throws(() => retryOnWindows(gone.op, ["EPERM", "EBUSY"], { platform: "win32" }), (error) => error === gone.errors[0]);
+  assert.equal(gone.errors.length, 1);
+});
+
+test("fallback state root on Windows lives under %LOCALAPPDATA%, else under tmpdir", () => {
+  const tmp = makeTempDir();
+  const local = makeTempDir();
+  const pluginRoot = makeTempDir();
+  const root = resolveFallbackStateRoot({ env: { LOCALAPPDATA: local }, platform: "win32", tmpdir: tmp, uid: null, pluginRoot });
+  assert.ok(root.startsWith(path.join(local, "codex-companion") + path.sep), root);
+
+  const noLocal = resolveFallbackStateRoot({ env: {}, platform: "win32", tmpdir: tmp, uid: null, pluginRoot });
+  assert.ok(noLocal.startsWith(path.join(tmp, "codex-companion-user") + path.sep), noLocal);
+});
+
+function captureStderr(fn) {
+  const lines = [];
+  const original = process.stderr.write;
+  process.stderr.write = (chunk) => {
+    lines.push(String(chunk));
+    return true;
+  };
+  try {
+    return { value: fn(), lines };
+  } finally {
+    process.stderr.write = original;
+  }
+}
+
+test("fallback state root on Windows keeps an existing tmpdir root until the new one exists, with one notice", () => {
+  const tmp = makeTempDir();
+  const local = makeTempDir();
+  const pluginRoot = makeTempDir();
+  const options = { env: { LOCALAPPDATA: local }, platform: "win32", tmpdir: tmp, uid: null, pluginRoot };
+  const legacy = resolveFallbackStateRoot({ ...options, env: {} });
+  fs.mkdirSync(legacy, { recursive: true });
+
+  const first = captureStderr(() => resolveFallbackStateRoot(options));
+  assert.equal(first.value, legacy);
+  assert.equal(first.lines.length, 1);
+  assert.ok(first.lines[0].includes(legacy), first.lines[0]);
+  assert.equal(fs.existsSync(path.join(local, "codex-companion")), false, "nothing is migrated or created");
+
+  const again = captureStderr(() => resolveFallbackStateRoot(options));
+  assert.equal(again.value, legacy);
+  assert.deepEqual(again.lines, [], "the notice is printed once per process");
+
+  const newRoot = path.join(local, "codex-companion", path.basename(legacy));
+  fs.mkdirSync(newRoot, { recursive: true });
+  const moved = captureStderr(() => resolveFallbackStateRoot(options));
+  assert.equal(moved.value, newRoot, "once the new root exists it wins");
+  assert.deepEqual(moved.lines, []);
 });

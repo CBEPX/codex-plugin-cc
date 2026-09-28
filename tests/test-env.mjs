@@ -1,3 +1,5 @@
+import { fileURLToPath } from "node:url";
+
 // Hermetic test environment: strip host-session variables that Claude Code /
 // the plugin's own SessionStart hook export, so tests see a clean machine.
 for (const name of [
@@ -14,4 +16,4 @@ for (const name of [
   delete process.env[name];
 }
 // Never read the host's real Codex model catalogue from tests.
-process.env.CODEX_COMPANION_MODEL_CATALOG = new URL("./fixtures/models-catalog.json", import.meta.url).pathname;
+process.env.CODEX_COMPANION_MODEL_CATALOG = fileURLToPath(new URL("./fixtures/models-catalog.json", import.meta.url));

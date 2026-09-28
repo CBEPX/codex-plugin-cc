@@ -2,22 +2,28 @@ import path from "node:path";
 import process from "node:process";
 import test from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import { spawnSync } from "node:child_process";
 
+import { IS_WIN, makeTempDir } from "./helpers.mjs";
 import {
+  buildLaunch,
   getProcessIdentity,
   processCommandLine,
+  quoteForCmd,
+  resolveExecutable,
   runCommand,
   terminateProcessTree,
-  terminateRecordedProcess
+  terminateRecordedProcess,
+  workerCommandLine
 } from "../plugins/codex/scripts/lib/process.mjs";
 
 test("terminateProcessTree uses taskkill on Windows", () => {
   let captured = null;
   const outcome = terminateProcessTree(1234, {
     platform: "win32",
-    runCommandImpl(command, args) {
-      captured = { command, args };
+    runCommandImpl(command, args, options) {
+      captured = { command, args, shell: options.shell };
       return {
         command,
         args,
@@ -33,9 +39,11 @@ test("terminateProcessTree uses taskkill on Windows", () => {
     }
   });
 
+  // Direct taskkill.exe, never through a shell: Git Bash's $SHELL mangles /PID.
   assert.deepEqual(captured, {
-    command: "taskkill",
-    args: ["/PID", "1234", "/T", "/F"]
+    command: "C:\\Windows\\System32\\taskkill.exe",
+    args: ["/PID", "1234", "/T", "/F"],
+    shell: false
   });
   assert.equal(outcome.delivered, true);
   assert.equal(outcome.method, "taskkill");
@@ -284,4 +292,111 @@ test("terminateRecordedProcess hands a verified pid to an injected terminateImpl
   });
   assert.deepEqual(terminated, [4242]);
   assert.deepEqual([outcome.attempted, outcome.delivered, outcome.reason], [true, true, "command-line-match"]);
+});
+
+// Windows spawning without $SHELL: where.exe resolves the real file, .cmd/.bat
+// shims go through cmd.exe with every argument escaped, .exe/.com run directly.
+test("resolveExecutable walks PATH x PATHEXT with fs, skips the extensionless shim and never the cwd", () => {
+  // A case-insensitive stand-in for the Windows file system.
+  const present = new Set(["c:\\tools.d\\codex", "c:\\npm\\codex", "c:\\npm\\codex.cmd", "c:\\bin\\codex.exe", "c:\\w\\codex.exe", "c:\\users\\项\\npm\\codex.cmd"]);
+  const existsSyncImpl = (candidate) => present.has(candidate.toLowerCase());
+  const env = { PATH: 'C:\\tools.d;.;"C:\\npm";C:\\bin', PATHEXT: ".COM;.EXE;.BAT;.CMD" };
+  assert.equal(resolveExecutable("codex", { env, cwd: "C:\\w", existsSyncImpl }), "C:\\npm\\codex.CMD");
+  // PATHEXT decides: without .CMD in it the .exe wins.
+  assert.equal(resolveExecutable("codex", { env: { ...env, PATHEXT: ".EXE" }, existsSyncImpl }), "C:\\bin\\codex.EXE");
+  // A non-ASCII install directory is a plain string here, not decoded console output.
+  assert.equal(resolveExecutable("codex", { env: { PATH: "C:\\Users\\项\\npm", PATHEXT: ".CMD" }, existsSyncImpl }), "C:\\Users\\项\\npm\\codex.CMD");
+  // "." and the cwd are never searched; PATHEXT entries we cannot launch (.JS) are ignored; a lowercase Path key works.
+  assert.equal(resolveExecutable("codex", { env: { PATH: ".;C:\\nowhere", PATHEXT: ".JS;.CMD" }, cwd: "C:\\w", existsSyncImpl }), null);
+  assert.equal(resolveExecutable("codex", { env: { Path: "C:\\bin", PATHEXT: ".EXE" }, existsSyncImpl }), "C:\\bin\\codex.EXE");
+  assert.equal(resolveExecutable("codex", { env: { PATH: "", PATHEXT: ".EXE" }, existsSyncImpl }), null);
+});
+
+test("quoteForCmd escapes every argument so cmd.exe and the shim's %* both pass it through", () => {
+  assert.throws(() => quoteForCmd("a\nb"), /line break/);
+  assert.throws(() => quoteForCmd("a\rb"), /line break/);
+  const table = [
+    ["plain", '^^^"plain^^^"'],
+    ["with space", '^^^"with^^^ space^^^"'],
+    ['q"uote', '^^^"q\\^^^"uote^^^"'],
+    ["", '^^^"^^^"'],
+    ["%PATH%", '^^^"^^^%PATH^^^%^^^"'],
+    ["a&b", '^^^"a^^^&b^^^"'],
+    ["trail\\", '^^^"trail\\\\^^^"']
+  ];
+  for (const [arg, expected] of table) {
+    assert.equal(quoteForCmd(arg), expected, JSON.stringify(arg));
+  }
+});
+
+test("buildLaunch runs .exe directly and .cmd through cmd.exe /d /s /c with verbatim arguments", () => {
+  assert.deepEqual(buildLaunch("C:\\bin\\codex.exe", ["a b"], {}), { file: "C:\\bin\\codex.exe", args: ["a b"], env: {}, windowsVerbatimArguments: false });
+  assert.deepEqual(buildLaunch("C:\\Program Files\\npm\\codex.cmd", ["app-server", "a&b"], { ComSpec: "C:\\Windows\\system32\\cmd.exe", Path: '.;tools;"C:\\npm";C:\\node' }), {
+    file: "C:\\Windows\\system32\\cmd.exe",
+    args: ["/d", "/s", "/v:off", "/c", '"C:\\Program^ Files\\npm\\codex.cmd ^^^"app-server^^^" ^^^"a^^^&b^^^""'],
+    // cmd.exe must not find the shim's bare `node` in the cwd or via a relative PATH entry.
+    env: { ComSpec: "C:\\Windows\\system32\\cmd.exe", Path: "C:\\npm;C:\\node", NoDefaultCurrentDirectoryInExePath: "1" },
+    windowsVerbatimArguments: true
+  });
+  assert.equal(buildLaunch("C:\\x\\run.BAT", [], {}).file, "C:\\Windows\\System32\\cmd.exe");
+  assert.equal(buildLaunch("C:\\x\\run.BAT", [], { SystemRoot: "D:\\Win" }).file, "D:\\Win\\System32\\cmd.exe");
+});
+
+test("runCommand on win32 resolves a bare name through PATH and launches the shim without a shell", () => {
+  const calls = [];
+  const spawnSyncImpl = (file, args, options) => {
+    calls.push({ file, args, options });
+    return { status: 0, stdout: "codex 1.0\n", stderr: "" };
+  };
+  const existsSyncImpl = (candidate) => candidate.toLowerCase() === "c:\\npm\\codex.cmd";
+  const result = runCommand("codex", ["--version"], { platform: "win32", env: { PATH: "C:\\npm", PATHEXT: ".EXE;.cmd" }, existsSyncImpl, spawnSyncImpl });
+  assert.deepEqual([result.command, result.args, result.stdout], ["codex", ["--version"], "codex 1.0\n"]);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].file, "C:\\Windows\\System32\\cmd.exe");
+  assert.deepEqual(calls[0].args, ["/d", "/s", "/v:off", "/c", '"C:\\npm\\codex.cmd ^^^"--version^^^""']);
+  assert.equal(calls[0].options.shell, false);
+  assert.equal(calls[0].options.windowsVerbatimArguments, true);
+  assert.equal(calls[0].options.env.NoDefaultCurrentDirectoryInExePath, "1");
+
+  // A path is launched as is; a bare name that resolves to nothing is ENOENT without any spawn.
+  calls.length = 0;
+  runCommand("C:\\Windows\\System32\\taskkill.exe", ["/PID", "1"], { platform: "win32", spawnSyncImpl });
+  runCommand("C:\\node\\node.exe", [], { platform: "win32", spawnSyncImpl });
+  assert.deepEqual(calls.map((call) => [call.file, call.options.shell, call.options.windowsVerbatimArguments]), [
+    ["C:\\Windows\\System32\\taskkill.exe", false, false],
+    ["C:\\node\\node.exe", false, false]
+  ]);
+  calls.length = 0;
+  const missing = runCommand("npm", [], { platform: "win32", env: { PATH: "C:\\npm" }, existsSyncImpl: () => false, spawnSyncImpl });
+  assert.equal(missing.error.code, "ENOENT");
+  assert.equal(missing.status, null);
+  // Nothing found: ENOENT is reported without any spawn (libuv would search the cwd).
+  assert.deepEqual(calls, []);
+});
+
+// Only CI runs this: a real cmd.exe parses the line, then the shim's %* re-parses it.
+test("runCommand round-trips awkward arguments through a .cmd shim in a directory with a space", { skip: !IS_WIN }, () => {
+  const dir = path.join(makeTempDir(), "shim dir");
+  fs.mkdirSync(dir);
+  fs.writeFileSync(path.join(dir, "argv.cjs"), "process.stdout.write(JSON.stringify(process.argv.slice(2)));\n");
+  fs.writeFileSync(path.join(dir, "argv-shim.cmd"), '@echo off\r\nnode "%~dp0argv.cjs" %*\r\n');
+  const args = ["plain", "with space", 'q"uote', "", "%PATH%", "a&b", "trail\\", "^caret", "!bang!", "C:\\Program Files (x86)\\x"];
+  const env = { ...process.env, PATH: `${dir};${process.env.PATH}` };
+  // A `node.cmd` planted in the cwd, or under a relative PATH entry, must not be
+  // what the shim's bare `node` resolves to.
+  const repo = makeTempDir();
+  fs.mkdirSync(path.join(repo, "tools"));
+  for (const planted of ["node.cmd", path.join("tools", "node.cmd")]) {
+    fs.writeFileSync(path.join(repo, planted), "@echo off\r\necho HIJACKED\r\n");
+  }
+  const result = runCommand("argv-shim", args, { env: { ...env, PATH: `.;tools;${env.PATH}` }, cwd: repo });
+  assert.equal(result.error, null);
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(JSON.parse(result.stdout), args);
+});
+
+test("workerCommandLine matches the job id literally", () => {
+  assert.ok(workerCommandLine("task-a.b").test("node companion.mjs task-worker --job-id task-a.b"));
+  assert.equal(workerCommandLine("task-a.b").test("node companion.mjs task-worker --job-id task-aXb"), false);
+  assert.equal(workerCommandLine("task-a+").test("node companion.mjs task-worker --job-id task-aaa"), false);
 });

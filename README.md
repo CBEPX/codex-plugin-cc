@@ -7,8 +7,6 @@ Use Codex from inside Claude Code for code reviews or to delegate tasks to Codex
 This plugin is for Claude Code users who want an easy way to start using Codex from the workflow
 they already have.
 
-<video src="./docs/plugin-demo.webm" controls muted playsinline autoplay></video>
-
 ## What You Get
 
 - `/codex:review` for a normal read-only Codex review
@@ -165,12 +163,22 @@ Ask Codex to redesign the database connection to be more resilient.
 - model aliases resolve against the local Codex model catalogue (`$CODEX_HOME/models_cache.json`, else `codex debug models --bundled`): an alias picks the listed model whose slug ends in `-<alias>`, lowest priority number first, newest family on ties; today `sol` -> `gpt-6-sol`, `astra` -> `gpt-6-astra`, `luna` -> `gpt-6-luna`, `terra` -> `gpt-5.6-terra`, `spark` -> `gpt-5.3-codex-spark`, `mini` -> `gpt-5.4-mini`; run `codex debug models` to see yours. An exact model slug passes through unchanged, and when the model is in the catalogue `--effort` is checked against the reasoning levels it lists
 - `--config key=value` (repeatable, also on `/codex:review` and `/codex:adversarial-review`) forwards a `config.toml` override to the Codex thread, e.g. `--config model_provider=ollama`. On `--resume-last` the plugin opens a fresh app-server session (cold resume) so `--config` overrides, sandbox and approval policy take effect; model and effort for the resumed turn are sent on the turn, never on the resume request. In a `--background`/`--await` job record the config **keys** are recorded and the **values** are never stored (they read back as `[redacted]` in `status`/`result`): the real values live only in the job's private 0600 `jobs/<id>.request.json`, which the worker consumes and deletes.
 - follow-up rescue requests can continue the latest Codex task in the repo
-- under the hood, `/codex:rescue` and the `codex-rescue` agent are each a single `scripts/codex-companion.mjs task --await --prompt-stdin <flags>` call: `--await [--await-timeout-ms <ms>]` launches the same tracked background job as `--background`, then waits for it (default 540000 ms), and `--prompt-stdin` reads the prompt as stdin verbatim (so it cannot be combined with `--args-stdin`, `--prompt-file`, or prompt text on the command line). Exit code is 0 when the job completed, 1 when it failed or was cancelled, and 3 when the wait times out while the job is still queued or running — exit 3 prints a `Re-run: node "<abs>" result <id> --wait --timeout-ms 540000` hint, which is the only follow-up call the rescue flow makes.
+- under the hood, `/codex:rescue` and the `codex-rescue` agent are each a single `scripts/codex-companion.mjs task --await --prompt-stdin <flags>` call: `--await [--await-timeout-ms <ms>]` launches the same tracked background job as `--background`, then waits for it (default 540000 ms), and `--prompt-stdin` reads the prompt as stdin verbatim (so it cannot be combined with `--args-stdin`, `--prompt-file`, or prompt text on the command line). Exit code is 0 when the job completed, 1 when it failed or was cancelled, and 3 when the wait times out while the job is still queued or running — exit 3 prints a `Re-run: node "<abs>" result <id> --wait --timeout-ms 540000` hint, which is the only follow-up call the rescue flow makes. With `--args-stdin` (and a single-string `$ARGUMENTS`), a backslash escapes only a following quote, backslash or whitespace and stays literal before anything else, so `C:\Users\me` survives but `\\server\share` becomes `\server\share`; use `--prompt-stdin` for byte-exact text.
 - `result <id> [--wait [--timeout-ms <ms>]]` answers a different question, so it has its own contract: `result` exits 0 for any terminal record (completed, failed or cancelled) and 3 while the job is still active. Its exit code means "a result was retrieved", not "the job succeeded" — unlike `task --await` it never returns 1 for a failed job, so read the rendered record for the outcome. A plain `result <id>` on a still-running job prints the same `--wait` hint and exits 3 instead of failing (fixes upstream #498/#524, which reported "No job found" for a running job). `--json` on either returns `{ job, storedJob }` (or, on a timeout, the `status --json` snapshot plus a `resumeCommand` field).
 - The detached worker outlives the companion only when the companion returns on its own (exit 3); a host process-tree kill — e.g. Claude Code's Bash timeout — also kills the worker, so keep `--await-timeout-ms` below the host limit (default 540000 < 600000).
 - `--turn-timeout-ms <ms>` (or `CODEX_TURN_TIMEOUT_MS`, also on `/codex:review` and `/codex:adversarial-review`) bounds a single Codex turn: on expiry it interrupts the turn and returns a structured failed result ("turn timed out after `<ms>` ms") instead of hanging. Default is `0` (unbounded). The budget travels with a `--background`/`--await` job, so a detached worker enforces it too. The interrupt is not trusted on its own: the run waits up to 10 s for the turn's terminal notification, and if none arrives the failure says so ("interrupt not acknowledged — the turn may still be running in the shared runtime, check status or cancel"), because a shared broker runtime can keep executing a turn nobody is listening to any more. A run that owns its own app-server (a cold `--resume-last`) closes it in that case, which does stop the turn (stdin EOF, then `SIGTERM`, then `SIGKILL`, so the close is bounded too). Partial output on a timed-out turn is best-effort: only whole items Codex had already completed are kept, so a turn interrupted mid-message reports less text than Codex had produced.
 - the `SessionEnd` hook works to one absolute budget (`SESSION_END_BUDGET_MS`, 12 s; `CODEX_COMPANION_SESSION_END_BUDGET_MS` can only *shorten* it — a larger value is ignored with a note, since the hook timeout is fixed), and every bounded step inside it — the workspace state lock, each broker handshake, the busy retries, the teardown probe — is clamped to what is left of that budget. `hooks/hooks.json` gives `SessionEnd` a 15 s timeout, which must stay **above** the budget: below it Claude Code would kill the hook mid-decision instead of letting it report one. A test asserts the pair, so the two numbers cannot drift apart.
 - if a background job's session ends while `CODEX_COMPANION_BROKER_IDLE_TIMEOUT_MS=0`, the shared broker that keeps running for that job never self-terminates on its own — its normal idle exit is disabled in that configuration, so the broker only goes away once the job finishes (or is reaped as dead) and a later `SessionEnd` runs.
+- the `SessionEnd` broker teardown line (`[codex] Broker teardown: ... reason=<reason>`) names one of:
+
+  | reason | meaning |
+  | --- | --- |
+  | `no-pid` | no broker pid was recorded; nothing to signal |
+  | `identity-match` | the pid was proven to be this broker by its recorded identity, so the signal was attempted (`signalled` says whether it landed) |
+  | `command-line-match` | a record without an identity was proven by its command line, so the signal was attempted |
+  | `identity-mismatch` | the pid is no longer provably ours (another process, or a command line that did not match or could not be read); left alone |
+  | `identity-unavailable` | the identity could not be read (e.g. on Windows); left alone |
+  | `kill-failed` | the ownership probe or the kill threw; the broker may still be running |
 
 ### `/codex:transfer`
 
@@ -185,7 +193,7 @@ Examples:
 /codex:transfer --source ~/.claude/projects/-Users-me-repo/<session-id>.jsonl
 ```
 
-The plugin's existing `SessionStart` hook supplies the current transcript path automatically; `--source` is available as a manual override. The transfer uses Codex's external-agent session importer, so it follows the same conversion rules as importing Claude history in the Codex App and creates visible turns that can be continued in the App or TUI. The source must be under `~/.claude/projects`, and older Codex versions that do not expose session import must be upgraded before using this command. The transcript root honours `CLAUDE_CONFIG_DIR` when set, resolving to `<CLAUDE_CONFIG_DIR>/projects` instead of `~/.claude/projects`.
+The plugin's existing `SessionStart` hook supplies the current transcript path automatically; `--source` is available as a manual override. The transfer uses Codex's external-agent session importer, so it follows the same conversion rules as importing Claude history in the Codex App and creates visible turns that can be continued in the App or TUI. The source must be under `~/.claude/projects` (`$CLAUDE_CONFIG_DIR/projects` when `CLAUDE_CONFIG_DIR` is set), and older Codex versions that do not expose session import must be upgraded before using this command.
 
 ### `/codex:status`
 
@@ -247,7 +255,7 @@ You can also use `/codex:setup` to manage the optional review gate.
 /codex:setup --disable-review-gate
 ```
 
-When the review gate is enabled, the plugin uses a `Stop` hook to run a targeted Codex review based on Claude's response. If that review finds issues, the stop is blocked so Claude can address them first. When the review itself fails (timeout, killed by a signal, invalid output), the block reason says why and ends with `Disable with /codex:setup --disable-review-gate.`
+When the review gate is enabled, the plugin uses a `Stop` hook to run a targeted Codex review based on Claude's response. If that review finds issues, the stop is blocked so Claude can address them first. When the review itself fails (timeout, killed by a signal, invalid output), the block reason says why and ends with `Disable with /codex:setup --disable-review-gate.` The hooks read their input from stdin against a deadline (1 s for `SessionEnd`, before its budget starts; 5 s for `SessionStart`; 2 s for `Stop`), so a disabled gate never waits on a stdin Claude Code leaves open, while an enabled gate blocks when the input never arrives. With the gate on and a host that never closes stdin or never sends the input, every stop is blocked; run `/codex:setup --disable-review-gate` to get out.
 
 To pin the model and reasoning effort the gate's review uses, independently of your Codex config:
 
@@ -378,4 +386,34 @@ If you need to point the built-in OpenAI provider at a different endpoint, set `
 
 ### Windows
 
-As of v1.3.0, kills issued from stored process records (`/codex:cancel`, `SessionEnd` cleanup, stale-broker replacement, broker teardown) are refused on Windows until process identity lands in v1.4.0. This bounds any leak by the broker idle timeout, and a turn interrupt is still sent regardless — it just cannot be followed by a forced kill on that platform yet.
+As of v1.4.0, the plugin no longer spawns commands through `$SHELL` on Windows (usually Git Bash, which mangled `taskkill` and other arguments): `codex`, `npm` and `git` are resolved with `where.exe`, `.exe` files run directly and `.cmd` shims run through `cmd.exe`. This is the spawn path behind the commands, `/codex:review`, `/codex:adversarial-review` and background `task`/`--await` jobs. Separately, the `Stop`, `SessionStart` and `SessionEnd` hooks now read stdin with a bounded deadline instead of a blocking read, so a disabled review gate no longer hangs until the hook timeout on Windows. `/codex:transfer`'s own Windows-specific issues (verbatim `\\?\` paths, ledger lookups) are unrelated to this change and are not fixed in v1.4.0.
+
+Still limited until v1.4.1: kills issued from stored process records — `/codex:cancel`, `SessionEnd` cleanup of a still-running job, stale-broker replacement, and broker teardown — refuse to signal a stored pid (reason `identity-unavailable`) because process identity verification has not landed yet; that is now targeted for v1.4.1, not v1.4.0. `/codex:cancel` still sends the turn interrupt on a best-effort basis; `SessionEnd` only refuses. A worker or broker left behind exits when its turn ends and, for the broker, once every client has disconnected and its idle timeout elapses — an unbounded turn is not reaped on Windows until v1.4.1.
+
+Requirements: `where.exe` and `cmd.exe` ship with Windows, so nothing extra needs installing for them, and PowerShell is not required in v1.4.0. `codex` and `npm` must be on the Windows `PATH` as `.cmd`/`.exe` (a global `npm install -g @openai/codex` already does that for `codex`); a `codex` or `npm` that only exists inside Git Bash (an alias, a shell function or a bash-only `PATH` entry) is no longer found.
+
+When `CLAUDE_PLUGIN_DATA` is not set, job state falls back to a per-user directory: `%LOCALAPPDATA%\codex-companion` on Windows as of v1.4.0 (a private `codex-companion-<uid>` directory under the system temp directory elsewhere). If a pre-1.4.0 state root under `%TEMP%\codex-companion-user` already exists, it keeps being used (with a one-line notice) until you remove it; nothing is migrated. On Windows, `state.json` reads and writes and lock-ticket reads also retry briefly (up to 20 attempts, roughly 300 ms worst case) on `EPERM`/`EBUSY`/`EACCES` when another process holds `state.json` or a lock ticket open.
+
+## Development
+
+The plugin runtime supports Node.js 18.18 or later; the development tooling below
+(eslint, c8, Stryker) needs Node.js 24. `npm run build` also needs the `codex` CLI
+on `PATH`, because it generates the app-server protocol types first.
+
+- `npm run check` — the full local gate: version metadata, changelog, lint,
+  typecheck (`npm run build`), typecheck of tests and scripts, and the test suite.
+- `npm run setup:git-hooks` — points git at `.githooks/` (pre-commit runs lint and
+  typecheck). The setting lives in the shared `.git/config`, so it applies to the
+  main checkout and every worktree and replaces any `.git/hooks/*`; typecheck runs
+  `prebuild`, so committing needs the `codex` CLI on `PATH`.
+- `npm run test:coverage` — runs the suite under c8 and writes
+  `reports/coverage/`; thresholds live in `.c8rc.json` (long-term target:
+  85% lines, 75% branches, 90% functions).
+- `npm run test:mutation:critical` — Stryker over `args.mjs` and
+  `model-catalog.mjs`, reports in `reports/mutation/` (also runs weekly in CI).
+
+Coverage includes the companion, broker and hook subprocesses that tests spawn,
+because c8 passes `NODE_V8_COVERAGE` to child processes. It has limits: a child
+killed with SIGKILL or `taskkill /F` leaves no coverage dump, a detached broker or
+worker may exit after the report is written, and Windows-only branches are not
+measured on the ubuntu CI job.

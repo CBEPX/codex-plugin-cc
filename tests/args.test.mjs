@@ -46,7 +46,7 @@ test("task --help prints usage and does not dispatch a Codex thread", () => {
   initGitRepo(repo);
   fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
 
-  const result = run("node", [SCRIPT, "task", "--help", "--cwd", repo, "--json"], {
+  const result = run(process.execPath, [SCRIPT, "task", "--help", "--cwd", repo, "--json"], {
     cwd: repo,
     env: buildEnv(binDir)
   });
@@ -70,7 +70,7 @@ test("task unknown --flag errors without dispatching a Codex thread", () => {
   initGitRepo(repo);
   fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
 
-  const result = run("node", [SCRIPT, "task", "--not-a-real-flag", "--cwd", repo], {
+  const result = run(process.execPath, [SCRIPT, "task", "--not-a-real-flag", "--cwd", repo], {
     cwd: repo,
     env: buildEnv(binDir)
   });
@@ -123,4 +123,15 @@ test("splitRawArgumentString groups quoted runs and keeps quoted newlines inside
   assert.deepEqual(splitRawArgumentString("--config 'a b=c d' \"e f\""), ["--config", "a b=c d", "e f"]);
   assert.deepEqual(splitRawArgumentString("'line one\nline two'"), ["line one\nline two"]);
   assert.deepEqual(splitRawArgumentString("--all\n--json"), ["--all", "--json"]);
+});
+
+test("splitRawArgumentString keeps a backslash that escapes nothing (Windows paths)", () => {
+  assert.deepEqual(splitRawArgumentString("investigate C:\\Users\\me\\proj\\file.mjs"), ["investigate", "C:\\Users\\me\\proj\\file.mjs"]);
+  assert.deepEqual(splitRawArgumentString("'C:\\dir\\x' \"D:\\y\""), ["C:\\dir\\x", "D:\\y"]);
+});
+
+test("splitRawArgumentString keeps the old escape semantics for quotes, backslash and whitespace", () => {
+  assert.deepEqual(splitRawArgumentString("say \\\"q\\\" a\\ b back\\\\slash it\\'s"), ["say", "\"q\"", "a b", "back\\slash", "it's"]);
+  assert.deepEqual(splitRawArgumentString("'it\\'s'"), ["it's"]); // old behaviour, kept
+  assert.deepEqual(splitRawArgumentString("\\\\server\\share"), ["\\server\\share"]); // documented limitation
 });

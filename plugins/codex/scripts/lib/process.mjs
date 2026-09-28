@@ -1,11 +1,109 @@
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
+import path from "node:path";
 import process from "node:process";
 
+// Windows has no $SHELL to lean on: Git Bash (the usual one on CI) mangles
+// `taskkill /PID` and other Windows-style arguments. So on win32 nothing runs
+// through a shell — a bare name is resolved with where.exe, .exe/.com run directly, and
+// .cmd/.bat shims run under cmd.exe with every argument escaped for it.
+const LAUNCHABLE = /\.(com|exe|bat|cmd)$/i;
+// In-box tools by absolute path: libuv searches the child's cwd before PATH, so a
+// bare "where.exe" would run a same-named file planted in the reviewed repo.
+export function systemExe(name, env = process.env) {
+  return path.win32.join(env?.SystemRoot || env?.SYSTEMROOT || "C:\\Windows", "System32", name);
+}
+// cmd.exe metacharacters, escaped with ^ (cross-spawn's set).
+const CMD_META = /([()\][%!^"`<>&|;, *?])/g;
+
+// First PATH directory holding `<command><ext>` for a PATHEXT extension we can
+// launch (.com/.exe/.bat/.cmd), or null. Done with fs rather than where.exe: no
+// child process, no guessing the console code page of its output (a non-ASCII
+// install path must survive), and never the current directory — a repo must not
+// plant a codex.cmd, so relative PATH entries are skipped as well. An
+// extensionless file (npm's bash shim next to codex.cmd) is never a hit.
+// PATH as absolute directories only: relative entries (".", "tools") would be
+// resolved against the cwd, i.e. the reviewed repo. Returns the env key that
+// carried it (win32 env keys are case-insensitive; injected objects are not).
+export function absolutePathEntries(env) {
+  const key = Object.keys(env ?? {}).find((name) => name.toUpperCase() === "PATH") ?? "PATH";
+  const dirs = String(env?.[key] ?? "")
+    .split(";")
+    .map((dir) => dir.trim().replace(/^"(.*)"$/, "$1"))
+    .filter((dir) => dir && path.win32.isAbsolute(dir));
+  return { key, dirs };
+}
+
+export function resolveExecutable(command, options = {}) {
+  const env = options.env ?? process.env;
+  const exists = options.existsSyncImpl ?? fs.existsSync;
+  const extensions = String(env.PATHEXT ?? env.Pathext ?? ".COM;.EXE;.BAT;.CMD").split(";").filter((ext) => LAUNCHABLE.test(ext));
+  const { dirs } = absolutePathEntries(env);
+  for (const dir of dirs) {
+    for (const ext of extensions) {
+      const candidate = path.win32.join(dir, command + ext);
+      if (exists(candidate)) {
+        return candidate;
+      }
+    }
+  }
+  return null;
+}
+
+// One argument for a cmd.exe line that a .cmd shim forwards with %*: CRT
+// quoting for the final program, then every metacharacter caret-escaped twice —
+// once for `cmd /c`, once for the shim's own parse of %*. Escaped quotes never
+// open a quoted region, so `a&b` and `%PATH%` stay literal.
+// A line break cannot be escaped at all (cmd.exe stops reading at it), so it is
+// refused instead of silently dropping the rest of the arguments.
+// ponytail: assumes the .cmd forwards %* (npm shims do); one that reads %1 itself sees carets.
+// ponytail: `%VAR:a=b%` substitution still expands (cmd has no escape for it in
+// command-line mode); every caller passes fixed literals, revisit if user text ever lands here.
+export function quoteForCmd(arg) {
+  if (/[\r\n]/.test(String(arg))) {
+    throw new TypeError("cmd.exe cannot carry a line break in an argument");
+  }
+  const quoted = `"${String(arg)
+    .replace(/(?=(\\+?)?)\1"/g, '$1$1\\"')
+    .replace(/(?=(\\+?)?)\1$/, "$1$1")}"`;
+  return quoted.replace(CMD_META, "^$1").replace(CMD_META, "^$1");
+}
+
+export function buildLaunch(file, args, env = process.env) {
+  if (!/\.(bat|cmd)$/i.test(file)) {
+    return { file, args, env, windowsVerbatimArguments: false };
+  }
+  const { key, dirs } = absolutePathEntries(env);
+  const line = [file.replace(CMD_META, "^$1"), ...args.map(quoteForCmd)].join(" ");
+  return {
+    file: env?.ComSpec || systemExe("cmd.exe", env),
+    args: ["/d", "/s", "/v:off", "/c", `"${line}"`],
+    // The shim itself runs a bare `node`, which cmd.exe would look up in the
+    // cwd (the reviewed repo) before PATH; the flag turns that off and the
+    // shim sees only the absolute PATH entries the resolver used.
+    env: { ...env, [key]: dirs.join(";"), NoDefaultCurrentDirectoryInExePath: "1" },
+    windowsVerbatimArguments: true
+  };
+}
+
+// Shaped like spawnSync's own ENOENT so binaryAvailable() reads it as "not found".
+export function notFound(command) {
+  return Object.assign(new Error(`spawn ${command} ENOENT`), { code: "ENOENT", errno: -4058, syscall: `spawn ${command}`, path: command });
+}
+
 export function runCommand(command, args = [], options = {}) {
-  const result = spawnSync(command, args, {
+  const windows = (options.platform ?? process.platform) === "win32";
+  // win32: a path is used as is, a bare name goes through where.exe. Nothing
+  // found is reported as ENOENT without spawning: libuv would otherwise search
+  // the cwd (the reviewed repo) for a same-named .exe.
+  const target = !windows || /[\\/]/.test(command) ? command : resolveExecutable(command, options);
+  if (target === null) {
+    return { command, args, status: null, signal: null, stdout: "", stderr: "", error: notFound(command) };
+  }
+  const launch = windows ? buildLaunch(target, args, options.env) : { file: command, args, env: options.env };
+  const result = (options.spawnSyncImpl ?? spawnSync)(launch.file, launch.args, {
     cwd: options.cwd,
-    env: options.env,
+    env: launch.env,
     encoding: "utf8",
     input: options.input,
     maxBuffer: options.maxBuffer,
@@ -13,7 +111,8 @@ export function runCommand(command, args = [], options = {}) {
     // spawnSync throws on a fractional timeout and reads 0 as "no timeout":
     // whatever budget arithmetic a caller did, a bound stays a bound.
     timeout: Number.isFinite(options.timeoutMs) ? Math.max(1, Math.floor(options.timeoutMs)) : undefined,
-    shell: options.shell ?? (process.platform === "win32" ? (process.env.SHELL || true) : false),
+    shell: windows ? false : (options.shell ?? false),
+    windowsVerbatimArguments: launch.windowsVerbatimArguments,
     windowsHide: true
   });
 
@@ -162,10 +261,10 @@ export function getProcessIdentity(pid, options = {}) {
 }
 
 // What a background worker's command line looks like — the check a record
-// without an identity (v1.2.x) falls back to. Job ids are generated
-// `<prefix>-<base36>-<base36>`, so they need no escaping.
+// without an identity (v1.2.x) falls back to. The id is matched literally.
 export function workerCommandLine(jobId) {
-  return new RegExp(`task-worker.*--job-id ${jobId}(\\s|$)`);
+  const escaped = String(jobId).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`task-worker.*--job-id ${escaped}(\\s|$)`);
 }
 
 // Signals a recorded PID only once it is proven to still be the recorded
@@ -248,9 +347,10 @@ export function terminateProcessTree(pid, options = {}) {
   const killImpl = options.killImpl ?? process.kill.bind(process);
 
   if (platform === "win32") {
-    const result = runCommandImpl("taskkill", ["/PID", String(pid), "/T", "/F"], {
+    const result = runCommandImpl(systemExe("taskkill.exe", options.env), ["/PID", String(pid), "/T", "/F"], {
       cwd: options.cwd,
-      env: options.env
+      env: options.env,
+      shell: false
     });
 
     if (!result.error && result.status === 0) {
