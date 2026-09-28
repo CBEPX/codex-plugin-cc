@@ -3,7 +3,6 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { PassThrough, Readable } from "node:stream";
 
-import { IS_WIN } from "./helpers.mjs";
 import { readHookInput } from "../plugins/codex/scripts/lib/hook-input.mjs";
 
 // Feeds a child's readStdinIfPiped() two writes `gapMs` apart, then EOF. A spawned
@@ -111,9 +110,18 @@ test("an error while destroying stdin after the read does not crash the process"
   await new Promise((resolve) => setTimeout(resolve, 20));
 });
 
+// The refusal is not raced against a real writer (a loaded runner stretches the
+// retry budget past any gap): the child's readSync throws EAGAIN forever.
+function readWithEndlessEagain() {
+  const fsLib = new URL("../plugins/codex/scripts/lib/fs.mjs", import.meta.url).href;
+  const code = `import("node:fs").then((fs) => { let calls = 0; const orig = fs.default.readSync; fs.default.readSync = (fd, ...rest) => { if (fd !== 0) return orig(fd, ...rest); calls += 1; throw Object.assign(new Error("EAGAIN"), { code: "EAGAIN" }); }; return import(${JSON.stringify(fsLib)}).then((m) => { try { process.stdout.write("OK " + m.readStdinIfPiped()); } catch (e) { process.stdout.write("ERR " + e.message + " after " + calls); } }); });`;
+  const child = spawn(process.execPath, ["-e", code], { stdio: ["pipe", "pipe", "inherit"], windowsHide: true });
+  let out = "";
+  child.stdout.on("data", (chunk) => (out += chunk));
+  return new Promise((resolve) => child.on("close", () => resolve(out)));
+}
+
 test("readStdinIfPiped keeps bytes across EAGAIN and refuses a partial read once retries run out", async () => {
   assert.equal(await readPipedWithGap(100), "OK part1-part2");
-  if (!IS_WIN) {
-    assert.match(await readPipedWithGap(2500), /^ERR stdin stayed unreadable \(EAGAIN\)/);
-  }
+  assert.match(await readWithEndlessEagain(), /^ERR stdin stayed unreadable \(EAGAIN\).* after 51$/);
 });

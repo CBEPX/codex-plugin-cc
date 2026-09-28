@@ -2963,7 +2963,10 @@ test("commands lazily start and reuse one shared app-server after first use", as
   run("git", ["commit", "-m", "init"], { cwd: repo });
   fs.writeFileSync(path.join(repo, "README.md"), "hello again\n");
 
-  const env = buildEnv(binDir);
+  // The broker must outlive the gap between the two CLI runs: on a slow runner
+  // spawning the second command alone can take several seconds.
+  const idleMs = 15000;
+  const env = buildEnv(binDir, { CODEX_COMPANION_BROKER_IDLE_TIMEOUT_MS: String(idleMs) });
 
   const review = run(process.execPath, [SCRIPT, "review"], {
     cwd: repo,
@@ -2987,7 +2990,7 @@ test("commands lazily start and reuse one shared app-server after first use", as
 
   const brokerPid = brokerSession.pid;
   assert.ok(brokerPid > 0);
-  const deadline = Date.now() + 12000;
+  const deadline = Date.now() + idleMs + 10000;
   let alive = true;
   while (alive && Date.now() < deadline) {
     try {
@@ -2997,7 +3000,7 @@ test("commands lazily start and reuse one shared app-server after first use", as
       alive = false;
     }
   }
-  assert.equal(alive, false, `broker ${brokerPid} should exit within the 5 s test idle timeout`);
+  assert.equal(alive, false, `broker ${brokerPid} should exit within the ${idleMs} ms test idle timeout`);
 
   const cleanup = run(process.execPath, [SESSION_HOOK, "SessionEnd"], {
     cwd: repo,
