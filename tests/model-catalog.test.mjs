@@ -4,7 +4,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
 import { makeTempDir } from "./helpers.mjs";
-import { loadModelCatalog, resolveModelAlias, supportedEfforts } from "../plugins/codex/scripts/lib/model-catalog.mjs";
+import { FALLBACK_ALIASES, loadModelCatalog, resolveModelAlias, supportedEfforts } from "../plugins/codex/scripts/lib/model-catalog.mjs";
 
 const FIXTURE = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures", "models-catalog.json");
 const catalog = loadModelCatalog({ env: { CODEX_COMPANION_MODEL_CATALOG: FIXTURE } });
@@ -14,6 +14,12 @@ test("family alias resolves to the listed model with the lowest priority, newest
   assert.equal(resolveModelAlias("terra", catalog), "gpt-5.6-terra");
   assert.equal(resolveModelAlias("astra", catalog), "gpt-6-astra");
   assert.equal(resolveModelAlias("SOL", catalog), "gpt-6-sol");
+});
+
+test("a catalogue-only alias resolves from the catalogue, newest family on a priority tie", () => {
+  assert.equal(FALLBACK_ALIASES.has("nova"), false);
+  assert.equal(resolveModelAlias("nova", catalog), "gpt-7-nova");
+  assert.equal(resolveModelAlias("nova", []), "nova", "without the catalogue it passes through");
 });
 
 test("hidden models never resolve from an alias and exact slugs pass through", () => {

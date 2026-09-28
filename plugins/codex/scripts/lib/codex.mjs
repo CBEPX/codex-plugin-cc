@@ -273,6 +273,9 @@ function labelForThread(state, threadId) {
   return state.threadLabels.get(threadId) ?? threadId;
 }
 
+// Any thread announced on this connection is taken as part of this turn's tree
+// (`thread/started` is applied unconditionally). That holds because the broker is
+// single-tenant: it serves one client's turn at a time and answers others `busy`.
 function registerThread(state, threadId, options = {}) {
   if (!threadId) {
     return;

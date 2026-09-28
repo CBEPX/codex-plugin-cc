@@ -38,14 +38,19 @@ function logNote(message) {
 }
 
 // Cap on how many consecutive gate-induced rounds run in one session.
-// Unset or invalid → DEFAULT_MAX_ROUNDS; an explicit 0 keeps the rounds unbounded.
+// Unset → DEFAULT_MAX_ROUNDS; an explicit 0 keeps the rounds unbounded; anything
+// but a non-negative integer (0.5, 0x10, -1) → DEFAULT_MAX_ROUNDS with a warning.
 function getMaxRounds() {
   const raw = process.env.CODEX_REVIEW_GATE_MAX_ROUNDS;
   if (raw == null || raw === "") {
     return DEFAULT_MAX_ROUNDS;
   }
-  const parsed = Number.parseInt(raw, 10);
-  return Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_MAX_ROUNDS;
+  const parsed = /^\s*\d+\s*$/.test(raw) ? Number(raw) : Number.NaN;
+  if (Number.isInteger(parsed) && parsed >= 0) {
+    return parsed;
+  }
+  logNote(`Ignoring CODEX_REVIEW_GATE_MAX_ROUNDS=${JSON.stringify(raw)}: not a non-negative integer; using ${DEFAULT_MAX_ROUNDS}.`);
+  return DEFAULT_MAX_ROUNDS;
 }
 
 function gateSessionId(input) {

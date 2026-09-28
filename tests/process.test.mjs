@@ -14,7 +14,8 @@ import {
   resolveExecutable,
   runCommand,
   terminateProcessTree,
-  terminateRecordedProcess
+  terminateRecordedProcess,
+  workerCommandLine
 } from "../plugins/codex/scripts/lib/process.mjs";
 
 test("terminateProcessTree uses taskkill on Windows", () => {
@@ -386,4 +387,10 @@ test("runCommand round-trips awkward arguments through a .cmd shim in a director
   assert.equal(result.error, null);
   assert.equal(result.status, 0, result.stderr);
   assert.deepEqual(JSON.parse(result.stdout), args);
+});
+
+test("workerCommandLine matches the job id literally", () => {
+  assert.ok(workerCommandLine("task-a.b").test("node companion.mjs task-worker --job-id task-a.b"));
+  assert.equal(workerCommandLine("task-a.b").test("node companion.mjs task-worker --job-id task-aXb"), false);
+  assert.equal(workerCommandLine("task-a+").test("node companion.mjs task-worker --job-id task-aaa"), false);
 });

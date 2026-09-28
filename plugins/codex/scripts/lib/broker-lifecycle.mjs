@@ -336,6 +336,9 @@ export function ownsBrokerProcess(pid, endpoint, timeoutMs, commandLine = proces
 // PID whose identity (or, for a record without one, command line) no longer
 // matches this broker is deliberately left alone (#743), and a caller that
 // wonders why a broker outlived its teardown needs to know which it was.
+// `reason` is one of: `no-pid` (nothing to signal), `identity-match` /
+// `command-line-match` (proven ours and signalled), `identity-mismatch`,
+// `identity-unavailable` (refused), `kill-failed` (the probe or kill threw).
 export function teardownBrokerSession({ endpoint = null, pidFile, logFile, sessionDir = null, pid = null, pidIdentity = null, killProcess = null, timeoutMs = undefined, ownsProcess = ownsBrokerProcess }) {
   let signalled = false;
   let reason = "no-pid";

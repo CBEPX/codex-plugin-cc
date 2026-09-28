@@ -231,10 +231,10 @@ export function getProcessIdentity(pid, options = {}) {
 }
 
 // What a background worker's command line looks like — the check a record
-// without an identity (v1.2.x) falls back to. Job ids are generated
-// `<prefix>-<base36>-<base36>`, so they need no escaping.
+// without an identity (v1.2.x) falls back to. The id is matched literally.
 export function workerCommandLine(jobId) {
-  return new RegExp(`task-worker.*--job-id ${jobId}(\\s|$)`);
+  const escaped = String(jobId).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`task-worker.*--job-id ${escaped}(\\s|$)`);
 }
 
 // Signals a recorded PID only once it is proven to still be the recorded

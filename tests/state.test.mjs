@@ -874,7 +874,16 @@ test("fallback state root refuses a pre-existing world-accessible directory", { 
   const tmp = makeTempDir();
   const shared = path.join(tmp, `codex-companion-${process.getuid()}`);
   fs.mkdirSync(shared, { mode: 0o755 });
+  fs.chmodSync(shared, 0o755); // mkdir's mode is masked by the umask
   assert.throws(() => resolveFallbackStateRoot({ env: {}, tmpdir: tmp, pluginRoot: makeTempDir() }), /Refusing to use shared state directory/);
+});
+
+test("fallback state root refuses a user directory owned by another uid", { skip: process.platform === "win32" }, () => {
+  const tmp = makeTempDir();
+  assert.throws(
+    () => resolveFallbackStateRoot({ env: {}, tmpdir: tmp, uid: process.getuid() + 1, pluginRoot: makeTempDir() }),
+    /Refusing to use shared state directory/
+  );
 });
 
 test("fallback state root refuses a symlinked user directory", { skip: process.platform === "win32" }, () => {

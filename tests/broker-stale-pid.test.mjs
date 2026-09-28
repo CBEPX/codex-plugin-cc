@@ -1124,10 +1124,10 @@ test("SessionEnd leaves a recorded broker pid alone when its identity no longer 
   clearBrokerSession(workspace);
 });
 
-// A broker this call just spawned that never becomes ready is killed through the
-// child handle: its pid cannot have been recycled while the handle says it has
-// not exited, so no identity is consulted.
-test("ensureBrokerSession kills a fresh broker that never becomes ready", async () => {
+// A broker this call just spawned that never becomes ready is killed as a process
+// group: its pid cannot have been recycled while the child handle says it has not
+// exited, so no identity is consulted. The handle's own kill is only the fallback.
+test("ensureBrokerSession kills a fresh broker that never becomes ready as a process group", async () => {
   const binDir = makeTempDir();
   installFakeCodex(binDir);
   const workspace = makeTempDir();

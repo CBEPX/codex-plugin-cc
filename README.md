@@ -171,6 +171,16 @@ Ask Codex to redesign the database connection to be more resilient.
 - `--turn-timeout-ms <ms>` (or `CODEX_TURN_TIMEOUT_MS`, also on `/codex:review` and `/codex:adversarial-review`) bounds a single Codex turn: on expiry it interrupts the turn and returns a structured failed result ("turn timed out after `<ms>` ms") instead of hanging. Default is `0` (unbounded). The budget travels with a `--background`/`--await` job, so a detached worker enforces it too. The interrupt is not trusted on its own: the run waits up to 10 s for the turn's terminal notification, and if none arrives the failure says so ("interrupt not acknowledged — the turn may still be running in the shared runtime, check status or cancel"), because a shared broker runtime can keep executing a turn nobody is listening to any more. A run that owns its own app-server (a cold `--resume-last`) closes it in that case, which does stop the turn (stdin EOF, then `SIGTERM`, then `SIGKILL`, so the close is bounded too). Partial output on a timed-out turn is best-effort: only whole items Codex had already completed are kept, so a turn interrupted mid-message reports less text than Codex had produced.
 - the `SessionEnd` hook works to one absolute budget (`SESSION_END_BUDGET_MS`, 12 s; `CODEX_COMPANION_SESSION_END_BUDGET_MS` can only *shorten* it — a larger value is ignored with a note, since the hook timeout is fixed), and every bounded step inside it — the workspace state lock, each broker handshake, the busy retries, the teardown probe — is clamped to what is left of that budget. `hooks/hooks.json` gives `SessionEnd` a 15 s timeout, which must stay **above** the budget: below it Claude Code would kill the hook mid-decision instead of letting it report one. A test asserts the pair, so the two numbers cannot drift apart.
 - if a background job's session ends while `CODEX_COMPANION_BROKER_IDLE_TIMEOUT_MS=0`, the shared broker that keeps running for that job never self-terminates on its own — its normal idle exit is disabled in that configuration, so the broker only goes away once the job finishes (or is reaped as dead) and a later `SessionEnd` runs.
+- the `SessionEnd` broker teardown line (`[codex] Broker teardown: ... reason=<reason>`) names one of:
+
+  | reason | meaning |
+  | --- | --- |
+  | `no-pid` | no broker pid was recorded; nothing to signal |
+  | `identity-match` | the pid was proven to be this broker by its recorded identity and signalled |
+  | `command-line-match` | a record without an identity was proven by its command line and signalled |
+  | `identity-mismatch` | the pid now belongs to another process; left alone |
+  | `identity-unavailable` | the identity could not be read (e.g. on Windows); left alone |
+  | `kill-failed` | the ownership probe or the kill threw; the broker may still be running |
 
 ### `/codex:transfer`
 
@@ -185,7 +195,7 @@ Examples:
 /codex:transfer --source ~/.claude/projects/-Users-me-repo/<session-id>.jsonl
 ```
 
-The plugin's existing `SessionStart` hook supplies the current transcript path automatically; `--source` is available as a manual override. The transfer uses Codex's external-agent session importer, so it follows the same conversion rules as importing Claude history in the Codex App and creates visible turns that can be continued in the App or TUI. The source must be under `~/.claude/projects`, and older Codex versions that do not expose session import must be upgraded before using this command. The transcript root honours `CLAUDE_CONFIG_DIR` when set, resolving to `<CLAUDE_CONFIG_DIR>/projects` instead of `~/.claude/projects`.
+The plugin's existing `SessionStart` hook supplies the current transcript path automatically; `--source` is available as a manual override. The transfer uses Codex's external-agent session importer, so it follows the same conversion rules as importing Claude history in the Codex App and creates visible turns that can be continued in the App or TUI. The source must be under `~/.claude/projects` (`$CLAUDE_CONFIG_DIR/projects` when `CLAUDE_CONFIG_DIR` is set), and older Codex versions that do not expose session import must be upgraded before using this command.
 
 ### `/codex:status`
 

@@ -2630,6 +2630,60 @@ test("stop gate stops blocking after three gate-induced rounds by default (#548)
   assert.deepEqual(decisions, ["block", "block", "block", "allow"]);
 });
 
+function gateDecisions(env, repo, session, rounds) {
+  const decisions = [];
+  let stderr = "";
+  for (let i = 0; i < rounds; i += 1) {
+    const input = JSON.stringify({ cwd: repo, session_id: session, stop_hook_active: i > 0, last_assistant_message: "I completed the refactor." });
+    const r = run(process.execPath, [STOP_HOOK], { cwd: repo, env, input });
+    assert.equal(r.status, 0, r.stderr);
+    stderr += r.stderr;
+    decisions.push(r.stdout.trim() ? JSON.parse(r.stdout).decision : "allow");
+  }
+  return { decisions, stderr };
+}
+
+test("CODEX_REVIEW_GATE_MAX_ROUNDS=0 never stops blocking and =5 allows the sixth stop", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  run(process.execPath, [SCRIPT, "setup", "--enable-review-gate"], { cwd: repo, env: buildEnv(binDir) });
+  const unlimited = gateDecisions(buildEnv(binDir, { CODEX_REVIEW_GATE_MAX_ROUNDS: "0" }), repo, "sess-rounds-0", 4);
+  assert.deepEqual(unlimited.decisions, ["block", "block", "block", "block"]);
+  const five = gateDecisions(buildEnv(binDir, { CODEX_REVIEW_GATE_MAX_ROUNDS: "5" }), repo, "sess-rounds-5", 6);
+  assert.deepEqual(five.decisions, ["block", "block", "block", "block", "block", "allow"]);
+});
+
+test("an invalid CODEX_REVIEW_GATE_MAX_ROUNDS falls back to 3 with a warning", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  run(process.execPath, [SCRIPT, "setup", "--enable-review-gate"], { cwd: repo, env: buildEnv(binDir) });
+  const { decisions, stderr } = gateDecisions(buildEnv(binDir, { CODEX_REVIEW_GATE_MAX_ROUNDS: "0.5" }), repo, "sess-rounds-bad", 4);
+  assert.deepEqual(decisions, ["block", "block", "block", "allow"]);
+  assert.match(stderr, /Ignoring CODEX_REVIEW_GATE_MAX_ROUNDS="0\.5"/);
+});
+
+test("setup rejects an empty gate model or effort and writes nothing", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  const first = run(process.execPath, [SCRIPT, "setup", "--review-gate-model", "astra", "--review-gate-effort", "high", "--json"], { cwd: repo, env: buildEnv(binDir) });
+  assert.equal(first.status, 0, first.stderr);
+  for (const flag of ["--review-gate-model", "--review-gate-effort"]) {
+    const empty = run(process.execPath, [SCRIPT, "setup", "--enable-review-gate", flag, "", "--json"], { cwd: repo, env: buildEnv(binDir) });
+    assert.notEqual(empty.status, 0);
+    assert.match(empty.stderr, /use inherit to clear/);
+  }
+  const after = JSON.parse(run(process.execPath, [SCRIPT, "setup", "--json"], { cwd: repo, env: buildEnv(binDir) }).stdout);
+  assert.equal(after.reviewGateModel, "gpt-6-astra");
+  assert.equal(after.reviewGateEffort, "high");
+  assert.equal(after.reviewGateEnabled, false, "the gate flag must not be written either");
+});
+
 test("stop gate names the signal when the review task is killed and always names the escape hatch (#589/#483)", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
@@ -3826,7 +3880,7 @@ test("cancelling an awaited job ends the await with exit 1 and leaves a readable
 
 // A worker that outlives the SIGTERM (it only stops once its turn winds down)
 // used to overwrite the acknowledged `cancelled` record with its own result.
-test("an acknowledged cancellation survives a worker that finishes after it", { skip: process.platform === "win32" }, async () => {
+test("an acknowledged cancellation survives a worker that finishes after it", { skip: process.platform === "win32" }, async (t) => {
   const repo = seededRepo();
   const binDir = makeTempDir();
   installFakeCodex(binDir);
@@ -3852,6 +3906,7 @@ test("an acknowledged cancellation survives a worker that finishes after it", { 
     const job = JSON.parse(fs.readFileSync(stateFile, "utf8")).jobs?.find((entry) => entry.id === jobId);
     return job && job.status === "running" && job.pid ? job.pid : null;
   }, { timeoutMs: 15000 });
+  t.after(() => { try { process.kill(-workerPid, "SIGKILL"); } catch {} });
 
   const cancelled = run(process.execPath, [SCRIPT, "cancel", jobId, "--json"], { cwd: repo, env });
   assert.equal(cancelled.status, 0, cancelled.stderr);
