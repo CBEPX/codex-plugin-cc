@@ -30,6 +30,8 @@ export default {
   jsonReporter: {
     fileName: "reports/mutation/mutation.json",
   },
+  // Stryker does not read .gitignore; keep worktrees and docs out of the sandbox copy.
+  ignorePatterns: ["/.worktrees", "/docs", "/.superpowers", "/reports"],
   tempDirName: ".stryker-tmp",
   cleanTempDir: true,
 };

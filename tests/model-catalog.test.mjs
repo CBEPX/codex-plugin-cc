@@ -64,7 +64,7 @@ test("loadModelCatalog falls back from the env catalogue to models_cache.json, t
   const empty = writeCatalog(dir, "empty.json", { models: [] });
   const calls = [];
   const bundled = (cmd, args, opts) => {
-    calls.push([cmd, args, opts.timeoutMs]);
+    calls.push([cmd, args]);
     return { status: 0, stdout: JSON.stringify({ models: [{ slug: "gpt-bundled" }] }), error: null };
   };
   const fromCache = loadModelCatalog({ env: { CODEX_COMPANION_MODEL_CATALOG: empty, CODEX_HOME: dir }, runCommandImpl: bundled });
@@ -73,14 +73,14 @@ test("loadModelCatalog falls back from the env catalogue to models_cache.json, t
 
   const fromBundled = loadModelCatalog({ env: { CODEX_HOME: path.join(dir, "missing") }, runCommandImpl: bundled });
   assert.deepEqual(fromBundled.map((m) => m.slug), ["gpt-bundled"]);
-  assert.deepEqual(calls, [["codex", ["debug", "models", "--bundled"], 10000]]);
+  assert.deepEqual(calls, [["codex", ["debug", "models", "--bundled"]]]);
 });
 
 test("loadModelCatalog ignores failed, erroring or non-JSON codex output", () => {
   const env = { CODEX_HOME: path.join(makeTempDir(), "missing") };
   for (const result of [
     { status: 0, stdout: "not json", error: null },
-    { status: 0, stdout: "[]", error: new Error("spawn") },
+    { status: 0, stdout: JSON.stringify([{ slug: "gpt-x" }]), error: new Error("spawn") },
     { status: 2, stdout: JSON.stringify([{ slug: "gpt-x" }]), error: null }
   ]) {
     assert.deepEqual(loadModelCatalog({ env, runCommandImpl: () => result }), []);
@@ -88,6 +88,7 @@ test("loadModelCatalog ignores failed, erroring or non-JSON codex output", () =>
   assert.deepEqual(loadModelCatalog({ env, runCommandImpl: () => { throw new Error("boom"); } }), []);
 });
 
+// Leaves the module-level cache populated; fine because each test file runs in its own process.
 test("loadModelCatalog caches only when asked", () => {
   const dir = makeTempDir();
   const file = writeCatalog(dir, "catalog.json", [{ slug: "gpt-first" }]);

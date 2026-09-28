@@ -389,7 +389,9 @@ on `PATH`, because it generates the app-server protocol types first.
 - `npm run check` — the full local gate: version metadata, changelog, lint,
   typecheck (`npm run build`), typecheck of tests and scripts, and the test suite.
 - `npm run setup:git-hooks` — points git at `.githooks/` (pre-commit runs lint and
-  typecheck).
+  typecheck). The setting lives in the shared `.git/config`, so it applies to the
+  main checkout and every worktree and replaces any `.git/hooks/*`; typecheck runs
+  `prebuild`, so committing needs the `codex` CLI on `PATH`.
 - `npm run test:coverage` — runs the suite under c8 and writes
   `reports/coverage/`; thresholds live in `.c8rc.json` (long-term target:
   85% lines, 75% branches, 90% functions).
