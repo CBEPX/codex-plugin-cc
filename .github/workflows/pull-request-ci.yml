@@ -53,6 +53,23 @@ jobs:
           { rg -e 'ℹ (tests|pass|fail)' -e '^# (tests|pass|fail)' -e '^not ok' -e '^✖' test-output.log || grep -E 'ℹ (tests|pass|fail)|^# (tests|pass|fail)|^not ok|^✖' test-output.log; } >> "$GITHUB_STEP_SUMMARY" || true
           exit "$status"
 
+      # Same check as the local gate (`sleep 10; pgrep -f codex-plugin-test-`):
+      # every test process must be gone once the suite ends. Reported, not
+      # enforced, until the Windows kill path lands (v1.4.1).
+      - name: Leak check
+        if: always()
+        shell: bash
+        run: |
+          sleep 10
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            leaked=$(powershell -NoProfile -Command "(Get-CimInstance Win32_Process | Where-Object { \$_.CommandLine -match 'codex-plugin-test-' }).Count")
+            powershell -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object { \$_.CommandLine -match 'codex-plugin-test-' } | Select-Object ProcessId,ParentProcessId,Name,@{n='Cmd';e={\$_.CommandLine.Substring(0,[Math]::Min(160,\$_.CommandLine.Length))}} | Format-Table -AutoSize | Out-String -Width 220" | head -40
+          else
+            leaked=$(pgrep -f codex-plugin-test- | wc -l | tr -d ' ')
+            pgrep -af codex-plugin-test- 2>/dev/null | cut -c1-200 | head -40 || true
+          fi
+          echo "Leaked test processes after 10 s: ${leaked:-?}" | tee -a "$GITHUB_STEP_SUMMARY"
+
       - name: Upload test log
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
