@@ -7,6 +7,7 @@
 - Windows: the broker and app-server child processes no longer flash a visible console window on spawn (`windowsHide: true`) (#440, #451).
 - The `Stop`, `SessionStart` and `SessionEnd` hooks read stdin with a bounded deadline (2 s / 5 s / 1 s respectively) and a 1 MiB limit instead of a blocking `readFileSync(0)`; a disabled Stop review gate no longer hangs until the 900 s hook timeout when stdin never arrives, and the companion no longer crashes with `EAGAIN` reading a non-blocking stdin under concurrent sessions (#530, #544, #120, #247, #123, #150, #165).
 - `--args-stdin` (and `$ARGUMENTS`) no longer eats a backslash that does not escape a quote, another backslash or whitespace, so Windows paths such as `C:\Users\me\project\file.mjs` survive; `\\server\share` is a documented limitation, and `--prompt-stdin` remains available for byte-exact text.
+- A turn without subagents no longer has its completion inferred 250 ms after the final answer: on a slow host a delayed `turn/completed` with status `failed` was being recorded as `completed` (seen twice on hosted CI). Inference now applies only once a subagent thread has joined the turn, the case it was built for.
 - Windows: `state.json` reads and writes and lock-ticket reads retry briefly (bounded, roughly 300 ms worst case) on `EPERM`/`EBUSY`/`EACCES` instead of failing outright when another process holds the file open.
 
 ### Added

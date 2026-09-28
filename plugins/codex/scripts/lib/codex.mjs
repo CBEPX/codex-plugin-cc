@@ -282,6 +282,9 @@ function registerThread(state, threadId, options = {}) {
   }
 
   state.threadIds.add(threadId);
+  if (threadId !== state.threadId) {
+    state.sawSubagents = true;
+  }
   const label =
     options.threadName ??
     options.name ??
@@ -372,6 +375,9 @@ function createTurnCaptureState(threadId, options = {}) {
     threadId,
     rootThreadId: threadId,
     threadIds: new Set([threadId]),
+    // Set once any non-main thread joins the turn: only then may completion be
+    // inferred instead of waited for.
+    sawSubagents: false,
     threadTurnIds: new Map(),
     threadLabels: new Map(),
     turnId: null,
@@ -433,6 +439,12 @@ function completeTurn(state, turn = null, options = {}) {
 
 function scheduleInferredCompletion(state) {
   if (state.completed || state.finalTurn || !state.finalAnswerSeen) {
+    return;
+  }
+  // Inference exists for subagent flows whose main turn/completed never comes.
+  // A plain turn always gets one; guessing 250 ms after the final answer would
+  // turn a merely delayed `turn/completed` with status "failed" into "completed".
+  if (!state.sawSubagents) {
     return;
   }
 

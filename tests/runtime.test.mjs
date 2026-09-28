@@ -4233,6 +4233,23 @@ test("a server-side turn failure that terminates normally still records an error
   assert.match(status.stdout, /Codex turn ended with status "failed"/);
 });
 
+// The final answer arriving well before the terminal notification (a slow relay,
+// a loaded CI host) must not be mistaken for the turn having completed.
+test("a failed turn whose turn/completed arrives late is still recorded as failed", () => {
+  const repo = makeTempDir();
+  initGitRepo(repo);
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "turn-failed-silently");
+  const env = buildEnv(binDir, { FAKE_CODEX_TURN_DELAY_MS: "800" });
+  const launched = run(process.execPath, [SCRIPT, "task", "--background", "--json", "do the thing"], { cwd: repo, env });
+  assert.equal(launched.status, 0, launched.stderr);
+  const jobId = JSON.parse(launched.stdout).jobId;
+  const done = run(process.execPath, [SCRIPT, "result", jobId, "--wait", "--timeout-ms", "15000", "--json"], { cwd: repo, env });
+  assert.equal(done.status, 0, done.stderr);
+  assert.equal(JSON.parse(done.stdout).job.status, "failed");
+  assert.match(JSON.parse(done.stdout).job.errorMessage ?? "", /Codex turn ended with status "failed"/);
+});
+
 test("a subagent's terminal error does not fail the main turn", () => {
   const repo = makeTempDir();
   initGitRepo(repo);
