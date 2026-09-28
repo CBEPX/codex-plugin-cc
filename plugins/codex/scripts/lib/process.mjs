@@ -16,30 +16,29 @@ export function systemExe(name, env = process.env) {
 // cmd.exe metacharacters, escaped with ^ (cross-spawn's set).
 const CMD_META = /([()\][%!^"`<>&|;, *?])/g;
 
-// First where.exe hit whose extension is in PATHEXT, or null. An extensionless
-// hit (npm's bash shim next to codex.cmd) is skipped. `$PATH:` searches PATH
-// only, never the current directory (a repo must not plant a codex.cmd). Raw
-// spawnSync: runCommand calls this, so going through it would recurse.
+// First PATH directory holding `<command><ext>` for a PATHEXT extension we can
+// launch (.com/.exe/.bat/.cmd), or null. Done with fs rather than where.exe: no
+// child process, no guessing the console code page of its output (a non-ASCII
+// install path must survive), and never the current directory — a repo must not
+// plant a codex.cmd, so relative PATH entries are skipped as well. An
+// extensionless file (npm's bash shim next to codex.cmd) is never a hit.
 export function resolveExecutable(command, options = {}) {
   const env = options.env ?? process.env;
-  const result = (options.spawnSyncImpl ?? spawnSync)(systemExe("where.exe", env), [`$PATH:${command}`], {
-    cwd: options.cwd,
-    env,
-    encoding: "utf8",
-    shell: false,
-    // The lookup shares the caller's budget instead of adding up to 5 s to it.
-    timeout: Number.isFinite(options.timeoutMs) ? Math.max(1, Math.min(5000, Math.floor(options.timeoutMs))) : 5000,
-    windowsHide: true
-  });
-  if (result.error || result.status !== 0) {
-    return null;
+  const exists = options.existsSyncImpl ?? fs.existsSync;
+  const extensions = String(env.PATHEXT ?? env.Pathext ?? ".COM;.EXE;.BAT;.CMD").split(";").filter((ext) => LAUNCHABLE.test(ext));
+  const dirs = String(env.PATH ?? env.Path ?? "")
+    .split(";")
+    .map((dir) => dir.trim().replace(/^"(.*)"$/, "$1"))
+    .filter((dir) => dir && path.win32.isAbsolute(dir));
+  for (const dir of dirs) {
+    for (const ext of extensions) {
+      const candidate = path.win32.join(dir, command + ext);
+      if (exists(candidate)) {
+        return candidate;
+      }
+    }
   }
-  const extensions = String(env.PATHEXT || ".COM;.EXE;.BAT;.CMD").toLowerCase().split(";");
-  const hit = String(result.stdout ?? "")
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .find((line) => LAUNCHABLE.test(line) && extensions.includes(path.win32.extname(line).toLowerCase()));
-  return hit ?? null;
+  return null;
 }
 
 // One argument for a cmd.exe line that a .cmd shim forwards with %*: CRT

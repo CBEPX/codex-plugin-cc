@@ -296,30 +296,22 @@ test("terminateRecordedProcess hands a verified pid to an injected terminateImpl
 
 // Windows spawning without $SHELL: where.exe resolves the real file, .cmd/.bat
 // shims go through cmd.exe with every argument escaped, .exe/.com run directly.
-test("resolveExecutable takes where.exe's first PATHEXT hit and skips the extensionless shim", () => {
-  let seen = null;
-  const spawnSyncImpl = (file, args, options) => {
-    seen = { file, args, options };
-    return { status: 0, stdout: "C:\\tools.d\\codex\r\nC:\\npm\\codex\r\nC:\\npm\\codex.CMD\r\nC:\\bin\\codex.exe\r\n", stderr: "" };
-  };
-  assert.equal(resolveExecutable("codex", { env: { PATHEXT: ".COM;.EXE;.BAT;.CMD" }, cwd: "C:\\w", spawnSyncImpl }), "C:\\npm\\codex.CMD");
-  assert.equal(seen.file, "C:\\Windows\\System32\\where.exe");
-  assert.deepEqual(seen.args, ["$PATH:codex"]);
-  assert.equal(seen.options.shell, false);
-  assert.equal(seen.options.timeout, 5000);
-  assert.equal(seen.options.cwd, "C:\\w");
-  // The lookup never outlives the caller's own budget.
-  resolveExecutable("codex", { env: {}, timeoutMs: 250, spawnSyncImpl });
-  assert.equal(seen.options.timeout, 250);
+test("resolveExecutable walks PATH x PATHEXT with fs, skips the extensionless shim and never the cwd", () => {
+  // A case-insensitive stand-in for the Windows file system.
+  const present = new Set(["c:\\tools.d\\codex", "c:\\npm\\codex", "c:\\npm\\codex.cmd", "c:\\bin\\codex.exe", "c:\\w\\codex.exe", "c:\\users\\项\\npm\\codex.cmd"]);
+  const existsSyncImpl = (candidate) => present.has(candidate.toLowerCase());
+  const env = { PATH: 'C:\\tools.d;.;"C:\\npm";C:\\bin', PATHEXT: ".COM;.EXE;.BAT;.CMD" };
+  assert.equal(resolveExecutable("codex", { env, cwd: "C:\\w", existsSyncImpl }), "C:\\npm\\codex.CMD");
   // PATHEXT decides: without .CMD in it the .exe wins.
-  assert.equal(resolveExecutable("codex", { env: { PATHEXT: ".EXE" }, spawnSyncImpl }), "C:\\bin\\codex.exe");
-  assert.equal(resolveExecutable("codex", { env: {}, spawnSyncImpl: () => ({ status: 1, stdout: "", stderr: "INFO: Could not find files" }) }), null);
-  assert.equal(resolveExecutable("codex", { env: {}, spawnSyncImpl: () => ({ status: 0, stdout: "C:\\npm\\codex\r\n", stderr: "" }) }), null);
-  assert.equal(resolveExecutable("codex", { env: {}, spawnSyncImpl: () => ({ error: new Error("ENOENT"), stdout: "" }) }), null);
+  assert.equal(resolveExecutable("codex", { env: { ...env, PATHEXT: ".EXE" }, existsSyncImpl }), "C:\\bin\\codex.EXE");
+  // A non-ASCII install directory is a plain string here, not decoded console output.
+  assert.equal(resolveExecutable("codex", { env: { PATH: "C:\\Users\\项\\npm", PATHEXT: ".CMD" }, existsSyncImpl }), "C:\\Users\\项\\npm\\codex.CMD");
+  // "." and the cwd are never searched; PATHEXT entries we cannot launch (.JS) are ignored; a lowercase Path key works.
+  assert.equal(resolveExecutable("codex", { env: { PATH: ".;C:\\nowhere", PATHEXT: ".JS;.CMD" }, cwd: "C:\\w", existsSyncImpl }), null);
+  assert.equal(resolveExecutable("codex", { env: { Path: "C:\\bin", PATHEXT: ".EXE" }, existsSyncImpl }), "C:\\bin\\codex.EXE");
+  assert.equal(resolveExecutable("codex", { env: { PATH: "", PATHEXT: ".EXE" }, existsSyncImpl }), null);
 });
 
-// The table pins the caret strings; the Windows-only round-trip test below is the
-// behavioural oracle.
 test("quoteForCmd escapes every argument so cmd.exe and the shim's %* both pass it through", () => {
   assert.throws(() => quoteForCmd("a\nb"), /line break/);
   assert.throws(() => quoteForCmd("a\rb"), /line break/);
@@ -350,23 +342,23 @@ test("buildLaunch runs .exe directly and .cmd through cmd.exe /d /s /c with verb
   assert.equal(buildLaunch("C:\\x\\run.BAT", [], { SystemRoot: "D:\\Win" }).file, "D:\\Win\\System32\\cmd.exe");
 });
 
-test("runCommand on win32 resolves a bare name with where.exe and launches the shim without a shell", () => {
+test("runCommand on win32 resolves a bare name through PATH and launches the shim without a shell", () => {
   const calls = [];
   const spawnSyncImpl = (file, args, options) => {
     calls.push({ file, args, options });
-    return file.endsWith("\\where.exe")
-      ? { status: 0, stdout: "C:\\npm\\codex\r\nC:\\npm\\codex.cmd\r\n", stderr: "" }
-      : { status: 0, stdout: "codex 1.0\n", stderr: "" };
+    return { status: 0, stdout: "codex 1.0\n", stderr: "" };
   };
-  const result = runCommand("codex", ["--version"], { platform: "win32", env: { PATHEXT: ".EXE;.CMD" }, spawnSyncImpl });
+  const existsSyncImpl = (candidate) => candidate.toLowerCase() === "c:\\npm\\codex.cmd";
+  const result = runCommand("codex", ["--version"], { platform: "win32", env: { PATH: "C:\\npm", PATHEXT: ".EXE;.cmd" }, existsSyncImpl, spawnSyncImpl });
   assert.deepEqual([result.command, result.args, result.stdout], ["codex", ["--version"], "codex 1.0\n"]);
-  assert.equal(calls[1].file, "C:\\Windows\\System32\\cmd.exe");
-  assert.deepEqual(calls[1].args, ["/d", "/s", "/v:off", "/c", '"C:\\npm\\codex.cmd ^^^"--version^^^""']);
-  assert.equal(calls[1].options.shell, false);
-  assert.equal(calls[1].options.windowsVerbatimArguments, true);
-  assert.equal(calls[1].options.env.NoDefaultCurrentDirectoryInExePath, "1");
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].file, "C:\\Windows\\System32\\cmd.exe");
+  assert.deepEqual(calls[0].args, ["/d", "/s", "/v:off", "/c", '"C:\\npm\\codex.cmd ^^^"--version^^^""']);
+  assert.equal(calls[0].options.shell, false);
+  assert.equal(calls[0].options.windowsVerbatimArguments, true);
+  assert.equal(calls[0].options.env.NoDefaultCurrentDirectoryInExePath, "1");
 
-  // A path skips where.exe; a bare name that resolves to nothing is ENOENT without any spawn.
+  // A path is launched as is; a bare name that resolves to nothing is ENOENT without any spawn.
   calls.length = 0;
   runCommand("C:\\Windows\\System32\\taskkill.exe", ["/PID", "1"], { platform: "win32", spawnSyncImpl });
   runCommand("C:\\node\\node.exe", [], { platform: "win32", spawnSyncImpl });
@@ -375,11 +367,11 @@ test("runCommand on win32 resolves a bare name with where.exe and launches the s
     ["C:\\node\\node.exe", false, false]
   ]);
   calls.length = 0;
-  const missing = runCommand("npm", [], { platform: "win32", spawnSyncImpl: (file, args, options) => { calls.push({ file, options }); return file.endsWith("\\where.exe") ? { status: 1, stdout: "" } : { error: Object.assign(new Error("spawn npm ENOENT"), { code: "ENOENT" }) }; } });
+  const missing = runCommand("npm", [], { platform: "win32", env: { PATH: "C:\\npm" }, existsSyncImpl: () => false, spawnSyncImpl });
   assert.equal(missing.error.code, "ENOENT");
   assert.equal(missing.status, null);
-  // Nothing found: ENOENT is reported without a second spawn (libuv would search the cwd).
-  assert.deepEqual(calls.map((call) => [call.file, call.options.shell]), [["C:\\Windows\\System32\\where.exe", false]]);
+  // Nothing found: ENOENT is reported without any spawn (libuv would search the cwd).
+  assert.deepEqual(calls, []);
 });
 
 // Only CI runs this: a real cmd.exe parses the line, then the shim's %* re-parses it.

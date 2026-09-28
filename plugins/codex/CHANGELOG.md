@@ -20,7 +20,7 @@
 - Deferred v1.3.0 review minors folded in: `CODEX_REVIEW_GATE_MAX_ROUNDS` rejects a non-integer, negative or otherwise malformed value (falls back to 3 with a warning) instead of misreading it; `setup --review-gate-model ""` / `--review-gate-effort ""` now fails with `--<flag> needs a value; use inherit to clear it.` instead of writing anything; a job id used to build the `workerCommandLine` match is now regex-escaped; the `kill-failed` broker-teardown reason is documented in the README's reason table. Also added (test coverage only, no behavior change): a catalogue-only model alias resolving correctly on a priority tie, and the fallback-root refusal covering a non-standard directory mode.
 
 ### Known limitations
-- Kills issued from stored process records (`/codex:cancel`, `SessionEnd` cleanup, stale-broker replacement, broker teardown) are still refused on Windows (`identity-unavailable`); process identity verification is now targeted for v1.4.1, not v1.4.0 as previously stated. This bounds any leak by the broker idle timeout, and the turn interrupt is still sent regardless.
+- Kills issued from stored process records (`/codex:cancel`, `SessionEnd` cleanup, stale-broker replacement, broker teardown) are still refused on Windows (`identity-unavailable`); process identity verification is now targeted for v1.4.1, not v1.4.0 as previously stated. `/codex:cancel` still sends the turn interrupt on a best-effort basis; `SessionEnd` only refuses. A worker or broker left behind exits when its turn ends and, for the broker, once every client has disconnected and its idle timeout elapses — an unbounded turn is not reaped on Windows until v1.4.1.
 
 Ported with reference to upstream PRs by mohammad-malik, mittalpk, stantheman0128, tmchow, D2758695161, ikbear, e345ee, tanakauo.
 
@@ -50,7 +50,7 @@ Ported with reference to upstream PRs by mohammad-malik, mittalpk, stantheman012
 - `runCommand` reports `status: null`, not `0`, for a subprocess that timed out.
 
 ### Known limitations
-- On Windows, kills issued from stored process records (cancel worker, `SessionEnd` cleanup, stale-broker replacement, broker teardown) are refused until process identity lands in v1.4.0; leaks are bounded by the broker idle timeout, and the turn interrupt is still sent regardless.
+- On Windows, kills issued from stored process records (cancel worker, `SessionEnd` cleanup, stale-broker replacement, broker teardown) are refused until process identity lands in v1.4.0; a leaked broker exits on its idle timeout once every client has disconnected, and `cancel` still sends the turn interrupt on a best-effort basis (`SessionEnd` does not).
 - Foreground job records written by v1.2.x (no `pidIdentity`) are not killed at `SessionEnd` after upgrading to v1.3.0 (one-off).
 - When `CLAUDE_PLUGIN_DATA` is unset (inside Claude Code the SessionStart hook normally sets it), the fallback state root under `os.tmpdir()` hashes `CLAUDE_PLUGIN_ROOT`, whose path includes the plugin version: job and broker state is orphaned on every plugin update, not only when upgrading from v1.2.x.
 - Darwin identity checks use `ps lstart`, which has 1 s resolution.
