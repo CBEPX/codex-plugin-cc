@@ -4,7 +4,7 @@ import path from "node:path";
 import {
   encodePowerShell, powerShellEnvironment, resetWindowsIdentityCircuit, runPowerShell,
   systemPowerShell, systemRoot, getProcessIdentity, getProcessIdentities
-} from "../plugins/codex/scripts/lib/process.mjs";
+} from "../../../../plugins/codex/scripts/lib/process.mjs";
 
 const probe = (pids) => [
   "$ErrorActionPreference = 'Stop'",
