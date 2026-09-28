@@ -16,7 +16,8 @@ function parseObject(text) {
 // Reads a hook's JSON payload from stdin without trusting the host to close it
 // (#530) and without the EAGAIN a non-blocking stdin gives `readFileSync(0)`.
 // A payload that is complete when the deadline hits is accepted: only a late EOF
-// is missing. `error.bytes` says how much arrived before a timeout.
+// is missing. `error.bytes` says how much arrived before a timeout; a stream
+// error is a `read-error` whatever was buffered.
 export async function readHookInput({ timeoutMs = 2000, maxBytes = 1024 * 1024, stdin = process.stdin } = {}) {
   const override = Number(process.env.CODEX_HOOK_STDIN_TIMEOUT_MS);
   const deadlineMs = override > 0 ? override : timeoutMs;
@@ -24,12 +25,15 @@ export async function readHookInput({ timeoutMs = 2000, maxBytes = 1024 * 1024, 
   let text = "";
   let bytes = 0;
 
+  let readError = null;
   const outcome = await new Promise((resolve) => {
     const finish = (reason) => {
       clearTimeout(timer);
       stdin.off("data", onData);
       stdin.off("end", onEnd);
       stdin.off("error", onError);
+      // destroy() can still emit an error; unhandled, it would kill the hook.
+      stdin.on("error", () => {});
       stdin.pause();
       stdin.destroy?.();
       resolve(reason);
@@ -47,8 +51,10 @@ export async function readHookInput({ timeoutMs = 2000, maxBytes = 1024 * 1024, 
       text += decoder.end();
       finish("end");
     };
-    // A broken stdin is treated like one that stopped arriving.
-    const onError = () => finish("deadline");
+    const onError = (error) => {
+      readError = error;
+      finish("read-error");
+    };
     const timer = setTimeout(() => finish("deadline"), deadlineMs);
     stdin.on("data", onData);
     stdin.on("end", onEnd);
@@ -58,7 +64,12 @@ export async function readHookInput({ timeoutMs = 2000, maxBytes = 1024 * 1024, 
   if (outcome === "overflow") {
     return { input: null, error: { code: "overflow", message: `hook input exceeded ${maxBytes} bytes` } };
   }
+  if (outcome === "read-error") {
+    return { input: null, error: { code: "read-error", message: `hook input could not be read: ${readError?.message ?? readError}` } };
+  }
   if (outcome === "deadline") {
+    // A held partial UTF-8 sequence becomes U+FFFD, so the text cannot pass as complete.
+    text += decoder.end();
     try {
       if (text.trim()) {
         return { input: parseObject(text), error: null };

@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import fs from "node:fs";
 import process from "node:process";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
@@ -8,7 +9,7 @@ import { fileURLToPath } from "node:url";
 import { getCodexAvailability } from "./lib/codex.mjs";
 import { readHookInput } from "./lib/hook-input.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
-import { getConfig, setConfig, listJobs } from "./lib/state.mjs";
+import { getConfig, setConfig, listJobs, resolveStateFile } from "./lib/state.mjs";
 import { sortJobsNewestFirst } from "./lib/job-control.mjs";
 import { reapDeadJobs, SESSION_ID_ENV } from "./lib/tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
@@ -192,9 +193,15 @@ function runStopReview(cwd, input = {}, config = {}) {
   }
 }
 
+// Read directly, not via getConfig: loadState turns an unreadable or corrupt
+// state file into defaults (gate off), which must not open the gate.
 function gateEnabledForProject() {
   try {
-    return Boolean(getConfig(resolveWorkspaceRoot(process.env.CLAUDE_PROJECT_DIR || process.cwd())).stopReviewGate);
+    const stateFile = resolveStateFile(resolveWorkspaceRoot(process.env.CLAUDE_PROJECT_DIR || process.cwd()));
+    if (!fs.existsSync(stateFile)) {
+      return false;
+    }
+    return Boolean(JSON.parse(fs.readFileSync(stateFile, "utf8")).config?.stopReviewGate);
   } catch {
     return true;
   }
@@ -203,8 +210,10 @@ function gateEnabledForProject() {
 async function main() {
   const { input, error } = await readHookInput();
   if (error) {
-    // Nothing arrived and the gate is off: nothing to review, so allow (#530).
-    if (error.code === "timeout" && error.bytes === 0 && !gateEnabledForProject()) {
+    // Gate off (as stored, unreadable counts as on): allow when nothing arrived
+    // (#530) or the input overflowed, since a disabled gate never blocked. Every
+    // other case (gate on, partial input, invalid JSON, read error) blocks.
+    if (((error.code === "timeout" && error.bytes === 0) || error.code === "overflow") && !gateEnabledForProject()) {
       return;
     }
     emitDecision({

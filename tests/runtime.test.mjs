@@ -2662,11 +2662,14 @@ test("stop hook blocks when hook input is malformed JSON", () => {
 // time how long the hook takes to decide.
 async function runHookWithOpenStdin(t, args, { cwd, env, input = "" }) {
   const child = spawn(process.execPath, args, { cwd, env, stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
-  t.after(() => {
+  const kill = () => {
     if (child.exitCode === null && child.signalCode === null) {
       child.kill("SIGKILL");
     }
-  });
+  };
+  t.after(kill);
+  // A hook that never exits must fail the test, not hang the run.
+  setTimeout(kill, 20_000).unref();
   let stdout = "";
   let stderr = "";
   child.stdout.on("data", (chunk) => (stdout += chunk));
@@ -2680,7 +2683,7 @@ async function runHookWithOpenStdin(t, args, { cwd, env, input = "" }) {
   return { status, stdout, stderr, elapsedMs: Date.now() - started };
 }
 
-test("stop hook with the gate disabled allows promptly when stdin stays open (#530)", async (t) => {
+test("stop hook with the gate disabled allows promptly when stdin stays open (#530)", { timeout: 30_000 }, async (t) => {
   const repo = makeTempDir();
   initGitRepo(repo);
   const env = { ...process.env, CLAUDE_PROJECT_DIR: repo, CODEX_HOOK_STDIN_TIMEOUT_MS: "200" };
@@ -2692,7 +2695,7 @@ test("stop hook with the gate disabled allows promptly when stdin stays open (#5
   }
 });
 
-test("stop hook with the gate enabled blocks when hook input never arrives", async (t) => {
+test("stop hook with the gate enabled blocks when hook input never arrives", { timeout: 30_000 }, async (t) => {
   const repo = makeTempDir();
   initGitRepo(repo);
   const setup = run(process.execPath, [SCRIPT, "setup", "--enable-review-gate", "--json"], { cwd: repo });
@@ -2704,6 +2707,37 @@ test("stop hook with the gate enabled blocks when hook input never arrives", asy
   assert.equal(payload.decision, "block");
   assert.match(payload.reason, /hook input did not arrive/);
   assert.ok(result.elapsedMs < 3000, `hook took ${result.elapsedMs} ms`);
+});
+
+test("stop hook with an unreadable state file keeps the gate closed when hook input never arrives", { timeout: 30_000 }, async (t) => {
+  const repo = makeTempDir();
+  initGitRepo(repo);
+  const stateDir = resolveStateDir(repo);
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(path.join(stateDir, "state.json"), "{not-json");
+  const env = { ...process.env, CLAUDE_PROJECT_DIR: repo, CODEX_HOOK_STDIN_TIMEOUT_MS: "200" };
+  const result = await runHookWithOpenStdin(t, [STOP_HOOK], { cwd: repo, env });
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.decision, "block");
+  assert.match(payload.reason, /hook input did not arrive/);
+});
+
+test("stop hook input above 1 MiB allows with the gate off and blocks with it on", () => {
+  const repo = makeTempDir();
+  initGitRepo(repo);
+  const env = { ...process.env, CLAUDE_PROJECT_DIR: repo };
+  const input = JSON.stringify({ cwd: repo, session_id: "sess-huge", last_assistant_message: "x".repeat(1.1 * 1024 * 1024) });
+  const off = run(process.execPath, [STOP_HOOK], { cwd: repo, env, input });
+  assert.equal(off.status, 0, off.stderr);
+  assert.equal(off.stdout.trim(), "");
+  const setup = run(process.execPath, [SCRIPT, "setup", "--enable-review-gate", "--json"], { cwd: repo });
+  assert.equal(setup.status, 0, setup.stderr);
+  const on = run(process.execPath, [STOP_HOOK], { cwd: repo, env, input });
+  assert.equal(on.status, 0, on.stderr);
+  const payload = JSON.parse(on.stdout);
+  assert.equal(payload.decision, "block");
+  assert.match(payload.reason, /exceeded/);
 });
 
 test("stop gate hands a 300 KB last_assistant_message to Codex whole", () => {

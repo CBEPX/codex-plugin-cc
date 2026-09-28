@@ -322,9 +322,10 @@ async function handleSessionEnd(input) {
 }
 
 async function main() {
-  // 1 s: SESSION_END_BUDGET_MS starts after this read, and hooks.json's 15 s
-  // SessionEnd timeout has to cover both (asserted in tests/commands.test.mjs).
-  const { input, error } = await readHookInput({ timeoutMs: 1000 });
+  // SessionEnd 1 s: SESSION_END_BUDGET_MS starts after this read, and hooks.json's
+  // 15 s SessionEnd timeout has to cover both (asserted in tests/commands.test.mjs).
+  // SessionStart has a 60 s host timeout and nothing after the read, so 5 s.
+  const { input, error } = await readHookInput({ timeoutMs: process.argv[2] === "SessionEnd" ? 1000 : 5000 });
   if (error) {
     // No payload means no session id to clean up for; guessing one could stop
     // another session's jobs.

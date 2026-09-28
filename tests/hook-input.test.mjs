@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { PassThrough } from "node:stream";
+import { PassThrough, Readable } from "node:stream";
 
 import { IS_WIN } from "./helpers.mjs";
 import { readHookInput } from "../plugins/codex/scripts/lib/hook-input.mjs";
@@ -77,9 +77,43 @@ test("malformed JSON at EOF is invalid-json", async () => {
   assert.equal(error.code, "invalid-json");
 });
 
+test("a stdin stream error is a read-error, even after a complete object", async () => {
+  const stdin = new PassThrough();
+  const pending = readHookInput({ stdin, timeoutMs: 5000 });
+  stdin.write('{"session_id":"s1"}');
+  stdin.destroy(new Error("EIO"));
+  const { input, error } = await pending;
+  assert.equal(input, null);
+  assert.equal(error.code, "read-error");
+  assert.match(error.message, /EIO/);
+});
+
+test("an incomplete UTF-8 tail at the deadline is not dropped to make valid JSON", async () => {
+  const stdin = new PassThrough();
+  const pending = readHookInput({ stdin, timeoutMs: 100 });
+  stdin.write(Buffer.from([0x7b, 0x7d, 0xc3]));
+  const { input, error } = await pending;
+  assert.equal(input, null);
+  assert.equal(error.code, "timeout");
+  assert.equal(error.bytes, 3);
+});
+
+test("an error while destroying stdin after the read does not crash the process", async () => {
+  const stdin = new Readable({
+    read() {},
+    destroy(_error, callback) {
+      callback(new Error("close failed"));
+    }
+  });
+  const pending = readHookInput({ stdin, timeoutMs: 50 });
+  stdin.push("{}");
+  assert.deepEqual(await pending, { input: {}, error: null });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+});
+
 test("readStdinIfPiped keeps bytes across EAGAIN and refuses a partial read once retries run out", async () => {
   assert.equal(await readPipedWithGap(100), "OK part1-part2");
   if (!IS_WIN) {
-    assert.match(await readPipedWithGap(1500), /^ERR stdin stayed unreadable \(EAGAIN\)/);
+    assert.match(await readPipedWithGap(2500), /^ERR stdin stayed unreadable \(EAGAIN\)/);
   }
 });
