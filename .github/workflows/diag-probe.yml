@@ -1,7 +1,8 @@
 # Temporary: Windows identity-probe diagnostic for v1.4.1 Task 3. Remove before release.
 name: Diag identity probe
 on:
-  workflow_dispatch:
+  pull_request:
+    paths: [".github/workflows/diag-probe.yml", ".superpowers/sdd/**/diag/**"]
 jobs:
   diag:
     runs-on: windows-latest
