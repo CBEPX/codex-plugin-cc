@@ -12,7 +12,8 @@ import { pathToFileURL } from "node:url";
 import { parseProtocolLines, runPowerShell } from "../plugins/codex/scripts/lib/process.mjs";
 
 const MARKER = "codex-plugin-test-";
-const ENUMERATE_MS = 60000;
+// Measured 30-53 s on hosted Windows runners; 3 min gives that a 3x margin.
+const ENUMERATE_MS = 180000;
 
 // Protocol lines → number of leaked processes, or null when the answer is not
 // exactly LEAK* COUNT with a matching count.
