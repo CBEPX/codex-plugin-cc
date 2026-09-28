@@ -317,6 +317,60 @@ const ownIdentityCache = new Map();
 // executable path that may contain spaces.
 const DARWIN_PS_LINE = /^(\w{3} \w{3} [ \d]\d \d\d:\d\d:\d\d \d{4})\s+(.+)$/;
 
+const WIN32_PROBE_BATCH = 256;
+const WIN32_IDENTITY_ROW = /^ID (\d+) (\d+)$/;
+
+function identityProbeScript(pids) {
+  return [
+    "$ErrorActionPreference = 'Stop'",
+    `if ($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage') { exit ${WINDOWS_IDENTITY_UNAVAILABLE_EXIT} }`,
+    `foreach ($p in @(Get-Process -Id ${pids.join(",")} -ErrorAction SilentlyContinue)) {`,
+    "  try { $null = $p.Handle; Write-Output ('ID {0} {1}' -f $p.Id, $p.StartTime.ToFileTimeUtc()) } catch { }",
+    "}"
+  ].join("\n");
+}
+
+// Several pids, one probe. On win32 that is one PowerShell run for the whole
+// list (a cold start costs 0.5-3 s; per pid it would multiply); elsewhere the
+// per-pid probe is already cheap and is called unchanged. Unknown, missing or
+// unparseable → null; too many pids → the extra ones stay null.
+export function getProcessIdentities(pids, options = {}) {
+  const platform = options.platform ?? process.platform;
+  const wanted = [...new Set(pids.filter(isWin32Pid))];
+  const map = new Map(wanted.map((pid) => [pid, null]));
+  if (wanted.length === 0) {
+    return map;
+  }
+  if (platform !== "win32") {
+    for (const pid of wanted) {
+      map.set(pid, getProcessIdentity(pid, options));
+    }
+    return map;
+  }
+  const sent = new Set(wanted.slice(0, WIN32_PROBE_BATCH));
+  const probe = runPowerShell(identityProbeScript([...sent]), { ...options, timeoutMs: options.timeoutMs ?? 10000 });
+  const lines = probe.unavailable || probe.status !== 0 ? null : parseProtocolLines(probe.stdout);
+  // The whole answer must be ID rows, each for a pid this run actually sent,
+  // each pid at most once. A stray OK, a duplicate or a pid outside the batch
+  // voids the answer as a whole: partial trust in a script's output is how a
+  // wrong identity gets in.
+  const rows = [];
+  const seen = new Set();
+  for (const line of lines ?? []) {
+    const row = WIN32_IDENTITY_ROW.exec(line);
+    const pid = row ? Number(row[1]) : null;
+    if (!row || !sent.has(pid) || seen.has(pid)) {
+      return map;
+    }
+    seen.add(pid);
+    rows.push([pid, `win32:${row[2]}`]);
+  }
+  for (const [pid, identity] of rows) {
+    map.set(pid, identity);
+  }
+  return map;
+}
+
 // Who a PID belongs to, beyond the number the OS recycles (#743): its start time
 // (plus the executable on darwin, where `lstart` only has second resolution).
 // Two reads for the same process always agree; a process that inherited the PID
@@ -327,7 +381,17 @@ export function getProcessIdentity(pid, options = {}) {
   }
   const platform = options.platform ?? process.platform;
   if (platform === "win32") {
-    return null; // ponytail: CIM (CreationDate) identity lands in v1.4.0
+    if (!isWin32Pid(pid)) {
+      return null;
+    }
+    if (pid === process.pid && ownIdentityCache.has(platform)) {
+      return ownIdentityCache.get(platform);
+    }
+    const identity = getProcessIdentities([pid], options).get(pid) ?? null;
+    if (pid === process.pid && identity) {
+      ownIdentityCache.set(platform, identity);
+    }
+    return identity;
   }
   if (pid === process.pid && ownIdentityCache.has(platform)) {
     return ownIdentityCache.get(platform);
