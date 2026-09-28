@@ -9,14 +9,23 @@ import { IS_WIN, makeTempDir } from "./helpers.mjs";
 import {
   buildLaunch,
   getProcessIdentity,
+  parseProtocolLines,
+  powerShellEnvironment,
   processCommandLine,
   quoteForCmd,
+  resetWindowsIdentityCircuit,
   resolveExecutable,
   runCommand,
+  runPowerShell,
+  systemRoot,
   terminateProcessTree,
   terminateRecordedProcess,
   workerCommandLine
 } from "../plugins/codex/scripts/lib/process.mjs";
+
+const PS_UNDER = "D:\\Win\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
+const existsPs = (p) => p === PS_UNDER;
+const psBase = { env: { SystemRoot: "D:\\Win" }, timeoutMs: 1000, existsSyncImpl: existsPs };
 
 test("terminateProcessTree uses taskkill on Windows", () => {
   let captured = null;
@@ -411,4 +420,85 @@ test("workerCommandLine matches the job id literally", () => {
   assert.ok(workerCommandLine("task-a.b").test("node companion.mjs task-worker --job-id task-a.b"));
   assert.equal(workerCommandLine("task-a.b").test("node companion.mjs task-worker --job-id task-aXb"), false);
   assert.equal(workerCommandLine("task-a+").test("node companion.mjs task-worker --job-id task-aaa"), false);
+});
+
+test("systemRoot accepts only an absolute drive path that holds the in-box PowerShell", () => {
+  assert.equal(systemRoot({ SystemRoot: "D:\\Win" }, { existsSyncImpl: existsPs }), "D:\\Win");
+  assert.equal(systemRoot({ SYSTEMROOT: "D:\\Win" }, { existsSyncImpl: existsPs }), "D:\\Win");
+  for (const bad of [".", "relative\\dir", "\\\\server\\share", "D:\\", "", undefined]) {
+    assert.equal(systemRoot({ SystemRoot: bad }, { existsSyncImpl: existsPs }), null, JSON.stringify(bad));
+  }
+  assert.equal(systemRoot({ SystemRoot: "D:\\Win" }, { existsSyncImpl: () => false }), null, "launcher must exist");
+});
+
+test("powerShellEnvironment is minimal and never inherits the job's variables", () => {
+  const env = powerShellEnvironment("D:\\Win", { PATH: "C:\\repo\\tools", PSModulePath: "C:\\repo\\mods", COMPlus_EnableDiagnostics: "1", TEMP: "C:\\T", TMP: "relative" });
+  assert.deepEqual(env, {
+    SystemRoot: "D:\\Win", windir: "D:\\Win", TEMP: "C:\\T", TMP: "D:\\Win\\Temp",
+    PATH: "D:\\Win\\System32;D:\\Win", PATHEXT: ".EXE",
+    PSModulePath: "D:\\Win\\System32\\WindowsPowerShell\\v1.0\\Modules", NoDefaultCurrentDirectoryInExePath: "1"
+  });
+});
+
+test("parseProtocolLines accepts only upper-case words followed by integers", () => {
+  assert.deepEqual(parseProtocolLines("KILL\r\nSURVIVOR 4300 1337\r\nSURVIVOR 4301 1338\r\n"), ["KILL", "SURVIVOR 4300 1337", "SURVIVOR 4301 1338"]);
+  assert.deepEqual(parseProtocolLines(""), []);
+  for (const junk of ["failure 5\r\n", "OK\r\nZugriff verweigert\r\n", "4242 1337\r\nINFO: x\r\n", "KILL\nOK\t\n", "KILL\nOK\u00a0\n", "KILL\n\nOK\n", " OK\n", "OK\n\n"]) {
+    assert.equal(parseProtocolLines(junk), null, JSON.stringify(junk));
+  }
+  assert.deepEqual(parseProtocolLines("OK"), ["OK"], "a final newline is optional, nothing else is");
+});
+
+test("runPowerShell launches the in-box powershell.exe by absolute path, clean env, System32 cwd and an encoded script", () => {
+  resetWindowsIdentityCircuit();
+  let seen = null;
+  const result = runPowerShell("Write-Output OK", {
+    ...psBase, env: { SystemRoot: "D:\\Win", PSModulePath: "C:\\repo" }, timeoutMs: 1234,
+    runCommandImpl: (file, args, options) => { seen = { file, args, options }; return { status: 0, stdout: "OK\r\n", stderr: "", error: null }; }
+  });
+  assert.equal(seen.file, PS_UNDER);
+  assert.deepEqual(seen.args.slice(0, 6), ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand"]);
+  assert.equal(Buffer.from(seen.args[6], "base64").toString("utf16le"), "Write-Output OK");
+  assert.equal(seen.options.timeoutMs, 1234);
+  assert.equal(seen.options.shell, false);
+  assert.equal(seen.options.cwd, "D:\\Win\\System32");
+  assert.equal(seen.options.env.PSModulePath, "D:\\Win\\System32\\WindowsPowerShell\\v1.0\\Modules");
+  assert.equal("COMPlus_EnableDiagnostics" in seen.options.env, false);
+  assert.deepEqual(result, { status: 0, stdout: "OK\r\n", timedOut: false, unavailable: false });
+});
+
+test("runPowerShell is unavailable without a valid root or a finite budget and never spawns then", () => {
+  resetWindowsIdentityCircuit();
+  const never = () => assert.fail("must not spawn");
+  assert.equal(runPowerShell("x", { ...psBase, env: { SystemRoot: "." }, runCommandImpl: never }).unavailable, true);
+  // An invalid root trips the breaker too: a valid root right after is not spawned either.
+  assert.equal(runPowerShell("x", { ...psBase, runCommandImpl: never }).unavailable, true);
+  resetWindowsIdentityCircuit();
+  for (const timeoutMs of [0, -1, Infinity, NaN, undefined]) {
+    assert.equal(runPowerShell("x", { ...psBase, timeoutMs, runCommandImpl: never }).unavailable, true, String(timeoutMs));
+  }
+});
+
+test("runPowerShell opens the circuit on ENOENT, ETIMEDOUT or exit 244 and closes it after a minute", () => {
+  resetWindowsIdentityCircuit();
+  let clock = 1_000_000;
+  const now = () => clock;
+  let calls = 0;
+  const enoent = () => { calls += 1; return { status: null, stdout: "", stderr: "", error: Object.assign(new Error("spawn ENOENT"), { code: "ENOENT" }) }; };
+  assert.equal(runPowerShell("x", { ...psBase, runCommandImpl: enoent, now }).unavailable, true);
+  assert.equal(runPowerShell("x", { ...psBase, runCommandImpl: enoent, now }).unavailable, true);
+  assert.equal(calls, 1, "the open circuit must not spawn again");
+  clock += 60_001;
+  assert.equal(runPowerShell("x", { ...psBase, runCommandImpl: () => { calls += 1; return { status: 0, stdout: "OK", stderr: "", error: null }; }, now }).unavailable, false);
+  assert.equal(calls, 2);
+  for (const result of [
+    { status: null, stdout: "", stderr: "", error: Object.assign(new Error("spawnSync ETIMEDOUT"), { code: "ETIMEDOUT" }), signal: "SIGTERM" },
+    { status: 244, stdout: "", stderr: "", error: null }
+  ]) {
+    resetWindowsIdentityCircuit();
+    const first = runPowerShell("x", { ...psBase, runCommandImpl: () => result, now });
+    assert.equal(first.unavailable, true);
+    assert.equal(first.timedOut, result.error?.code === "ETIMEDOUT");
+    assert.equal(runPowerShell("x", { ...psBase, runCommandImpl: () => assert.fail("circuit must be open"), now }).unavailable, true);
+  }
 });

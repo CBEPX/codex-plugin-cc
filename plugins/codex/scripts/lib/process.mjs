@@ -13,6 +13,108 @@ const LAUNCHABLE = /\.(com|exe|bat|cmd)$/i;
 export function systemExe(name, env = process.env) {
   return path.win32.join(env?.SystemRoot || env?.SYSTEMROOT || "C:\\Windows", "System32", name);
 }
+
+export const WINDOWS_PROCESS_MISSING_EXIT = 241;
+export const WINDOWS_IDENTITY_MISMATCH_EXIT = 242;
+export const WINDOWS_TERMINATION_FAILED_EXIT = 243;
+export const WINDOWS_IDENTITY_UNAVAILABLE_EXIT = 244;
+export const WIN32_MAX_PID = 2147483647;
+export const isWin32Pid = (pid) => Number.isInteger(pid) && pid >= 1 && pid <= WIN32_MAX_PID;
+const WINDOWS_IDENTITY_CIRCUIT_MS = 60000;
+const WINDOWS_ROOT = /^[A-Za-z]:\\[^\\/]+/;
+const PROTOCOL_LINE = /^[A-Z]+( \d+)*$/;
+let windowsIdentityUnavailableAt = null;
+
+export function resetWindowsIdentityCircuit() {
+  windowsIdentityUnavailableAt = null;
+}
+
+// The Windows directory, taken from the environment like every other System32
+// path since v1.4.0, but only when it is an absolute drive path that really
+// holds the in-box PowerShell 5.1 (never `pwsh`, #336; never `.`, never UNC).
+export function systemRoot(env, options = {}) {
+  const root = env?.SystemRoot ?? env?.SYSTEMROOT;
+  if (typeof root !== "string" || !WINDOWS_ROOT.test(root)) {
+    return null;
+  }
+  return (options.existsSyncImpl ?? fs.existsSync)(systemPowerShell(root)) ? root : null;
+}
+
+export function systemPowerShell(root) {
+  return path.win32.join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+}
+
+// PowerShell never inherits the job's environment: no PSModulePath pointing at
+// a repository, no CLR profiler hooks, no PATH. Exactly what it needs to start.
+export function powerShellEnvironment(root, env = process.env) {
+  const temp = (name) => (typeof env?.[name] === "string" && path.win32.isAbsolute(env[name]) ? env[name] : path.win32.join(root, "Temp"));
+  return {
+    SystemRoot: root,
+    windir: root,
+    TEMP: temp("TEMP"),
+    TMP: temp("TMP"),
+    PATH: `${path.win32.join(root, "System32")};${root}`,
+    PATHEXT: ".EXE",
+    PSModulePath: path.win32.join(root, "System32", "WindowsPowerShell", "v1.0", "Modules"),
+    NoDefaultCurrentDirectoryInExePath: "1"
+  };
+}
+
+export function encodePowerShell(script) {
+  return Buffer.from(String(script), "utf16le").toString("base64");
+}
+
+// Scripts speak a machine-only protocol: upper-case words and integers. One
+// foreign line (a localised error, a stray prompt) voids the whole answer.
+export function parseProtocolLines(stdout) {
+  // No trimming: a line is the exact text between line breaks. Only the single
+  // newline that terminates the last line is optional.
+  const lines = String(stdout ?? "").split(/\r?\n/);
+  if (lines.length > 0 && lines[lines.length - 1] === "") {
+    lines.pop();
+  }
+  return lines.every((line) => PROTOCOL_LINE.test(line)) ? lines : null;
+}
+
+// One way to run PowerShell: validated absolute path, clean environment,
+// System32 as cwd, script as -EncodedCommand. A launcher that is missing,
+// invalid, hangs or reports 244 trips a per-process breaker: for a minute
+// every caller gets `unavailable` at once instead of each waiting out its own
+// timeout.
+export function runPowerShell(script, options = {}) {
+  const now = options.now ?? (() => performance.now());
+  const unavailable = { status: null, stdout: "", timedOut: false, unavailable: true };
+  const trip = () => {
+    windowsIdentityUnavailableAt = now();
+    return unavailable;
+  };
+  if (windowsIdentityUnavailableAt !== null && now() - windowsIdentityUnavailableAt < WINDOWS_IDENTITY_CIRCUIT_MS) {
+    return unavailable;
+  }
+  if (!(Number.isFinite(options.timeoutMs) && options.timeoutMs >= 1)) {
+    return unavailable;
+  }
+  const env = options.env ?? process.env;
+  const root = systemRoot(env, options);
+  if (!root) {
+    return trip();
+  }
+  const result = (options.runCommandImpl ?? runCommand)(
+    systemPowerShell(root),
+    ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encodePowerShell(script)],
+    { cwd: path.win32.join(root, "System32"), env: powerShellEnvironment(root, env), timeoutMs: options.timeoutMs, shell: false }
+  );
+  const timedOut = result.error?.code === "ETIMEDOUT" || (!result.error && result.status === null);
+  if (result.error?.code === "ENOENT" || timedOut || result.status === WINDOWS_IDENTITY_UNAVAILABLE_EXIT) {
+    windowsIdentityUnavailableAt = now();
+    return { ...unavailable, stdout: String(result.stdout ?? ""), timedOut };
+  }
+  if (!result.error) {
+    windowsIdentityUnavailableAt = null;
+  }
+  return { status: result.status ?? null, stdout: String(result.stdout ?? ""), timedOut: false, unavailable: false };
+}
+
 // cmd.exe metacharacters, escaped with ^ (cross-spawn's set).
 const CMD_META = /([()\][%!^"`<>&|;, *?])/g;
 
