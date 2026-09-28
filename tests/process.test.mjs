@@ -619,3 +619,63 @@ test("getProcessIdentity and getProcessIdentities agree on a live win32 process 
   assert.notEqual(childIdentity1, ownBatch1);
   assert.notEqual(childIdentity1, ownBatch2);
 });
+
+test("terminateRecordedProcess on win32 runs the pinned verify-and-kill script and maps its protocol", () => {
+  const clock = () => 1_700_000_000_000; // ms; deadline = clock + 3000 - 500
+  const expectedDeadline = (BigInt(1_700_000_000_000 + 2500) * 10000n + 116444736000000000n).toString();
+  const base = { identity: "win32:133700000000000000", platform: "win32", ...psBase, timeoutMs: 3000, excludePids: [555], clock };
+  const cases = [
+    [0, "KILL\r\nOK\r\n", { attempted: true, delivered: true, method: "handle", reason: "identity-match" }],
+    [0, "failure 5\r\n", { attempted: false, delivered: false, reason: "identity-unavailable" }],
+    [0, "KILL\r\nZugriff verweigert\r\n", { attempted: true, delivered: false, method: "handle", reason: "kill-failed", survivors: [], unverified: true }],
+    [241, "", { attempted: false, delivered: false, method: "handle", reason: "process-missing" }],
+    [241, "KILL\r\n", { attempted: true, delivered: false, method: "handle", reason: "kill-failed", survivors: [], unverified: true }],
+    [242, "", { attempted: false, delivered: false, method: "handle", reason: "identity-mismatch" }],
+    [242, "KILL\r\n", { attempted: true, delivered: false, method: "handle", reason: "kill-failed", survivors: [], unverified: true }],
+    [243, "KILL\r\nSURVIVOR 4300 1337\r\nSURVIVOR 4301 0\r\n", { attempted: true, delivered: false, method: "handle", reason: "kill-failed", survivors: [{ pid: 4300, identity: "win32:1337" }, { pid: 4301, identity: null }] }],
+    [243, "KILL\r\nfailure 5\r\n", { attempted: true, delivered: false, method: "handle", reason: "kill-failed", survivors: [], unverified: true }],
+    [243, "junk\r\n", { attempted: true, delivered: false, method: "handle", reason: "kill-failed", survivors: [], unverified: true }],
+    [243, "KILL\r\n", { attempted: true, delivered: false, method: "handle", reason: "kill-failed", survivors: [], unverified: true }],
+    [243, "KILL\n", { attempted: true, delivered: false, method: "handle", reason: "kill-failed", survivors: [], unverified: true }],
+    [243, "KILL\r\nOK\r\n", { attempted: true, delivered: false, method: "handle", reason: "kill-failed", survivors: [], unverified: true }],
+    [244, "", { attempted: false, delivered: false, reason: "identity-unavailable" }],
+    [244, "KILL\r\n", { attempted: true, delivered: false, method: "handle", reason: "kill-failed", survivors: [], unverified: true }],
+    [1, "", { attempted: false, delivered: false, reason: "identity-unavailable" }]
+  ];
+  for (const [status, stdout, expected] of cases) {
+    resetWindowsIdentityCircuit();
+    let script = null;
+    const result = terminateRecordedProcess(4242, { ...base, runCommandImpl: (file, args) => { script = Buffer.from(args[6], "base64").toString("utf16le"); return { status, stdout, stderr: "", error: null }; } });
+    assert.deepEqual(result, expected, `exit ${status} / ${JSON.stringify(stdout)}`);
+    assert.match(script, /LanguageMode -ne 'FullLanguage'\) \{ exit 244 \}/);
+    assert.match(script, /\$target = 4242\n/);
+    assert.match(script, /\$expected = '133700000000000000'/);
+    assert.match(script, /\$exclude = @\(555\)/);
+    assert.match(script, new RegExp(`FromFileTimeUtc\\(${expectedDeadline}\\)`), "absolute deadline counts the PowerShell start-up");
+    assert.match(script, /\$null = \$h\.Handle/, "the handle is pinned before StartTime is read");
+    assert.match(script, /catch \[System\.ArgumentException\] \{ \$code = 241; throw \}/);
+    assert.match(script, /catch \[System\.ArgumentException\] \{ continue \}/, "a child that is already gone is skipped, any other pin error aborts with 244");
+    assert.match(script, /\$t - \(\$t % 10\)/, "exact Int64 microsecond truncation");
+    assert.match(script, /app-server-broker\.mjs/);
+    assert.match(script, /\.Kill\(\)/);
+    assert.doesNotMatch(script, /taskkill|& "|Start-Process/, "no external program is ever started");
+    assert.match(script, /finally \{\n {2}foreach \(\$h in \$pinned\)/);
+    const survivorAt = script.indexOf("'SURVIVOR {0} {1}'");
+    const finallyAt = script.indexOf("} finally {");
+    assert.ok(survivorAt > 0 && finallyAt > 0 && survivorAt < finallyAt, "SURVIVOR lines are printed while the objects are still pinned");
+  }
+  // A timeout after KILL is an unverified attempt (KILL anywhere in the output counts); before it, no evidence at all.
+  const timedOut = (stdout) => ({ status: null, stdout, stderr: "", error: Object.assign(new Error("t"), { code: "ETIMEDOUT" }) });
+  for (const out of ["KILL\r\n", "warning\r\nKILL\r\n"]) {
+    resetWindowsIdentityCircuit();
+    assert.deepEqual(terminateRecordedProcess(4242, { ...base, runCommandImpl: () => timedOut(out) }), { attempted: true, delivered: false, method: "handle", reason: "kill-failed", survivors: [], unverified: true });
+  }
+  resetWindowsIdentityCircuit();
+  assert.deepEqual(terminateRecordedProcess(4242, { ...base, runCommandImpl: () => timedOut("") }), { attempted: false, delivered: false, reason: "identity-unavailable" });
+  // Malformed identity, out-of-range pid, a legacy record or a budget under 750 ms never reach PowerShell.
+  for (const override of [{ identity: "win32:abc" }, { identity: "linux:5" }, { identity: null }, { pid: 2 ** 31 }, { timeoutMs: 700 }]) {
+    resetWindowsIdentityCircuit();
+    const { pid = 4242, ...rest } = override;
+    assert.equal(terminateRecordedProcess(pid, { ...base, ...rest, runCommandImpl: () => assert.fail("must not run") }).reason, "identity-unavailable");
+  }
+});

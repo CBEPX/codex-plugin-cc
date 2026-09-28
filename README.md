@@ -178,7 +178,8 @@ Ask Codex to redesign the database connection to be more resilient.
   | `command-line-match` | a record without an identity was proven by its command line, so the signal was attempted |
   | `identity-mismatch` | the pid is no longer provably ours (another process, or a command line that did not match or could not be read); left alone |
   | `identity-unavailable` | the identity could not be read (e.g. on Windows); left alone |
-  | `kill-failed` | the ownership probe or the kill threw; the broker may still be running |
+  | `process-missing` | Windows: the pid was provably gone before anything was signalled; the record is cleaned up |
+| `kill-failed` | the ownership probe or the kill threw, or (Windows, method `handle`) the kill left survivors or its outcome could not be verified; the broker may still be running |
 
 ### `/codex:transfer`
 

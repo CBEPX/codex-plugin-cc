@@ -444,6 +444,150 @@ export function workerCommandLine(jobId) {
   return new RegExp(`task-worker.*--job-id ${escaped}(\\s|$)`);
 }
 
+const KILL_DEADLINE_MARGIN_MS = 500;
+const KILL_MIN_BUDGET_MS = 750;
+const FILETIME_EPOCH_OFFSET = 116444736000000000n;
+
+export function fileTimeAt(ms) {
+  return (BigInt(Math.floor(ms)) * 10000n + FILETIME_EPOCH_OFFSET).toString();
+}
+
+// Every substitution is digits only (validated by the caller).
+export function terminateScript(pid, fileTime, excludePids, deadlineFileTime) {
+  return [
+    "$ErrorActionPreference = 'Stop'",
+    "if ($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage') { exit 244 }",
+    "$target = <pid>",
+    "$expected = '<fileTime>'",
+    "$exclude = @(<excludePids or nothing>)",
+    "$deadline = [DateTime]::FromFileTimeUtc(<deadlineFileTime>)",
+    "$pinned = @()",
+    "function Pin([int]$id) {",
+    "  $h = [System.Diagnostics.Process]::GetProcessById($id)",
+    "  $null = $h.Handle",
+    "  $script:pinned += $h",
+    "  return $h",
+    "}",
+    "function Micro($dt) { $t = [long]$dt.ToUniversalTime().Ticks; return $t - ($t % 10) }",
+    "function Remaining() { return [int][Math]::Floor([Math]::Max(0, ($deadline - [DateTime]::UtcNow).TotalMilliseconds)) }",
+    "$tree = @()",
+    "$code = 244",
+    "try {",
+    "  try {",
+    "    try { $root = Pin $target } catch [System.ArgumentException] { $code = 241; throw } ",
+    "    if ($root.StartTime.ToFileTimeUtc().ToString() -ne $expected) { $code = 242; throw 'mismatch' }",
+    "    $rows = @(Get-CimInstance Win32_Process | Select-Object ProcessId, ParentProcessId, CreationDate, CommandLine)",
+    "    $tree = @($root)",
+    "    $starts = @{ $target = (Micro $root.StartTime) }",
+    "    $seen = @{ $target = $true }",
+    "    $queue = @($target)",
+    "    while ($queue.Count -gt 0) {",
+    "      $pp = $queue[0]",
+    "      $queue = @($queue | Select-Object -Skip 1)",
+    "      foreach ($r in $rows) {",
+    "        $cid = [int]$r.ProcessId",
+    "        if ([int]$r.ParentProcessId -ne $pp -or $seen.ContainsKey($cid)) { continue }",
+    "        $seen[$cid] = $true",
+    "        if ($exclude -contains $cid) { continue }",
+    "        if ($r.CommandLine -and $r.CommandLine.Contains('app-server-broker.mjs')) { continue }",
+    "        try { $h = Pin $cid } catch [System.ArgumentException] { continue }   # already gone: proven",
+    "        $live = Micro $h.StartTime",
+    "        if ($live -ne (Micro $r.CreationDate)) { continue }                  # a stranger holding a reused pid",
+    "        if ($live -lt $starts[$pp]) { continue }                             # stale ParentProcessId",
+    "        $starts[$cid] = $live",
+    "        $tree += $h",
+    "        $queue += $cid",
+    "      }",
+    "    }",
+    "    if ((Remaining) -lt 250) { $code = 244; throw 'budget' }",
+    "  } catch { exit $code }",
+    "  Write-Output 'KILL'",
+    "  $survivors = @()",
+    "  try {",
+    "    [array]::Reverse($tree)",
+    "    foreach ($h in $tree) { try { $h.Kill() } catch { } }",
+    "    foreach ($h in $tree) {",
+    "      $confirmed = $false",
+    "      while (-not $confirmed) {",
+    "        $left = Remaining",
+    "        if ($left -le 0) { break }",
+    "        try { if ($h.WaitForExit([Math]::Min(250, $left))) { $confirmed = $true } } catch { break }",
+    "      }",
+    "      if (-not $confirmed) { $survivors += $h }",
+    "    }",
+    "  } catch {",
+    "    $survivors = @($tree)",
+    "  }",
+    "  if ($survivors.Count -eq 0) { Write-Output 'OK'; exit 0 }",
+    "  # Identity from the still-pinned object: a later report can never be confused with a reused pid.",
+    "  foreach ($h in $survivors) { $ft = '0'; try { $ft = $h.StartTime.ToFileTimeUtc().ToString() } catch { }; Write-Output ('SURVIVOR {0} {1}' -f $h.Id, $ft) }",
+    "  exit 243",
+    "} finally {",
+    "  foreach ($h in $pinned) { try { $h.Dispose() } catch { } }",
+    "}"
+  ]
+    .join("\n")
+    .replace("<pid>", String(pid))
+    .replace("<fileTime>", fileTime)
+    .replace("<excludePids or nothing>", excludePids.join(","))
+    .replace("<deadlineFileTime>", deadlineFileTime);
+}
+
+// One PowerShell run pins the recorded process (GetProcessById + .Handle), proves
+// its start time, builds the tree from a CIM snapshot admitting only children
+// whose pinned start time equals the snapshot's at microsecond precision and
+// follows their parent's, skips the shared broker, kills children-first through
+// the pinned objects and waits for each until an absolute deadline. Every answer
+// is an exit code plus protocol lines; an exit that could not be confirmed is a
+// survivor, and a corrupted answer after KILL is an unverified attempt.
+function terminateWindowsRecordedProcess(pid, identity, options) {
+  const refused = (reason) => ({ attempted: false, delivered: false, reason });
+  const fileTime = typeof identity === "string" ? /^win32:(\d+)$/.exec(identity)?.[1] : null;
+  const timeoutMs = options.timeoutMs ?? 10000;
+  if (!fileTime || !isWin32Pid(pid) || !(Number.isFinite(timeoutMs) && timeoutMs >= KILL_MIN_BUDGET_MS)) {
+    return refused("identity-unavailable");
+  }
+  const excludePids = (options.excludePids ?? []).filter(isWin32Pid);
+  const deadline = fileTimeAt((options.clock ?? Date.now)() + timeoutMs - KILL_DEADLINE_MARGIN_MS);
+  const run = runPowerShell(terminateScript(pid, fileTime, excludePids, deadline), { ...options, timeoutMs });
+  // An exact KILL line anywhere proves the destructive phase began; a clean
+  // sequence is required for anything stronger than "attempted".
+  // `rawLines` are exact lines (no trim): "KILL" must be the whole line.
+  const rawLines = String(run.stdout ?? "").split(/\r?\n/);
+  const protocol = parseProtocolLines(run.stdout);
+  const clean = protocol !== null;
+  const killStarted = rawLines.includes("KILL");
+  const survivorRows = (protocol ?? []).slice(1).map((line) => /^SURVIVOR (\d+) (\d+)$/.exec(line));
+  const failed = (extra) => ({ attempted: true, delivered: false, method: "handle", reason: "kill-failed", ...extra });
+  const unverified = () => failed({ survivors: [], unverified: true });
+  // The exit code classifies, the protocol refines, a contradiction is unknown:
+  // a KILL line next to a pre-kill exit code cannot come from our script.
+  if (killStarted && run.status !== 0 && run.status !== WINDOWS_TERMINATION_FAILED_EXIT) {
+    return unverified();
+  }
+  if (run.unavailable) {
+    return refused("identity-unavailable");
+  }
+  switch (run.status) {
+    case 0:
+      if (clean && protocol.length === 2 && protocol[0] === "KILL" && protocol[1] === "OK") {
+        return { attempted: true, delivered: true, method: "handle", reason: "identity-match" };
+      }
+      return killStarted ? unverified() : refused("identity-unavailable");
+    case WINDOWS_PROCESS_MISSING_EXIT:
+      return { attempted: false, delivered: false, method: "handle", reason: "process-missing" };
+    case WINDOWS_IDENTITY_MISMATCH_EXIT:
+      return { attempted: false, delivered: false, method: "handle", reason: "identity-mismatch" };
+    case WINDOWS_TERMINATION_FAILED_EXIT:
+      // A 243 without at least one SURVIVOR row is not the script's answer.
+      return clean && protocol.length >= 2 && protocol[0] === "KILL" && survivorRows.every(Boolean)
+        ? failed({ survivors: survivorRows.map((row) => ({ pid: Number(row[1]), identity: row[2] === "0" ? null : `win32:${row[2]}` })) })
+        : unverified();
+    default:
+      return refused("identity-unavailable");
+  }
+}
+
 // Signals a recorded PID only once it is proven to still be the recorded
 // process: by identity when one was recorded, else (posix records from before
 // identities) by its command line. Anything unprovable is left alone and the
@@ -454,6 +598,9 @@ export function terminateRecordedProcess(pid, options = {}) {
   }
   const platform = options.platform ?? process.platform;
   const identity = options.identity ?? null;
+  if (platform === "win32") {
+    return terminateWindowsRecordedProcess(pid, identity, options);
+  }
   // null when the pid is still provably the recorded process, else why not.
   const refusal = () => {
     if (identity) {

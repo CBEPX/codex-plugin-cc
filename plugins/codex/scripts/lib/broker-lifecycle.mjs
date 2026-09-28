@@ -321,7 +321,8 @@ export async function ensureBrokerSession(cwd, options = {}) {
 // group `terminateProcessTree` kills — to something unrelated. This command-line
 // check is what a record without an identity falls back to. It answers `true` on
 // Windows, which has no cheap probe, but teardown itself refuses to signal there
-// without an identity (`identity-unavailable`, CIM identity is v1.4.0).
+// without an identity (`identity-unavailable`); with one, the kill pins the
+// process and verifies its start time first (`terminateRecordedProcess`).
 export function ownsBrokerProcess(pid, endpoint, timeoutMs, commandLine = processCommandLine(pid, { timeoutMs })) {
   if (process.platform === "win32") {
     return true;
@@ -338,7 +339,9 @@ export function ownsBrokerProcess(pid, endpoint, timeoutMs, commandLine = proces
 // wonders why a broker outlived its teardown needs to know which it was.
 // `reason` is one of: `no-pid` (nothing to signal), `identity-match` /
 // `command-line-match` (proven ours, signal attempted), `identity-mismatch`,
-// `identity-unavailable` (refused), `kill-failed` (the probe or kill threw).
+// `identity-unavailable` (refused), `process-missing` (Windows: provably gone
+// before anything was signalled), `kill-failed` (the probe or kill threw, or a
+// Windows kill left survivors).
 export function teardownBrokerSession({ endpoint = null, pidFile, logFile, sessionDir = null, pid = null, pidIdentity = null, killProcess = null, timeoutMs = undefined, ownsProcess = ownsBrokerProcess }) {
   let signalled = false;
   let reason = "no-pid";
