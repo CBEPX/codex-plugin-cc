@@ -109,7 +109,8 @@ export function splitRawArgumentString(raw) {
   let quote = null;
   let escaping = false;
 
-  for (const character of raw) {
+  for (let index = 0; index < raw.length; index += 1) {
+    const character = raw[index];
     if (escaping) {
       current += character;
       escaping = false;
@@ -117,7 +118,12 @@ export function splitRawArgumentString(raw) {
     }
 
     if (character === "\\") {
-      escaping = true;
+      const next = raw[index + 1];
+      if (next === "\"" || next === "'" || next === "\\" || /\s/.test(next ?? "")) {
+        escaping = true;
+        continue;
+      }
+      current += "\\";
       continue;
     }
 
