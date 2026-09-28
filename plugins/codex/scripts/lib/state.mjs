@@ -179,7 +179,7 @@ export function loadState(cwd) {
   }
 
   try {
-    const parsed = JSON.parse(retryOnWindows(() => fs.readFileSync(stateFile, "utf8"), ["EBUSY"]));
+    const parsed = JSON.parse(retryOnWindows(() => fs.readFileSync(stateFile, "utf8"), ["EPERM", "EBUSY"]));
     return migrateStoredConfigValues(cwd, {
       ...defaultState(),
       ...parsed,
