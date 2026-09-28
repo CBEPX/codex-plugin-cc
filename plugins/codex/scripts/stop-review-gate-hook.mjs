@@ -199,16 +199,15 @@ function runStopReview(cwd, input = {}, config = {}) {
 }
 
 // Read directly, not via getConfig: loadState turns an unreadable or corrupt
-// state file into defaults (gate off), which must not open the gate.
+// state file into defaults (gate off), which must not open the gate. Only a
+// missing file means "never configured"; EACCES on the file or a parent (where
+// existsSync would also say false) keeps the gate closed.
 function gateEnabledForProject() {
   try {
     const stateFile = resolveStateFile(resolveWorkspaceRoot(process.env.CLAUDE_PROJECT_DIR || process.cwd()));
-    if (!fs.existsSync(stateFile)) {
-      return false;
-    }
     return Boolean(JSON.parse(retryOnWindows(() => fs.readFileSync(stateFile, "utf8"), ["EPERM", "EBUSY"])).config?.stopReviewGate);
-  } catch {
-    return true;
+  } catch (error) {
+    return error?.code !== "ENOENT";
   }
 }
 

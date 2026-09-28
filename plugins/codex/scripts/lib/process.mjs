@@ -69,12 +69,20 @@ export function buildLaunch(file, args, env = process.env) {
   return { file: env?.ComSpec || systemExe("cmd.exe", env), args: ["/d", "/s", "/v:off", "/c", `"${line}"`], windowsVerbatimArguments: true };
 }
 
+// Shaped like spawnSync's own ENOENT so binaryAvailable() reads it as "not found".
+export function notFound(command) {
+  return Object.assign(new Error(`spawn ${command} ENOENT`), { code: "ENOENT", errno: -4058, syscall: `spawn ${command}`, path: command });
+}
+
 export function runCommand(command, args = [], options = {}) {
   const windows = (options.platform ?? process.platform) === "win32";
-  // win32: a path or an explicit extension is used as is, a bare name goes
-  // through where.exe; nothing found keeps the bare name, so the spawn fails
-  // with ENOENT as before.
-  const target = !windows || /[\\/]/.test(command) || LAUNCHABLE.test(command) ? command : (resolveExecutable(command, options) ?? command);
+  // win32: a path is used as is, a bare name goes through where.exe. Nothing
+  // found is reported as ENOENT without spawning: libuv would otherwise search
+  // the cwd (the reviewed repo) for a same-named .exe.
+  const target = !windows || /[\\/]/.test(command) ? command : resolveExecutable(command, options);
+  if (target === null) {
+    return { command, args, status: null, signal: null, stdout: "", stderr: "", error: notFound(command) };
+  }
   const launch = windows ? buildLaunch(target, args, options.env) : { file: command, args };
   const result = (options.spawnSyncImpl ?? spawnSync)(launch.file, launch.args, {
     cwd: options.cwd,

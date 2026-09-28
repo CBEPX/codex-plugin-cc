@@ -363,17 +363,20 @@ test("runCommand on win32 resolves a bare name with where.exe and launches the s
   assert.equal(calls[1].options.shell, false);
   assert.equal(calls[1].options.windowsVerbatimArguments, true);
 
-  // An explicit .exe or a path skips where.exe; nothing found spawns the bare name (ENOENT as before).
+  // A path skips where.exe; a bare name that resolves to nothing is ENOENT without any spawn.
   calls.length = 0;
-  runCommand("taskkill.exe", ["/PID", "1"], { platform: "win32", spawnSyncImpl });
+  runCommand("C:\\Windows\\System32\\taskkill.exe", ["/PID", "1"], { platform: "win32", spawnSyncImpl });
   runCommand("C:\\node\\node.exe", [], { platform: "win32", spawnSyncImpl });
   assert.deepEqual(calls.map((call) => [call.file, call.options.shell, call.options.windowsVerbatimArguments]), [
-    ["taskkill.exe", false, false],
+    ["C:\\Windows\\System32\\taskkill.exe", false, false],
     ["C:\\node\\node.exe", false, false]
   ]);
   calls.length = 0;
-  runCommand("npm", [], { platform: "win32", spawnSyncImpl: (file, args, options) => { calls.push({ file, options }); return file.endsWith("\\where.exe") ? { status: 1, stdout: "" } : { error: Object.assign(new Error("spawn npm ENOENT"), { code: "ENOENT" }) }; } });
-  assert.deepEqual(calls.map((call) => [call.file, call.options.shell]), [["C:\\Windows\\System32\\where.exe", false], ["npm", false]]);
+  const missing = runCommand("npm", [], { platform: "win32", spawnSyncImpl: (file, args, options) => { calls.push({ file, options }); return file.endsWith("\\where.exe") ? { status: 1, stdout: "" } : { error: Object.assign(new Error("spawn npm ENOENT"), { code: "ENOENT" }) }; } });
+  assert.equal(missing.error.code, "ENOENT");
+  assert.equal(missing.status, null);
+  // Nothing found: ENOENT is reported without a second spawn (libuv would search the cwd).
+  assert.deepEqual(calls.map((call) => [call.file, call.options.shell]), [["C:\\Windows\\System32\\where.exe", false]]);
 });
 
 // Only CI runs this: a real cmd.exe parses the line, then the shim's %* re-parses it.

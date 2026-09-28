@@ -2777,6 +2777,24 @@ test("stop hook with an unreadable state file keeps the gate closed when hook in
   assert.match(payload.reason, /hook input did not arrive/);
 });
 
+// existsSync answers false for a path under an unreadable directory, which must
+// not read as "gate never configured".
+test("stop hook with an unreadable state directory keeps the gate closed when hook input never arrives", { timeout: 30_000, skip: IS_WIN || process.getuid?.() === 0 }, async (t) => {
+  const repo = makeTempDir();
+  initGitRepo(repo);
+  const stateDir = resolveStateDir(repo);
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(path.join(stateDir, "state.json"), JSON.stringify({ config: { stopReviewGate: true } }));
+  fs.chmodSync(stateDir, 0o000);
+  t.after(() => fs.chmodSync(stateDir, 0o700));
+  const env = { ...process.env, CLAUDE_PROJECT_DIR: repo, CODEX_HOOK_STDIN_TIMEOUT_MS: "200" };
+  const result = await runHookWithOpenStdin(t, [STOP_HOOK], { cwd: repo, env });
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.decision, "block");
+  assert.match(payload.reason, /hook input did not arrive/);
+});
+
 test("stop hook input above 1 MiB allows with the gate off and blocks with it on", () => {
   const repo = makeTempDir();
   initGitRepo(repo);

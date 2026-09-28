@@ -14,7 +14,7 @@ import { spawn } from "node:child_process";
 import readline from "node:readline";
 import { parseBrokerEndpoint } from "./broker-endpoint.mjs";
 import { ensureBrokerSession, loadBrokerSession } from "./broker-lifecycle.mjs";
-import { buildLaunch, resolveExecutable, terminateProcessTree } from "./process.mjs";
+import { buildLaunch, notFound, resolveExecutable, terminateProcessTree } from "./process.mjs";
 
 const PLUGIN_MANIFEST_URL = new URL("../../.claude-plugin/plugin.json", import.meta.url);
 const PLUGIN_MANIFEST = JSON.parse(fs.readFileSync(PLUGIN_MANIFEST_URL, "utf8"));
@@ -240,11 +240,16 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
   async initialize() {
     const env = this.options.env ?? process.env;
     // No shell on Windows either: resolve codex.cmd/codex.exe and launch it the
-    // way runCommand does (unresolved keeps "codex", so `error` fires ENOENT).
-    const launch =
-      process.platform === "win32"
-        ? buildLaunch(resolveExecutable("codex", { cwd: this.cwd, env }) ?? "codex", ["app-server"], env)
-        : { file: "codex", args: ["app-server"], windowsVerbatimArguments: false };
+    // way runCommand does. Unresolved fails as ENOENT without spawning, so a
+    // codex.exe planted in the workspace never runs.
+    let launch = { file: "codex", args: ["app-server"], windowsVerbatimArguments: false };
+    if (process.platform === "win32") {
+      const resolved = resolveExecutable("codex", { cwd: this.cwd, env });
+      if (resolved === null) {
+        throw notFound("codex");
+      }
+      launch = buildLaunch(resolved, ["app-server"], env);
+    }
     this.proc = spawn(launch.file, launch.args, {
       cwd: this.cwd,
       env,
