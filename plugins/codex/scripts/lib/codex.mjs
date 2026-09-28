@@ -13,6 +13,7 @@
  *   rootThreadId: string,
  *   threadIds: Set<string>,
  *   sawSubagents: boolean,
+ *   timingOut: boolean,
  *   threadTurnIds: Map<string, string>,
  *   threadLabels: Map<string, string>,
  *   turnId: string | null,
@@ -379,6 +380,9 @@ function createTurnCaptureState(threadId, options = {}) {
     // Set once any non-main thread joins the turn: only then may completion be
     // inferred instead of waited for.
     sawSubagents: false,
+    // The turn-timeout path owns the outcome once it starts (it may close the
+    // transport itself), so the transport-exit finalizer stands down.
+    timingOut: false,
     threadTurnIds: new Map(),
     threadLabels: new Map(),
     turnId: null,
@@ -712,6 +716,7 @@ async function failTurnOnTimeout(client, state, timeoutMs) {
   if (state.completed) {
     return;
   }
+  state.timingOut = true;
   const timeoutMessage = `turn timed out after ${timeoutMs} ms`;
   state.error = { message: timeoutMessage };
   emitProgress(state.onProgress, `Turn timed out after ${timeoutMs} ms; interrupting.`, "failed");
@@ -795,6 +800,19 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
       routeNotification(message);
     }
     state.bufferedNotifications.length = 0;
+
+    // A transport that dies before the terminal notification ends the turn as
+    // failed with whatever was captured; otherwise the completion never settles
+    // (a foreground run would exit silently, a background job stay "running").
+    void client.exitPromise.then(() => {
+      if (state.completed || state.timingOut) {
+        return;
+      }
+      const error = client.exitError ?? new Error("codex app-server connection closed before the turn completed.");
+      state.error = error;
+      emitProgress(state.onProgress, `Codex transport closed: ${error.message}`, "failed");
+      completeTurn(state, { id: state.turnId ?? "transport-closed-turn", status: "failed", error });
+    });
 
     if (response.turn?.status && response.turn.status !== "inProgress") {
       completeTurn(state, response.turn);

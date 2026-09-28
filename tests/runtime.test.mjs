@@ -4250,6 +4250,45 @@ test("a failed turn whose turn/completed arrives late is still recorded as faile
   assert.match(JSON.parse(done.stdout).job.errorMessage ?? "", /Codex turn ended with status "failed"/);
 });
 
+// The server dying after the final answer but before turn/completed must still
+// end the turn: as failed, with the captured output, on both transports.
+test("a transport that exits after the final answer ends a direct turn as failed", () => {
+  const repo = seededRepo();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const seeded = run(process.execPath, [SCRIPT, "task", "initial task"], { cwd: repo, env: buildEnv(binDir) });
+  assert.equal(seeded.status, 0, seeded.stderr);
+
+  installFakeCodex(binDir, "turn-failed-silently");
+  const env = buildEnv(binDir, { FAKE_CODEX_EXIT_AFTER_FINAL_ANSWER: "1" });
+  const started = Date.now();
+  const result = run(process.execPath, [SCRIPT, "task", "--resume-last", "--turn-timeout-ms", "20000", "--json", "do the thing"], { cwd: repo, env, timeout: 40000 });
+  assert.equal(result.error, undefined);
+  assert.equal(result.status, 1, result.stderr);
+  assert.ok(Date.now() - started < 15000, "the dead transport must end the turn long before the turn timeout");
+  const status = run(process.execPath, [SCRIPT, "status", "--json"], { cwd: repo, env: buildEnv(binDir) });
+  assert.equal(status.status, 0, status.stderr);
+  const latest = JSON.parse(status.stdout).latestFinished;
+  assert.equal(latest.status, "failed");
+  assert.match(latest.errorMessage ?? "", /exited|closed/i);
+});
+
+test("a transport that exits after the final answer ends a brokered background job as failed", () => {
+  const repo = makeTempDir();
+  initGitRepo(repo);
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "turn-failed-silently");
+  const env = buildEnv(binDir, { FAKE_CODEX_EXIT_AFTER_FINAL_ANSWER: "1" });
+  const launched = run(process.execPath, [SCRIPT, "task", "--background", "--json", "do the thing"], { cwd: repo, env });
+  assert.equal(launched.status, 0, launched.stderr);
+  const jobId = JSON.parse(launched.stdout).jobId;
+  const done = run(process.execPath, [SCRIPT, "result", jobId, "--wait", "--timeout-ms", "20000", "--json"], { cwd: repo, env, timeout: 40000 });
+  assert.equal(done.status, 0, done.stderr);
+  const job = JSON.parse(done.stdout).job;
+  assert.equal(job.status, "failed");
+  assert.match(job.errorMessage ?? "", /exited|closed/i);
+});
+
 test("a subagent's terminal error does not fail the main turn", () => {
   const repo = makeTempDir();
   initGitRepo(repo);

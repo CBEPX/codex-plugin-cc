@@ -399,6 +399,14 @@ async function main() {
     void shutdownAndExit(server);
   });
 
+  // The shared app-server dying takes the broker with it: every client sees its
+  // socket close and ends its turn as failed instead of waiting on a runtime
+  // that no longer exists.
+  void appClient.exitPromise.then(() => {
+    process.stderr.write(`[broker] app-server exited${appClient.exitError ? ` (${appClient.exitError.message})` : ""}; shutting down\n`);
+    void shutdownAndExit(server);
+  });
+
   server.listen(listenTarget.path, () => {
     // Start counting down immediately: a broker that is spawned but never
     // receives a client (or whose only client connects briefly during the

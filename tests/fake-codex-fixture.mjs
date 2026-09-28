@@ -560,8 +560,13 @@ rl.on("line", (line) => {
             method: "item/completed",
             params: { threadId: thread.id, turnId, item: { type: "agentMessage", id: "msg_" + turnId, text: JSON.stringify({ error: "quota exhausted" }, null, 2), phase: "final_answer" } }
           });
-          // FAKE_CODEX_TURN_DELAY_MS here stands in for a slow relay between the
-          // final answer and the terminal notification.
+          // FAKE_CODEX_EXIT_AFTER_FINAL_ANSWER: the server dies before any
+          // terminal notification; FAKE_CODEX_TURN_DELAY_MS stands in for a slow
+          // relay between the final answer and that notification.
+          if (process.env.FAKE_CODEX_EXIT_AFTER_FINAL_ANSWER === "1") {
+            setTimeout(() => process.exit(0), 50);
+            break;
+          }
           const failed = () => send({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(turnId, "failed") } });
           if (TURN_DELAY_MS > 0) {
             setTimeout(failed, TURN_DELAY_MS);
