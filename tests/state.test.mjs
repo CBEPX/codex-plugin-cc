@@ -198,8 +198,8 @@ test("concurrent writers never leave a torn state.json for a reader", async () =
   let reads = 0;
   const deadline = Date.now() + 2000;
   while (Date.now() < deadline) {
-    // Reads like `loadState`: on Windows a read racing the rename may see EBUSY.
-    const raw = retryOnWindows(() => fs.readFileSync(stateFile, "utf8"), ["EBUSY"]);
+    // Reads like `loadState`: on Windows a read racing the rename may see EPERM/EBUSY.
+    const raw = retryOnWindows(() => fs.readFileSync(stateFile, "utf8"), ["EPERM", "EBUSY"]);
     let parsed;
     try {
       parsed = JSON.parse(raw);
