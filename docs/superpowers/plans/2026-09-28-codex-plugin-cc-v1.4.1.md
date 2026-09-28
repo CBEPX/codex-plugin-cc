@@ -4,18 +4,18 @@
 
 **Goal:** Дать Windows ту же гарантию kill-пути, что posix имеет с v1.3.0: записанный PID сигналится только после доказательства через закреплённый process handle, дерево завершается теми же handle'ами, исход без подтверждения никогда не считается доставленным; четыре win32-отказа становятся реальными kill'ами; плюс хвосты v1.4.0.
 
-**Architecture:** Один запускатель `runPowerShell` (валидированный `SystemRoot`, абсолютный путь `System32\WindowsPowerShell\v1.0\powershell.exe`, чистое минимальное окружение, cwd = System32, `-EncodedCommand`, протокол вывода `^[A-Z]+( \d+)*$`, breaker по монотонным часам). Identity = `win32:<FILETIME>` из `.NET Process.StartTime`, читаемого через объект с закреплённым `.Handle`. Проба — batch `Get-Process -Id …` (только win32, Int32). Kill — один скрипт: guard CLM → pin root (`GetProcessById` + `.Handle`) → сверка `StartTime` → CIM-снимок дерева с допуском узла только при совпадении UTC-микросекунд его закреплённого `StartTime` со снимком и ≥ родителя, без поддерева брокера, ошибка pin потомка (кроме «его уже нет») → 244 → `KILL` → `.Kill()` по закреплённым объектам, дети → родитель → `WaitForExit` до абсолютного дедлайна, неподтверждённый узел = survivor → `OK`/`SURVIVORS …`; успех только при полной последовательности `KILL`,`OK`. Никаких внешних программ, никакого `taskkill`. Survivors и `kept` доходят до всех callers на win32. posix — только два изменения из spec §6.
+**Architecture:** Один запускатель `runPowerShell` (валидированный `SystemRoot`, абсолютный путь `System32\WindowsPowerShell\v1.0\powershell.exe`, чистое минимальное окружение, cwd = System32, `-EncodedCommand`, протокол вывода `^[A-Z]+( \d+)*$`, breaker по монотонным часам). Identity = `win32:<FILETIME>` из `.NET Process.StartTime`, читаемого через объект с закреплённым `.Handle`. Проба — batch `Get-Process -Id …` (только win32, Int32). Kill — один скрипт: guard CLM → pin root (`GetProcessById` + `.Handle`) → сверка `StartTime` → CIM-снимок дерева с допуском узла только при совпадении UTC-микросекунд его закреплённого `StartTime` со снимком и ≥ родителя, без поддерева брокера, ошибка pin потомка (кроме «его уже нет») → 244 → `KILL` → `.Kill()` по закреплённым объектам, дети → родитель → `WaitForExit` до абсолютного дедлайна, неподтверждённый узел = survivor → `OK` или строки `SURVIVOR <pid> <filetime>` (identity из ещё закреплённого объекта); успех только при полной последовательности `KILL`,`OK`. Survivors **сообщаются и логируются, но не сопровождаются записями** (решение по объёму: spec §1/§5). Никаких внешних программ, никакого `taskkill`. Survivors и `kept` доходят до всех callers на win32. posix — только два изменения из spec §6.
 
 **Tech Stack:** Node ≥18.18, ESM `.mjs`, `node --test` (`scripts/run-tests.mjs`), fake Codex fixture, Windows PowerShell 5.1 (in-box), .NET `System.Diagnostics.Process`, CIM `Win32_Process` (снимок дерева), GitHub Actions с обязательным Windows.
 
-**Spec:** `docs/superpowers/specs/2026-09-28-codex-plugin-cc-v1.4.1-design.md` (rev. 5); roadmap `/Users/g.mehrenin/.claude/plans/glistening-chasing-backus.md`, разделы «v1.4.1» и «Дизайн: process identity».
+**Spec:** `docs/superpowers/specs/2026-09-28-codex-plugin-cc-v1.4.1-design.md` (rev. 6); roadmap `/Users/g.mehrenin/.claude/plans/glistening-chasing-backus.md`, разделы «v1.4.1» и «Дизайн: process identity».
 
 ## Global Constraints
 
 - Worktree `/Users/g.mehrenin/project/personal/codex-plugin-cc/.worktrees/release-v1.4.1`, ветка `release/v1.4.1` от `main` (5662171 = v1.4.0). `main` = установленный `codex@cbepx` 1.4.0 — не трогать.
 - Гейт на задачу: `npm run check && sleep 10 && [ "$(pgrep -f codex-plugin-test- | wc -l | tr -d ' ')" = 0 ] && git add <files> && git commit …` (roadmap п. 7: только `&&`, только exit-коды).
 - Только `rg`, никаких `git add -A`. Трейлер `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>`. Push ветки разрешён; PR/merge/tag — отдельный вопрос в Task 7.
-- Threat-model (spec §2): PowerShell только по валидированному абсолютному пути; чистое окружение; cwd = System32; никаких голых имён; **скрипты не запускают ни одной внешней программы**; вывод по протоколу `^[A-Z]+( \d+)*$` (`ID …`, `KILL`, `OK`, `SURVIVORS …`); `-EncodedCommand`; PID ∈ [1, 2147483647]; kill требует `timeoutMs ≥ 750`.
+- Threat-model (spec §2): PowerShell только по валидированному абсолютному пути; чистое окружение; cwd = System32; никаких голых имён; **скрипты не запускают ни одной внешней программы**; вывод по протоколу `^[A-Z]+( \d+)*$` (`ID …`, `KILL`, `OK`, `SURVIVOR <pid> <filetime>`); `-EncodedCommand`; PID ∈ [1, 2147483647]; kill требует `timeoutMs ≥ 750`.
 - Fail-closed: `null`/ошибка/таймаут/breaker/CLM никогда не разрешает kill; неподтверждённый exit = survivor, никогда `delivered:true`; записи без identity на win32 остаются `identity-unavailable`; lock-тикеты на win32 — PID-liveness; `terminateProcessTree` (живой handle app-server) — как в v1.4.0.
 - posix меняется ровно в трёх местах (spec §6): ps-guard `≤ 0`, поле `kept: false` в результате `teardownBrokerSession`, и ничего в cancel (pending-reason/JSON на posix байт-в-байт как v1.4.0). Всё новое — за `platform === "win32"`.
 - Тайминги (roadmap п. 8): Windows-only E2E — `{ skip: !IS_WIN, timeout: 90_000 }`, ожидания через `waitFor` (30 s), `t.after` регистрируется сразу после получения pid.
@@ -27,7 +27,7 @@
 2. Не-ASCII путь и не-английская локаль (#310): протокол вывода `^[A-Z]+( \d+)*$`, любая другая строка → неизвестный исход (Task 3/4 тесты с мусорным stdout).
 3. Рецикл PID и устаревший `ParentProcessId`: root и каждый узел закреплены `.Handle` до чтения `StartTime`, узлы сверяются по UTC-микросекундам без допуска (Task 4 тест на текст скрипта + маппинг 242).
 4. CLM/медленный раннер: guard `LanguageMode` в обоих скриптах → 244 → breaker → `identity-unavailable`, запись сохраняется на SessionEnd (Task 3/4/5); таймаут после `KILL` → `kill-failed` + `unverified`, exit 0 с мусором → не delivered (Task 4).
-5. Root мёртв, ребёнок жив / общий брокер как ребёнок worker'а: `SURVIVORS` → `cancellationPending` + записанные `orphans` с identity, никогда `cancelled`; брокер исключён по pid и по `app-server-broker.mjs` (Task 4 скрипт, Task 5 cancel + E2E с вторым клиентом).
+5. Survivors / общий брокер как ребёнок worker'а: `SURVIVOR`-строки → `cancellationPending` + `survivors` (pid+identity) в ответе и логе, никогда `cancelled` при живом root; брокер исключён по pid и по `app-server-broker.mjs` (Task 4 скрипт, Task 5 cancel + E2E «тот же app-server обслуживает следующий job»).
 
 ---
 
@@ -126,7 +126,7 @@ test("powerShellEnvironment is minimal and never inherits the job's variables", 
 });
 
 test("parseProtocolLines accepts only upper-case words followed by integers", () => {
-  assert.deepEqual(parseProtocolLines("KILL\r\nSURVIVORS 4300 4301\r\n"), ["KILL", "SURVIVORS 4300 4301"]);
+  assert.deepEqual(parseProtocolLines("KILL\r\nSURVIVOR 4300 1337\r\nSURVIVOR 4301 1338\r\n"), ["KILL", "SURVIVOR 4300 1337", "SURVIVOR 4301 1338"]);
   assert.deepEqual(parseProtocolLines(""), []);
   for (const junk of ["failure 5\r\n", "OK\r\nZugriff verweigert\r\n", "4242 1337\r\nINFO: x\r\n"]) {
     assert.equal(parseProtocolLines(junk), null, JSON.stringify(junk));
@@ -515,20 +515,21 @@ try {
         if ($left -le 0) { break }
         try { if ($h.WaitForExit([Math]::Min(250, $left))) { $confirmed = $true } } catch { break }
       }
-      if (-not $confirmed) { $survivors += $h.Id }
+      if (-not $confirmed) { $survivors += $h }
     }
   } catch {
-    $survivors = @($tree | ForEach-Object { $_.Id })
+    $survivors = @($tree)
   }
   if ($survivors.Count -eq 0) { Write-Output 'OK'; exit 0 }
-  Write-Output ('SURVIVORS ' + ($survivors -join ' '))
+  # Identity from the still-pinned object: a later report can never be confused with a reused pid.
+  foreach ($h in $survivors) { $ft = '0'; try { $ft = $h.StartTime.ToFileTimeUtc().ToString() } catch { }; Write-Output ('SURVIVOR {0} {1}' -f $h.Id, $ft) }
   exit 243
 } finally {
   foreach ($h in $pinned) { try { $h.Dispose() } catch { } }
 }
 ```
 
-  Для исполнителя: `.Handle` в .NET Framework открывает `PROCESS_ALL_ACCESS` и кэширует handle до `Dispose()` — `StartTime`/`Kill()`/`WaitForExit()` этого объекта идут по нему; `GetProcessById` бросает `ArgumentException` только для «процесс не запущен»; любая другая ошибка pin (access denied, CLM) у **потомка** не проглатывается — она выходит из внутреннего `try` и даёт 244 (ничего не сигналилось); `Micro` — целочисленная арифметика `Int64` без деления; `[array]::Reverse($tree)` даёт порядок дети → root; исключение `WaitForExit` = survivor. Внешний `try/finally` покрывает обе фазы. Выход `exit N` внутри `try` срабатывает после `finally`.
+  Для исполнителя: `.Handle` в .NET Framework открывает `PROCESS_ALL_ACCESS` и кэширует handle до `Dispose()` — `StartTime`/`Kill()`/`WaitForExit()` этого объекта идут по нему; `GetProcessById` бросает `ArgumentException` только для «процесс не запущен»; любая другая ошибка pin (access denied, CLM) у **потомка** не проглатывается — она выходит из внутреннего `try` и даёт 244 (ничего не сигналилось); `Micro` — целочисленная арифметика `Int64` без деления; `[array]::Reverse($tree)` даёт порядок дети → root; исключение `WaitForExit` = survivor. Внешний `try/finally` покрывает обе фазы; строки `SURVIVOR` печатаются до `finally` (объекты ещё закреплены), `0` вместо filetime означает «identity не прочитана». Выход `exit N` внутри `try` срабатывает после `finally`.
 
 - [ ] **Step 1: failing tests**
 
@@ -545,7 +546,7 @@ test("terminateRecordedProcess on win32 runs the pinned verify-and-kill script a
     [241, "KILL\r\n", { attempted: true, delivered: false, method: "handle", reason: "kill-failed", survivors: [], unverified: true }],
     [242, "", { attempted: false, delivered: false, method: "handle", reason: "identity-mismatch" }],
     [242, "KILL\r\n", { attempted: true, delivered: false, method: "handle", reason: "kill-failed", survivors: [], unverified: true }],
-    [243, "KILL\r\nSURVIVORS 4300 4301\r\n", { attempted: true, delivered: false, method: "handle", reason: "kill-failed", survivors: [4300, 4301] }],
+    [243, "KILL\r\nSURVIVOR 4300 1337\r\nSURVIVOR 4301 0\r\n", { attempted: true, delivered: false, method: "handle", reason: "kill-failed", survivors: [{ pid: 4300, identity: "win32:1337" }, { pid: 4301, identity: null }] }],
     [243, "KILL\r\nfailure 5\r\n", { attempted: true, delivered: false, method: "handle", reason: "kill-failed", survivors: [], unverified: true }],
     [243, "junk\r\n", { attempted: true, delivered: false, method: "handle", reason: "kill-failed", survivors: [], unverified: true }],
     [244, "", { attempted: false, delivered: false, reason: "identity-unavailable" }],
@@ -571,10 +572,12 @@ test("terminateRecordedProcess on win32 runs the pinned verify-and-kill script a
     assert.doesNotMatch(script, /taskkill|& "|Start-Process/, "no external program is ever started");
     assert.match(script, /finally \{\n  foreach \(\$h in \$pinned\)/);
   }
-  // A timeout after KILL is an unverified attempt; before it, no evidence at all.
+  // A timeout after KILL is an unverified attempt (KILL anywhere in the output counts); before it, no evidence at all.
   const timedOut = (stdout) => ({ status: null, stdout, stderr: "", error: Object.assign(new Error("t"), { code: "ETIMEDOUT" }) });
-  resetWindowsIdentityCircuit();
-  assert.deepEqual(terminateRecordedProcess(4242, { ...base, runCommandImpl: () => timedOut("KILL\r\n") }), { attempted: true, delivered: false, method: "handle", reason: "kill-failed", survivors: [], unverified: true });
+  for (const out of ["KILL\r\n", "warning\r\nKILL\r\n"]) {
+    resetWindowsIdentityCircuit();
+    assert.deepEqual(terminateRecordedProcess(4242, { ...base, runCommandImpl: () => timedOut(out) }), { attempted: true, delivered: false, method: "handle", reason: "kill-failed", survivors: [], unverified: true });
+  }
   resetWindowsIdentityCircuit();
   assert.deepEqual(terminateRecordedProcess(4242, { ...base, runCommandImpl: () => timedOut("") }), { attempted: false, delivered: false, reason: "identity-unavailable" });
   // Malformed identity, out-of-range pid, a legacy record or a budget under 750 ms never reach PowerShell.
@@ -624,10 +627,12 @@ function terminateWindowsRecordedProcess(pid, identity, options) {
   const excludePids = (options.excludePids ?? []).filter(isWin32Pid);
   const deadline = fileTimeAt((options.clock ?? Date.now)() + timeoutMs - KILL_DEADLINE_MARGIN_MS);
   const run = runPowerShell(terminateScript(pid, fileTime, excludePids, deadline), { ...options, timeoutMs });
-  // Protocol: the lines up to the first foreign one still count for `killStarted`.
+  // An exact KILL line anywhere proves the destructive phase began; a clean
+  // sequence is required for anything stronger than "attempted".
   const rawLines = String(run.stdout ?? "").split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
   const clean = parseProtocolLines(run.stdout) !== null;
-  const killStarted = rawLines[0] === "KILL";
+  const killStarted = rawLines.includes("KILL");
+  const survivorRows = rawLines.slice(1).map((line) => /^SURVIVOR (\d+) (\d+)$/.exec(line));
   const failed = (extra) => ({ attempted: true, delivered: false, method: "handle", reason: "kill-failed", ...extra });
   const unverified = () => failed({ survivors: [], unverified: true });
   // The exit code classifies, the protocol refines, a contradiction is unknown:
@@ -649,8 +654,8 @@ function terminateWindowsRecordedProcess(pid, identity, options) {
     case WINDOWS_IDENTITY_MISMATCH_EXIT:
       return { attempted: false, delivered: false, method: "handle", reason: "identity-mismatch" };
     case WINDOWS_TERMINATION_FAILED_EXIT:
-      return clean && killStarted && rawLines.length === 2 && rawLines[1].startsWith("SURVIVORS ")
-        ? failed({ survivors: rawLines[1].split(" ").slice(1).map(Number) })
+      return clean && rawLines[0] === "KILL" && rawLines.length >= 2 && survivorRows.every(Boolean)
+        ? failed({ survivors: survivorRows.map((row) => ({ pid: Number(row[1]), identity: row[2] === "0" ? null : `win32:${row[2]}` })) })
         : unverified();
     default:
       return refused("identity-unavailable");
@@ -666,25 +671,24 @@ function terminateWindowsRecordedProcess(pid, identity, options) {
 
 ---
 
-### Task 5: Callers на win32 — reaper batch, cancel/SessionEnd с orphans, бюджеты, сохранение записей, runtime-ожидания, Windows E2E
+### Task 5: Callers на win32 — reaper batch, cancel survivors, бюджеты, сохранение записей, runtime-ожидания, Windows E2E
 
 **Files:**
-- Modify: `plugins/codex/scripts/lib/tracked-jobs.mjs:380-440` (`reapDeadJobs`: win32 batch; `orphans` переносятся в terminal-запись)
-- Modify: `plugins/codex/scripts/lib/job-control.mjs` (новые `cancelDecision`, `recordOrphans`, `killOrphans`)
-- Modify: `plugins/codex/scripts/codex-companion.mjs:1340-1365` (cancel: `excludePids`, orphans)
+- Modify: `plugins/codex/scripts/lib/tracked-jobs.mjs:380-440` (`reapDeadJobs`: win32 batch)
+- Modify: `plugins/codex/scripts/lib/job-control.mjs` (новая `cancelDecision`; `readStoredJob` там уже объявлена — не импортировать её из `state.mjs`)
+- Modify: `plugins/codex/scripts/codex-companion.mjs:1340-1365` (cancel: `excludePids`, survivors в ответе/логе на win32)
 - Modify: `plugins/codex/scripts/session-lifecycle-hook.mjs` (константы ~22–45; `cleanupSessionJobs` ~98–166; teardown ~298–322)
 - Modify: `plugins/codex/scripts/lib/broker-lifecycle.mjs:342-380` (`teardownBrokerSession`: опции `platform`, `keepOnUnknown`, `terminateRecordedProcessImpl`; поле `kept`)
 - Modify: `plugins/codex/scripts/app-server-broker.mjs` (~294–315, `broker/shutdown`: тестовый knob `CODEX_COMPANION_BROKER_HANG_ON_SHUTDOWN=1`)
 - Modify: `tests/tracked-jobs.test.mjs:408,417,424` (явный `platform: "linux"`) и `:490` («runTrackedJob records the worker identity…»: на win32 ожидать `^win32:\d+$`, равный `getProcessIdentity(process.pid)` того же процесса, вместо `null`), `tests/broker-stale-pid.test.mjs:1365,1381` (`deepEqual` + `kept: false`)
 - Modify: `tests/runtime.test.mjs` (Step 8); `tests/helpers.mjs` (`cimTree`)
-- Test: новые тесты в `tests/tracked-jobs.test.mjs`, `tests/broker-stale-pid.test.mjs`, `tests/runtime.test.mjs`, `tests/process.test.mjs` (`cancelDecision`)
+- Test: новые тесты в `tests/tracked-jobs.test.mjs`, `tests/broker-stale-pid.test.mjs`, `tests/runtime.test.mjs`, `tests/process.test.mjs` (`cancelDecision`); `tests/runtime.test.mjs:1922` (legacy win32 `deepEqual` без `survivors`: поле добавляется в JSON только когда список непуст, поэтому ожидание остаётся верным)
 
-**Interfaces (Consumes):** `getProcessIdentities`, `terminateRecordedProcess` win32 (`process-missing`, `survivors`, `unverified`, `excludePids`). **Produces:**
-- `reapDeadJobs(…, { getProcessIdentitiesImpl })` (только win32-ветка); terminal-запись мёртвого root сохраняет `job.orphans` и добавляет в `errorMessage` « (orphaned pids: a b)».
-- `export function cancelDecision({ pid, kill, alive, platform })` → `{ pending: boolean, reason: string|null, survivors: number[] }` (`lib/job-control.mjs`).
-- `export function recordOrphans(workspaceRoot, jobId, survivors, { getProcessIdentitiesImpl })` → `[{ pid, identity }]`: пробует identity survivors одной batch-пробой и под `withStateLock` перечитывает index + job file и пишет `orphans` в оба (terminal-запись не перезаписывается).
-- `export function killOrphans(workspaceRoot, job, { timeoutMs, terminateRecordedProcessImpl })` → `{ remaining: [{pid, identity}], killed: number[] }`: каждый orphan с identity → `terminateRecordedProcess(pid, { identity, timeoutMs })`; `delivered` или `process-missing` или `isPidAlive(pid) === false` → убран; иначе остаётся; результат записывается в оба представления под тем же lock.
-- `teardownBrokerSession(…, { platform, keepOnUnknown, terminateRecordedProcessImpl })` → `{ signalled, reason, kept }`; `export function killStepMs(platform)` в хуке; job-record поле `orphans?: [{ pid, identity: string|null }]` (только win32).
+**Interfaces (Consumes):** `getProcessIdentities`, `terminateRecordedProcess` win32 (`process-missing`, `survivors: [{pid, identity}]`, `unverified`, `excludePids`). **Produces:**
+- `reapDeadJobs(…, { getProcessIdentitiesImpl })` (только win32-ветка).
+- `export function cancelDecision({ pid, kill, alive, platform })` → `{ pending: boolean, reason: string|null, survivors: [{pid, identity}] }` (`lib/job-control.mjs`); на posix `survivors` всегда `[]`, причины как в v1.4.0.
+- `teardownBrokerSession(…, { platform, keepOnUnknown, terminateRecordedProcessImpl })` → `{ signalled, reason, kept }`; `export function killStepMs(platform)` в хуке.
+- Никаких новых полей в записях job'ов: survivors живут только в ответе `cancel` (win32, когда непусто), в логе job'а и в stderr SessionEnd (spec §3.6).
 
 - [ ] **Step 1: failing tests** (reaper; в файле, где уже тестируется `reapDeadJobs`, тем же способом подготовки записей):
 
@@ -721,16 +725,6 @@ test("reapDeadJobs on win32 leaves every job alone when the batch answers nothin
   assert.equal(reaped[0].status, "running");
 });
 
-test("reapDeadJobs carries recorded orphans into the terminal record of a dead root", () => {
-  const workspace = makeTempDir();
-  const job = { id: "job-o", status: "running", pid: 999999, pidIdentity: "win32:1", orphans: [{ pid: 4301, identity: "win32:7" }] };
-  writeJobFile(workspace, job.id, job);
-  const reaped = reapDeadJobs(workspace, [job], { platform: "win32", getProcessIdentitiesImpl: () => new Map() });
-  assert.equal(reaped[0].status, "failed");
-  assert.deepEqual(reaped[0].orphans, [{ pid: 4301, identity: "win32:7" }]);
-  assert.match(reaped[0].errorMessage, /orphaned pids: 4301/);
-});
-
 test("reapDeadJobs on posix keeps its per-pid probe and per-pid budget", () => {
   const seen = [];
   let clock = 0;
@@ -745,13 +739,13 @@ test("reapDeadJobs on posix keeps its per-pid probe and per-pid budget", () => {
 ```
 
 - [ ] **Step 2: run** → FAIL.
-- [ ] **Step 3: implement reaper** — опция `getProcessIdentitiesImpl = getProcessIdentities`; helper `liveIdentityCandidate(job)` → `{pid, identity}|null` (те же проверки, что в основном цикле); **только при `platform === "win32"`** один вызов до цикла: `batch = (() => { try { return getProcessIdentitiesImpl(candidatePids, { platform, timeoutMs: remainingMs ? Math.min(IDENTITY_PROBE_MS, remainingMs()) : IDENTITY_PROBE_MS }); } catch { return new Map(); } })()`; в цикле на win32 `actual = batch.get(pid) ?? null`; posix — без изменений. В `markJobDead`: если `stored.orphans?.length` — сохранить `orphans` в terminal-записи и дописать к сообщению ` (orphaned pids: ${orphans.map(o => o.pid).join(" ")})`. Старые inject-тесты (`tests/tracked-jobs.test.mjs:408,417,424`) получают явный `platform: "linux"`; тест `:490` на win32 ожидает `^win32:\d+$` (см. Files).
-- [ ] **Step 4: `cancelDecision`, `recordOrphans`, `killOrphans` + cancel** (`lib/job-control.mjs`):
+- [ ] **Step 3: implement reaper** — опция `getProcessIdentitiesImpl = getProcessIdentities`; helper `liveIdentityCandidate(job)` → `{pid, identity}|null` (те же проверки, что в основном цикле); **только при `platform === "win32"`** один вызов до цикла: `batch = (() => { try { return getProcessIdentitiesImpl(candidatePids, { platform, timeoutMs: remainingMs ? Math.min(IDENTITY_PROBE_MS, remainingMs()) : IDENTITY_PROBE_MS }); } catch { return new Map(); } })()`; в цикле на win32 `actual = batch.get(pid) ?? null`; posix — без изменений. Старые inject-тесты (`tests/tracked-jobs.test.mjs:408,417,424`) получают явный `platform: "linux"`; тест `:490` на win32 ожидает `^win32:\d+$` (см. Files).
+- [ ] **Step 4: `cancelDecision` + cancel** (`lib/job-control.mjs`):
 
 ```js
 // What cancel does with a kill outcome. posix keeps its v1.4.0 answer; win32
 // treats survivors and an unverified attempt as "not cancelled": the job stays
-// running with the orphans on record for a later cancel or SessionEnd.
+// running and the survivors are reported, never followed by a record (spec §1).
 export function cancelDecision({ pid, kill, alive, platform = process.platform }) {
   if (!pid) {
     return { pending: false, reason: null, survivors: [] };
@@ -764,54 +758,13 @@ export function cancelDecision({ pid, kill, alive, platform = process.platform }
   const reason = kill.attempted ? (platform === "win32" ? "kill-failed" : "not-delivered") : kill.reason;
   return { pending: true, reason, survivors: platform === "win32" ? (kill.survivors ?? []) : [] };
 }
-
-// Survivors become recorded processes: probed once for their identities and
-// written into both the index and the job file under the state lock, without
-// overwriting a job that finished in the meantime.
-export function recordOrphans(workspaceRoot, jobId, survivors, options = {}) {
-  const identities = (options.getProcessIdentitiesImpl ?? getProcessIdentities)(survivors, { timeoutMs: options.timeoutMs ?? IDENTITY_PROBE_MS });
-  const orphans = survivors.map((pid) => ({ pid, identity: identities.get(pid) ?? null }));
-  withStateLock(workspaceRoot, () => {
-    const stored = readStoredJob(workspaceRoot, jobId);
-    if (stored && (stored.status === "running" || stored.status === "queued")) {
-      writeJobFile(workspaceRoot, jobId, { ...stored, orphans });
-      upsertJob(workspaceRoot, { id: jobId, orphans });
-    }
-  });
-  return orphans;
-}
-
-// Kills each recorded orphan the only way a stored pid is ever killed: by its
-// identity. Proven gone → dropped; anything unknown stays on record.
-export function killOrphans(workspaceRoot, job, options = {}) {
-  const terminate = options.terminateRecordedProcessImpl ?? terminateRecordedProcess;
-  const killed = [];
-  const remaining = [];
-  for (const orphan of job.orphans ?? []) {
-    const outcome = orphan.identity ? terminate(orphan.pid, { identity: orphan.identity, timeoutMs: options.timeoutMs }) : { attempted: false, delivered: false, reason: "identity-unavailable" };
-    if ((outcome.attempted && outcome.delivered) || outcome.reason === "process-missing" || isPidAlive(orphan.pid) === false) {
-      killed.push(orphan.pid);
-    } else {
-      remaining.push(orphan);
-    }
-  }
-  if (killed.length) {
-    withStateLock(workspaceRoot, () => {
-      const stored = readStoredJob(workspaceRoot, job.id);
-      if (stored) {
-        writeJobFile(workspaceRoot, job.id, { ...stored, orphans: remaining });
-      }
-      upsertJob(workspaceRoot, { id: job.id, orphans: remaining });
-    });
-  }
-  return { remaining, killed };
-}
 ```
 
-  (Импорты `getProcessIdentities`, `terminateRecordedProcess`, `isPidAlive` из `./process.mjs`; `withStateLock`, `readStoredJob`, `writeJobFile`, `upsertJob` из `./state.mjs`; `IDENTITY_PROBE_MS` = 2000 — если константа не экспортируется из `tracked-jobs.mjs`, объявить локально.) Тест-таблица `cancelDecision` (`tests/process.test.mjs` или `tests/job-control.test.mjs`): `[{attempted:true,delivered:true}, alive:false] → not pending`; `[{attempted:true,delivered:false,survivors:[4301]}, alive:false, win32] → pending "kill-failed" survivors [4301]`; то же на `linux` → not pending; `[{attempted:false,reason:"identity-unavailable"}, alive:true] → pending "identity-unavailable"`; `[{attempted:true,delivered:false,unverified:true}, alive:false, win32] → pending`; `[{attempted:false,reason:"process-missing"}, alive:false] → not pending`; `[{attempted:true,delivered:false}, alive:true, linux] → pending "not-delivered"`. Тесты `recordOrphans` (inject `getProcessIdentitiesImpl`; terminal-запись не перезаписывается) и `killOrphans` (inject `terminateRecordedProcessImpl`: delivered → dropped, `identity-unavailable` при живом pid → остаётся, `identity: null` → остаётся без вызова impl, несуществующий pid → dropped).
-  В `codex-companion.mjs` (~1340): импортировать `loadBrokerSession`, `cancelDecision`, `recordOrphans`, `killOrphans`; сначала `killOrphans(workspaceRoot, job)` для уже записанных orphans; затем `const brokerPid = loadBrokerSession(workspaceRoot)?.pid; const kill = terminateRecordedProcess(pid, { identity, commandLineMatch: workerCommandLine(job.id), excludePids: Number.isInteger(brokerPid) ? [brokerPid] : [] }); const decision = cancelDecision({ pid, kill, alive: isPidAlive(pid) });` — при `decision.pending`: `const orphans = decision.survivors.length ? recordOrphans(workspaceRoot, job.id, decision.survivors) : (readStoredJob(workspaceRoot, job.id)?.orphans ?? [])`; JSON-ответ `{ jobId, status: "running", cancellationPending: true, reason, orphans }` (posix — прежние поля и текст; `orphans` там всегда `[]` и **не** добавляется в JSON); лог `worker tree survivors: <pids>`. Если `!decision.pending`, но у job остались `orphans` после `killOrphans` → тоже pending с `reason: "kill-failed"` (job не `cancelled`, пока есть orphan).
-- [ ] **Step 5: хук** — `export function killStepMs(platform = process.platform) { return platform === "win32" ? 4000 : IDENTITY_PROBE_MS; }`; в `cleanupSessionJobs`: `let outcome = null;` объявляется **до** `try` (S2 — сейчас `const outcome` внутри `try`); `probeMs = Math.floor(Math.min(killStepMs(), remainingMs() / 2))`; `excludePids` = pid брокера сессии (`loadBrokerSession(cwd)` уже загружается до cleanup — передать `brokerPid`); сначала `killOrphans(workspaceRoot, job, { timeoutMs: probeMs })` для job'ов с `orphans` (включая **terminal** job'ы сессии — цикл идёт по `sessionJobs`, не только по running; для terminal-job'а без orphans — как сегодня); затем kill root как сегодня; при `outcome.survivors?.length` — `recordOrphans` и `process.stderr.write(\`[codex] SessionEnd left ${job.id} tree survivors: …\n\`)`; решение о сохранении: `const unresolved = (outcome?.survivors?.length > 0) || outcome?.unverified === true || (readStoredJob(workspaceRoot, job.id)?.orphans?.length > 0); if (reason && isPidAlive(pid) === false && !unresolved) { reason = null; }` и `if (!reason && unresolved) reason = "kill-failed";` → job `kept`. Teardown: `timeoutMs: process.platform === "win32" ? stepBudget(killStepMs()) : Math.floor(stepBudget(IDENTITY_PROBE_MS) / 2)`, `keepOnUnknown: true`; после teardown `if (!teardown.kept && loadBrokerSession(cwd)?.endpoint === brokerEndpoint) clearBrokerSession(cwd);` и `kept=${teardown.kept}` в строке решения. Тесты: `killStepMs("win32") === 4000`, `killStepMs("linux") === 2000`; cleanup с inject `terminateRecordedProcessImpl` (опция `deps` как у reaper): outcome `{attempted:true, delivered:false, reason:"kill-failed", survivors:[4301]}` при мёртвом root → job сохранён с `orphans`, stderr содержит `tree survivors: 4301`; terminal job с `orphans` и impl → delivered → orphans очищены, job удалён из индекса; `no-pid` и успешный kill → job удалён как сегодня.
-- [ ] **Step 6: `teardownBrokerSession` kept** — опции `platform = process.platform`, `keepOnUnknown = false`, `terminateRecordedProcessImpl = terminateRecordedProcess`; `let outcome = null;` **до** `try` (S2); после kill: `const unknown = platform === "win32" && (["identity-unavailable", "kill-failed"].includes(reason) || outcome?.unverified === true || outcome?.survivors?.length > 0); const kept = keepOnUnknown && !signalled && unknown;` (мёртвый root не отменяет unknown; `identity-mismatch`/`process-missing`/`no-pid` → не kept; posix → `unknown` всегда false); при `kept` пропустить unlink pid/log/endpoint-файлов; вернуть `{ signalled, reason, kept }`. `ensureBrokerSession` вызывает teardown **без** `keepOnUnknown` (stale replacement не меняется). Обновить `deepEqual` в `tests/broker-stale-pid.test.mjs:1365,1381` (`kept: false`). Тесты: `platform:"win32", keepOnUnknown:true` + impl `identity-unavailable` → `kept:true`, файлы на месте; impl `{attempted:true,delivered:false,reason:"kill-failed",survivors:[7]}` при несуществующем root pid → `kept:true`; `process-missing` → `kept:false`, файлы удалены; `identity-mismatch` → `kept:false`; `no-pid` (pid null) → `kept:false`; `identity-unavailable` на `platform:"linux"` или без `keepOnUnknown` → `kept:false`, файлы удалены.
+  Тест-таблица (`tests/process.test.mjs` или `tests/job-control.test.mjs`): `[{attempted:true,delivered:true}, alive:false] → not pending`; `[{attempted:true,delivered:false,survivors:[{pid:4301,identity:"win32:7"}]}, alive:false, win32] → pending "kill-failed" survivors [{4301,…}]`; то же на `linux` → not pending (posix как v1.4.0); `[{attempted:false,reason:"identity-unavailable"}, alive:true] → pending "identity-unavailable"`; `[{attempted:true,delivered:false,unverified:true}, alive:false, win32] → pending`; `[{attempted:false,reason:"process-missing"}, alive:false] → not pending`; `[{attempted:true,delivered:false}, alive:true, linux] → pending "not-delivered"`.
+  В `codex-companion.mjs` (~1340): импортировать `loadBrokerSession` (`./lib/broker-lifecycle.mjs`) и `cancelDecision`; `const brokerPid = loadBrokerSession(workspaceRoot)?.pid; const kill = terminateRecordedProcess(pid, { identity, commandLineMatch: workerCommandLine(job.id), excludePids: Number.isInteger(brokerPid) ? [brokerPid] : [] }); const decision = cancelDecision({ pid, kill, alive: isPidAlive(pid) });` — при `decision.pending`: JSON `{ jobId, status: "running", cancellationPending: true, reason, ...(decision.survivors.length ? { survivors: decision.survivors } : {}) }`, текст как сегодня плюс строка `worker tree survivors: <pid>:<identity|unknown> …` в лог и в вывод; posix даёт прежние поля и текст байт-в-байт (существующие posix-тесты cancel без изменений; legacy win32-тест `runtime.test.mjs:1922` тоже, так как `survivors` там пуст).
+
+- [ ] **Step 5: хук** — `export function killStepMs(platform = process.platform) { return platform === "win32" ? 4000 : IDENTITY_PROBE_MS; }`; в `cleanupSessionJobs`: `let outcome = null;` объявляется **до** `try` (сейчас `const outcome` внутри `try`); `probeMs = Math.floor(Math.min(killStepMs(), remainingMs() / 2))`; `excludePids` = pid брокера сессии (`loadBrokerSession(cwd)` уже загружается до cleanup — передать `brokerPid`); решение о сохранении job'а по **всему дереву текущего исхода**: `const unresolved = process.platform === "win32" && ((outcome?.survivors?.length > 0) || outcome?.unverified === true); if (reason && isPidAlive(pid) === false && !unresolved) { reason = null; }` и при `unresolved` — `process.stderr.write(\`[codex] SessionEnd left ${job.id} tree survivors: ${outcome.survivors.map((s) => \`${s.pid}:${s.identity ?? "unknown"}\`).join(" ") || "unverified"}\n\`)` (job остаётся через `kept`; следующий SessionEnd оценит его заново — записей о survivors нет по решению spec §1). Teardown: `timeoutMs: process.platform === "win32" ? stepBudget(killStepMs()) : Math.floor(stepBudget(IDENTITY_PROBE_MS) / 2)`, `keepOnUnknown: true`; после teardown `if (!teardown.kept && loadBrokerSession(cwd)?.endpoint === brokerEndpoint) clearBrokerSession(cwd);` и `kept=${teardown.kept}` в строке решения. Бюджет: на win32 kill каждого job'а ≤ `min(4000, remaining/2)` — с 12 s хватает на два job'а и teardown; остальное — `budget-exhausted` как сегодня. Тесты: `killStepMs("win32") === 4000`, `killStepMs("linux") === 2000`; cleanup с inject `terminateRecordedProcessImpl` (опция `deps`, как у reaper) и `platform: "win32"`: outcome `{attempted:true, delivered:false, reason:"kill-failed", survivors:[{pid:4301, identity:"win32:7"}]}` при мёртвом root → job сохранён, stderr содержит `tree survivors: 4301:win32:7`; тот же outcome на `platform: "linux"` при мёртвом root → job удалён (posix как v1.4.0); `no-pid` и успешный kill → job удалён как сегодня.
+- [ ] **Step 6: `teardownBrokerSession` kept** — опции `platform = process.platform`, `keepOnUnknown = false`, `terminateRecordedProcessImpl = terminateRecordedProcess`; `let outcome = null;` **до** `try`; после kill: `const unknown = platform === "win32" && (["identity-unavailable", "kill-failed"].includes(reason) || outcome?.unverified === true || outcome?.survivors?.length > 0); const kept = keepOnUnknown && !signalled && unknown;` (мёртвый root не отменяет unknown; `identity-mismatch`/`process-missing`/`no-pid` → не kept; posix → `unknown` всегда false); при `kept` пропустить unlink pid/log/endpoint-файлов; вернуть `{ signalled, reason, kept }`. `ensureBrokerSession` вызывает teardown **без** `keepOnUnknown` (stale replacement не меняется). Обновить `deepEqual` в `tests/broker-stale-pid.test.mjs:1365,1381` (`kept: false`). Тесты: `platform:"win32", keepOnUnknown:true` + impl `identity-unavailable` → `kept:true`, файлы на месте; impl `{attempted:true,delivered:false,reason:"kill-failed",survivors:[7]}` при несуществующем root pid → `kept:true`; `process-missing` → `kept:false`, файлы удалены; `identity-mismatch` → `kept:false`; `no-pid` (pid null) → `kept:false`; `identity-unavailable` на `platform:"linux"` или без `keepOnUnknown` → `kept:false`, файлы удалены.
 - [ ] **Step 7: broker knob** — в обработчике `broker/shutdown` (`app-server-broker.mjs` ~310), до `await shutdownAndExit(server)`: `if (process.env.CODEX_COMPANION_BROKER_HANG_ON_SHUTDOWN === "1") { send(socket, { id: message.id, result: {} }); process.stderr.write("[broker] test knob: acknowledged shutdown, staying up\n"); continue; }`. Только для тестов; README не упоминать.
 - [ ] **Step 8: runtime win32-ожидания** — `tests/runtime.test.mjs`: ~1914–1920 оставить (legacy без identity); ~2167 `cancel sends turn interrupt`: убрать `IS_WIN && status === 1`; ~2436–2476 «session end preserves background jobs»: убрать win32-ветку; ~3885–3895 turn-timeout/cancel: убрать `if (IS_WIN)`, общий путь `status 0`, `/cancelled/i`, `assert.equal(await exited, 1)`; «session end fully cleans up jobs»: без win32-ветки; снять skip с 2004 (regex → `/^(linux|darwin|win32):/`) и 4115; оставить skip на 1954 и 3906. На уровне модуля: `import { isPidAlive } from "../plugins/codex/scripts/lib/process.mjs"; const isAlive = (pid) => isPidAlive(pid) === true;` (локальный одноимённый helper — переименовать).
 - [ ] **Step 9: helper `cimTree`** (`tests/helpers.mjs`, только для Windows-тестов; бросает при ошибке, а не возвращает `[]`):
@@ -856,8 +809,9 @@ test("cancel on Windows kills a direct worker and the codex.cmd tree under it", 
   assert.equal(readPersistedJob(repo, jobId).status, "cancelled");
 });
 
-test("cancel on Windows leaves the shared broker and its subtree alive, and the same broker serves the next job", { skip: !IS_WIN, timeout: 90_000 }, async (t) => {
+test("cancel on Windows leaves the shared broker and its subtree alive, and the same app-server serves the next job", { skip: !IS_WIN, timeout: 120_000 }, async (t) => {
   const repo = seededRepo(); const binDir = makeTempDir(); installFakeCodex(binDir);
+  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
   const env = buildEnv(binDir, { FAKE_CODEX_TURN_DELAY_MS: "60000", FAKE_CODEX_IGNORE_INTERRUPT: "1", CODEX_COMPANION_BROKER_IDLE_TIMEOUT_MS: "60000" });
   const launched = run(process.execPath, [SCRIPT, "task", "--background", "--json", "hold A"], { cwd: repo, env });
   const jobA = JSON.parse(launched.stdout).jobId;
@@ -870,15 +824,18 @@ test("cancel on Windows leaves the shared broker and its subtree alive, and the 
   const brokerTree = cimTree(broker.pid);
   t.after(() => { for (const { pid } of brokerTree) { try { process.kill(pid, "SIGKILL"); } catch {} } });
   assert.ok(brokerTree.some((n) => /^cmd\.exe$/i.test(n.name)), `expected the app-server tree under the broker, got ${JSON.stringify(brokerTree)}`);
+  assert.equal(JSON.parse(fs.readFileSync(fakeStatePath, "utf8")).appServerStarts, 1);
   // The broker is A's child by ParentProcessId on Windows; the kill must skip its whole subtree.
   const cancel = run(process.execPath, [SCRIPT, "cancel", jobA, "--json"], { cwd: repo, env });
   assert.equal(cancel.status, 0, cancel.stderr);
   await waitFor(() => (!isAlive(withPid.pid) ? "gone" : null));
   assert.equal(isAlive(broker.pid), true, "the shared broker survives a worker kill");
   assert.ok(brokerTree.every((n) => isAlive(n.pid)), "the broker's subtree survives");
-  // The same broker still serves: a fresh job completes through it.
-  const next = run(process.execPath, [SCRIPT, "task", "--json", "quick C"], { cwd: repo, env: buildEnv(binDir, { CODEX_COMPANION_BROKER_IDLE_TIMEOUT_MS: "60000" }) });
-  assert.equal(next.status, 0, next.stderr);
+  // The same app-server still serves: the fake holds every turn 60 s, so bound the next job by the turn timeout
+  // and prove it went through the existing app-server (no second start) rather than a direct fallback.
+  const next = run(process.execPath, [SCRIPT, "task", "--turn-timeout-ms", "3000", "--json", "quick C"], { cwd: repo, env, timeout: 60000 });
+  assert.equal(next.error, undefined);
+  assert.equal(JSON.parse(fs.readFileSync(fakeStatePath, "utf8")).appServerStarts, 1, "no second app-server was started for the next job");
   assert.equal(loadBrokerSession(repo)?.pid, broker.pid, "no replacement broker was started");
 });
 
@@ -954,7 +911,7 @@ test("a planted PowerShell in the workspace or a relative PATH entry is never wh
 });
 ```
 
-- [ ] **Step 11: gate + commit** `feat(runtime): Windows workers and brokers are killed from their records; survivors become recorded orphans, unknown outcomes are kept`. Push; контроллер диспатчит CI — Windows-джобы зелёные с leak-шагом 0 = доказательство Task 3–5.
+- [ ] **Step 11: gate + commit** `feat(runtime): Windows workers and brokers are killed from their records; survivors are reported, unknown outcomes are kept`. Push; контроллер диспатчит CI — Windows-джобы зелёные с leak-шагом 0 = доказательство Task 3–5.
 
 ---
 
@@ -962,7 +919,7 @@ test("a planted PowerShell in the workspace or a relative PATH entry is never wh
 
 **Files:**
 - Modify: `README.md` («### Windows», ~385–395: удалить «Still limited until v1.4.1 …»; требования: Windows PowerShell 5.1 in-box; Constrained Language Mode/AppLocker → kill из записи отказывает (`identity-unavailable`), записи брокера сохраняются до следующей попытки; потомки, появившиеся после снимка, вне гарантии; общий брокер никогда не убивается вместе с worker'ом), таблица причин (`process-missing`, `kill-failed` с survivors, метод `handle`).
-- Modify: `CHANGELOG.md` + `plugins/codex/CHANGELOG.md` (`## 1.4.1 — <день релизного коммита>`: Fixed — kill из записей на Windows через закреплённые handle'ы (#743 win32, #423/#577, #336, #416, #487, #718), leak-шаг обязателен; Changed — `status` на Windows делает одну пробу на все живые job'ы; survivors становятся записанными `orphans` с identity, job остаётся `running`/`cancellationPending`, пока они не подтверждены; записи брокера сохраняются при неизвестном исходе SessionEnd (Windows); ps-guard `≤ 0`; `teardownBrokerSession` результат содержит `kept`).
+- Modify: `CHANGELOG.md` + `plugins/codex/CHANGELOG.md` (`## 1.4.1 — <день релизного коммита>`: Fixed — kill из записей на Windows через закреплённые handle'ы (#743 win32, #423/#577, #336, #416, #487, #718), leak-шаг обязателен; Changed — `status` на Windows делает одну пробу на все живые job'ы; survivors kill'а сообщаются с identity (`cancellationPending` + `survivors`), job не считается cancelled при живом root; сопровождение survivors записями — вне v1.4.1; записи брокера сохраняются при неизвестном исходе SessionEnd (Windows); ps-guard `≤ 0`; `teardownBrokerSession` результат содержит `kept`).
 - Modify: `docs/superpowers/triage/2026-09-27-upstream-triage.md` — статусы `fixed-in v1.4.1`.
 - Test: `tests/commands.test.mjs` README-assertions.
 
@@ -982,7 +939,7 @@ test("a planted PowerShell in the workspace or a relative PATH entry is never wh
 
 ## Self-review
 
-- Spec coverage: §2 → Task 2 (root/env/cwd/launch/protocol/breaker/PID-range); §3.1 → Task 3/4 (`.Handle` + `StartTime`); §3.2 → Task 2; §3.3 → Task 3 + Task 5 reaper (win32-only, отдельная fixture для пустой Map); §3.4 → Task 4 (guard CLM, pin, 241/242/243/244, exact Int64 µs UTC, child pin error → 244, `excludePids`/`app-server-broker.mjs`, `KILL`/`OK`/`SURVIVORS`, absolute deadline, без внешних программ); §3.5 → без кода (E2E проверяет `win32:` в записях); §3.6 → Task 5 Step 4 (`cancelDecision` win32-only, `excludePids`, `recordOrphans`/`killOrphans` с identity под lock) + Step 5 (SessionEnd добивает orphans, включая terminal-job'ы) + E2E (direct tree kill, broker survives + serves next job, root-dead → reaper contract); §3.7 → Task 5 Steps 5–7 (whole-tree `kept` + unresolved orphans, `keepOnUnknown` только из хука); §3.8 → Task 1; §4 → тесты Task 1–5 (B8-исправления: счёт pid по аргументу `-Id`, отдельная fixture, сериализованные абсолютные file URL, `isAlive` через `isPidAlive`, явный `platform` в трёх старых inject-тестах и win32-ожидание в тесте `runTrackedJob records the worker identity`, `kept: false` в `deepEqual`, `cimTree` реализован в helpers с таймаутом и ошибкой вместо `[]`, `let outcome` вне `try` в хуке и teardown); §5 → Task 6 + breaker; §6 → Task 1, Task 5 Step 4 (posix cancel без изменений) и Step 6.
+- Spec coverage: §2 → Task 2 (root/env/cwd/launch/protocol/breaker/PID-range); §3.1 → Task 3/4 (`.Handle` + `StartTime`); §3.2 → Task 2; §3.3 → Task 3 + Task 5 reaper (win32-only, отдельная fixture для пустой Map); §3.4 → Task 4 (guard CLM, pin, 241/242/243/244, exact Int64 µs UTC, child pin error → 244, `excludePids`/`app-server-broker.mjs`, `KILL`/`OK`/`SURVIVORS`, absolute deadline, без внешних программ); §3.5 → без кода (E2E проверяет `win32:` в записях); §3.6 → Task 5 Step 4 (`cancelDecision` win32-only, `excludePids`, survivors в ответе/логе, без записей) + E2E (direct tree kill, broker survives + same app-server serves next job via `appServerStarts`, root-dead → reaper contract); §3.7 → Task 5 Steps 5–7 (whole-tree `kept` по текущему исходу, `keepOnUnknown` только из хука); §3.8 → Task 1; §4 → тесты Task 1–5 (B8-исправления: счёт pid по аргументу `-Id`, отдельная fixture, сериализованные абсолютные file URL, `isAlive` через `isPidAlive`, явный `platform` в трёх старых inject-тестах и win32-ожидание в тесте `runTrackedJob records the worker identity`, `kept: false` в `deepEqual`, `cimTree` реализован в helpers с таймаутом и ошибкой вместо `[]`, `let outcome` вне `try` в хуке и teardown); §5 → Task 6 + breaker; §6 → Task 1, Task 5 Step 4 (posix cancel без изменений) и Step 6.
 - Placeholder scan: все шаги с кодом/командами; условных E2E больше нет (`--background --resume-last` поддерживается: cold resume даёт прямой транспорт).
-- Type consistency: `runPowerShell` → `{ status, stdout, timedOut, unavailable }` (Task 2/3/4); `parseProtocolLines` → `string[]|null` (Task 2/3/4); `getProcessIdentities` → `Map<number,string|null>` (Task 3/5); `terminateRecordedProcess` win32 → `{ attempted, delivered, method?, reason, survivors?, unverified? }` (Task 4/5); `fileTimeAt(ms)` (Task 4); `cancelDecision` → `{ pending, reason, survivors }`, `recordOrphans` → `[{pid, identity}]`, `killOrphans` → `{ remaining, killed }` (Task 5); job-record `orphans?: [{pid, identity}]`; `teardownBrokerSession(…, { platform, keepOnUnknown, terminateRecordedProcessImpl })` → `{ signalled, reason, kept }` (Task 5); `killStepMs(platform)` (Task 5); `cimTree(pid)` → `[{pid,name}]` (Task 5); `isWin32Pid`/`WIN32_MAX_PID` (Task 2/3/4); тестовые helpers `PS_UNDER`/`existsPs`/`psBase` определены один раз в `tests/process.test.mjs`.
+- Type consistency: `runPowerShell` → `{ status, stdout, timedOut, unavailable }` (Task 2/3/4); `parseProtocolLines` → `string[]|null` (Task 2/3/4); `getProcessIdentities` → `Map<number,string|null>` (Task 3/5); `terminateRecordedProcess` win32 → `{ attempted, delivered, method?, reason, survivors?, unverified? }` (Task 4/5); `fileTimeAt(ms)` (Task 4); `cancelDecision` → `{ pending, reason, survivors: [{pid, identity}] }` (Task 5); `survivors` из Task 4 — `[{pid, identity|null}]`; `teardownBrokerSession(…, { platform, keepOnUnknown, terminateRecordedProcessImpl })` → `{ signalled, reason, kept }` (Task 5); `killStepMs(platform)` (Task 5); `cimTree(pid)` → `[{pid,name}]` (Task 5); `isWin32Pid`/`WIN32_MAX_PID` (Task 2/3/4); тестовые helpers `PS_UNDER`/`existsPs`/`psBase` определены один раз в `tests/process.test.mjs`.
 - Review Focus 1–5 → Task 2 env/argv + Task 5 sentinel; Task 2 protocol + Task 3/4 junk stdout (exit 0 + junk ≠ delivered); Task 4 скрипт (pin, exact µs UTC) + тест 242; Task 3/4 guard + timeout-after-KILL + Task 5 whole-tree `kept`; Task 4 survivors + Task 5 `cancelDecision` + E2E брокер A/B.
