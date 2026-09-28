@@ -11,7 +11,6 @@ import fs from "node:fs";
 import net from "node:net";
 import process from "node:process";
 import { spawn } from "node:child_process";
-import readline from "node:readline";
 import { parseBrokerEndpoint } from "./broker-endpoint.mjs";
 import { ensureBrokerSession, loadBrokerSession } from "./broker-lifecycle.mjs";
 import { buildLaunch, notFound, resolveExecutable, terminateProcessTree } from "./process.mjs";
@@ -281,9 +280,11 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
       this.handleExit(detail);
     });
 
-    this.readline = readline.createInterface({ input: this.proc.stdout });
-    this.readline.on("line", (line) => {
-      this.handleLine(line);
+    // Frames end at "\n" only. `readline` also breaks lines at U+2028/U+2029,
+    // which JSON leaves raw inside strings, so a notification carrying either
+    // arrived as two unparsable halves and the app-server was declared dead.
+    this.proc.stdout.on("data", (chunk) => {
+      this.handleChunk(chunk);
     });
 
     await this.request("initialize", {
@@ -323,10 +324,6 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
 
   async closeOnce() {
     this.closed = true;
-
-    if (this.readline) {
-      this.readline.close();
-    }
 
     const timers = [];
     if (this.proc && this.proc.exitCode === null && this.proc.signalCode === null) {

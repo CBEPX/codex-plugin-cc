@@ -100,6 +100,43 @@ test("permission approval requests grant nothing for the turn", () => {
 // SIGTERM (or is wedged in a tool call) used to leave it awaiting process exit
 // forever. TERM, then KILL, then give up on the process rather than the caller.
 // Windows: a SIGTERM-immune child is not modelled (kill() there is always TerminateProcess).
+// Codex serialises notifications as JSON lines and leaves U+2028/U+2029 raw
+// (JSON allows them). A reader that treats those as line breaks splits the
+// frame in two, fails to parse either half and declares the app-server dead —
+// every turn whose command or output carried such a character ended as
+// "connection closed before the turn completed".
+test("a notification containing U+2028/U+2029 is one frame, not a dead transport", { timeout: 15000 }, async (t) => {
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const text = "line\u2028separator\u2029paragraph";
+  const client = await CodexAppServerClient.connect(binDir, {
+    disableBroker: true,
+    env: buildEnv(binDir, { FAKE_CODEX_ANSWER_TEXT: text })
+  });
+  t.after(() => client.close().catch(() => {}));
+
+  const messages = [];
+  let settle;
+  const completed = new Promise((resolve) => {
+    settle = resolve;
+  });
+  client.notificationHandler = (message) => {
+    messages.push(message);
+    if (message.method === "turn/completed") {
+      settle("completed");
+    }
+  };
+  void client.exitPromise.then(() => settle("exit"));
+
+  const thread = await client.request("thread/start", { cwd: binDir });
+  await client.request("turn/start", { threadId: thread.thread.id, input: [{ type: "text", text: "echo please" }] });
+
+  assert.equal(await completed, "completed", client.exitError?.message ?? "transport closed without an error");
+  assert.equal(client.exitError, null);
+  const answer = messages.find((m) => m.method === "item/completed" && m.params?.item?.type === "agentMessage");
+  assert.equal(answer?.params.item.text, text, "the frame must arrive whole, characters intact");
+});
+
 test("close() bounds an app-server that ignores SIGTERM", { timeout: 8000, skip: IS_WIN }, async (t) => {
   const binDir = makeTempDir();
   installFakeCodex(binDir);
