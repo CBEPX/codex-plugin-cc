@@ -8,7 +8,7 @@
 
 **Tech Stack:** Node ≥18.18, ESM `.mjs`, `node --test` (`scripts/run-tests.mjs`), fake Codex fixture, Windows PowerShell 5.1 (in-box), .NET `System.Diagnostics.Process`, CIM `Win32_Process` (снимок дерева), GitHub Actions с обязательным Windows.
 
-**Spec:** `docs/superpowers/specs/2026-09-28-codex-plugin-cc-v1.4.1-design.md` (rev. 10; план rev. 11); roadmap `/Users/g.mehrenin/.claude/plans/glistening-chasing-backus.md`, разделы «v1.4.1» и «Дизайн: process identity».
+**Spec:** `docs/superpowers/specs/2026-09-28-codex-plugin-cc-v1.4.1-design.md` (rev. 10; план rev. 12); roadmap `/Users/g.mehrenin/.claude/plans/glistening-chasing-backus.md`, разделы «v1.4.1» и «Дизайн: process identity».
 
 ## Global Constraints
 
@@ -874,10 +874,22 @@ test("reapDeadJobs on posix keeps its per-pid probe and per-pid budget", () => {
   });
   assert.deepEqual(seen, [1500]);
 });
+
+// A 2 s budget is shorter than a cold PowerShell start (up to 3 s): the probe
+// times out, the launcher's breaker opens for a minute, and the cancel that
+// follows is refused as identity-unavailable without ever running.
+test("reapDeadJobs on win32 gives the batch probe a cold-start budget bounded by the deadline", () => {
+  const seen = [];
+  const impl = (pids, opts) => { seen.push(opts.timeoutMs); return new Map(pids.map((p) => [p, null])); };
+  const jobs = [{ id: "j", status: "running", pid: process.pid, pidIdentity: "win32:1" }];
+  reapDeadJobs(makeTempDir(), jobs, { platform: "win32", getProcessIdentitiesImpl: impl });
+  reapDeadJobs(makeTempDir(), jobs, { platform: "win32", getProcessIdentitiesImpl: impl, remainingMs: () => 1500 });
+  assert.deepEqual(seen, [6000, 1500]);
+});
 ```
 
 - [ ] **Step 2: run** → FAIL.
-- [ ] **Step 3: implement reaper** — `tracked-jobs.mjs`: импорт `getProcessIdentities` из `./process.mjs` рядом с `getProcessIdentity`; в JSDoc над функцией (`tracked-jobs.mjs:374`) в тип `options` добавить `getProcessIdentitiesImpl?: typeof getProcessIdentities` (иначе `npm run typecheck` даёт TS2339); `reapDeadJobs` целиком (изменения: опция `getProcessIdentitiesImpl`, `probeMs`, `liveIdentityCandidate`, `batch`, ветка `actual`):
+- [ ] **Step 3: implement reaper** — `tracked-jobs.mjs`: импорт `getProcessIdentities` из `./process.mjs` рядом с `getProcessIdentity`; в JSDoc над функцией (`tracked-jobs.mjs:374`) в тип `options` добавить `getProcessIdentitiesImpl?: typeof getProcessIdentities` (иначе `npm run typecheck` даёт TS2339); рядом с `IDENTITY_PROBE_MS` (~371) добавить `const WIN32_BATCH_PROBE_MS = 6000; // one cold PowerShell start (≤3 s) with margin`; `reapDeadJobs` целиком (изменения: опция `getProcessIdentitiesImpl`, `probeMs`, `liveIdentityCandidate`, `batch`, ветка `actual`):
 
 ```js
 export function reapDeadJobs(workspaceRoot, jobs, options = {}) {
@@ -897,6 +909,10 @@ export function reapDeadJobs(workspaceRoot, jobs, options = {}) {
     return lockWaitMs === undefined ? left : Math.min(lockWaitMs, left);
   };
   const probeMs = () => (remainingMs ? Math.min(IDENTITY_PROBE_MS, remainingMs()) : IDENTITY_PROBE_MS);
+  // One PowerShell for the whole batch may start cold (up to 3 s on a slow
+  // runner); a budget under that trips the launcher's breaker and blocks the
+  // next minute of kills. Still bounded by the caller's deadline.
+  const batchProbeMs = () => (remainingMs ? Math.min(WIN32_BATCH_PROBE_MS, remainingMs()) : WIN32_BATCH_PROBE_MS);
   // The jobs the identity probe can judge: still running by the index and on
   // disk, with a live pid that carries an identity — the same tests the loop
   // below applies, so the batch never probes a pid the loop would not.
@@ -923,7 +939,7 @@ export function reapDeadJobs(workspaceRoot, jobs, options = {}) {
     const candidatePids = [...new Set(jobs.map(liveIdentityCandidate).filter(Boolean).map((candidate) => candidate.pid))];
     if (candidatePids.length > 0 && !(remainingMs && remainingMs() < REAP_MIN_STEP_MS)) {
       try {
-        batch = getProcessIdentitiesImpl(candidatePids, { platform, timeoutMs: probeMs() });
+        batch = getProcessIdentitiesImpl(candidatePids, { platform, timeoutMs: batchProbeMs() });
       } catch {
         batch = new Map();
       }
@@ -1215,7 +1231,7 @@ export function cleanupSessionJobs(cwd, sessionId, lockWaitMs, remainingMs, deps
 
   Бюджет: на win32 kill каждого job'а ≤ `min(4000, remaining/2)` — с 12 s хватает на два job'а и teardown; остальное — `budget-exhausted` как сегодня.
 
-  Тесты (`tests/session-lifecycle-hook.test.mjs`, новый; импорт `{ cleanupSessionJobs, killStepMs }` из `../plugins/codex/scripts/session-lifecycle-hook.mjs`, `{ loadState, upsertJob }` из `../plugins/codex/scripts/lib/state.mjs`, `makeTempDir` из `./helpers.mjs`; записи сажаются как в `tests/tracked-jobs.test.mjs` — `upsertJob(repo, { id, status: "running", sessionId, background: false, pid: 4300, pidIdentity: "win32:1", … })` с теми же обязательными полями, что там):
+  Тесты (`tests/session-lifecycle-hook.test.mjs`, новый; импорт `{ cleanupSessionJobs, killStepMs }` из `../plugins/codex/scripts/session-lifecycle-hook.mjs`, `{ loadState, upsertJob }` из `../plugins/codex/scripts/lib/state.mjs`, `makeTempDir` из `./helpers.mjs`; записи сажаются через `upsertJob` как в примерах ниже — дополнительных обязательных полей он не требует):
 
 ```js
 test("killStepMs gives a Windows kill one PowerShell run's worth of budget", () => {
@@ -1265,7 +1281,7 @@ test("SessionEnd passes the broker pid as the excluded subtree", () => {
 });
 ```
 
-  (Импорт `spawnSync` из `node:child_process`. Если `upsertJob` требует полей, которых нет в примере, — взять минимальный набор из существующего теста `tests/tracked-jobs.test.mjs`, где записи сажаются для `reapDeadJobs`. Третий тест использует тот же `deadPid` вместо `4300`.)
+  (Импорт `spawnSync` из `node:child_process`.)
 
 - [ ] **Step 6: `teardownBrokerSession` kept** — `broker-lifecycle.mjs` (`process` уже импортирован; `terminateRecordedProcess` тоже), функция целиком:
 
