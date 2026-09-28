@@ -66,18 +66,16 @@ jobs:
           path: test-output.log
           retention-days: 7
 
-      # Same check as the local gate. Windows is reported, not enforced, until
-      # the Windows kill path lands (v1.4.1); it runs even after a red suite so
+      # Same check as the local gate on every OS, enforced everywhere. Windows
+      # enumerates through the plugin's own PowerShell launcher and reads only
+      # its protocol (scripts/check-leaks.mjs); it runs even after a red suite so
       # the leak list is always available.
       - name: No leaked test processes
         if: always()
         shell: bash
         run: |
           sleep 10
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            powershell -NoProfile -Command "\$p = @(Get-CimInstance Win32_Process | Where-Object { \$_.CommandLine -match 'codex-plugin-test-' }); Write-Output ('Leaked test processes after 10 s: ' + \$p.Count); \$p | Select-Object ProcessId,ParentProcessId,Name,@{n='Cmd';e={\$_.CommandLine.Substring(0,[Math]::Min(160,\$_.CommandLine.Length))}} | Format-Table -AutoSize | Out-String -Width 220" | tee -a "$GITHUB_STEP_SUMMARY"
-          elif pgrep -af codex-plugin-test- ; then echo "leaked test processes" >&2; exit 1; fi
-
+          node scripts/check-leaks.mjs | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Run build
         run: npm run build
