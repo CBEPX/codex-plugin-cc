@@ -506,10 +506,18 @@ test("session end reaps a SIGKILLed background worker instead of keeping its bro
   assert.equal(cleanup.status, 0, cleanup.stderr);
 
   const exited = await waitUntil(() => (isAlive(broker.pid) ? null : "exited"), { timeoutMs: 5000 });
+  // Read only on failure: a broker that did exit has already removed its log.
+  const brokerLogTail = () => {
+    try {
+      return fs.readFileSync(broker.logFile, "utf8").split("\n").slice(-20).join("\n");
+    } catch {
+      return "(broker log gone)";
+    }
+  };
   assert.equal(
     exited,
     "exited",
-    `a dead worker must not keep the broker alive; hook said: ${cleanup.stderr.trim()}\nbroker log tail:\n${fs.readFileSync(broker.logFile, "utf8").split("\n").slice(-20).join("\n")}`
+    `a dead worker must not keep the broker alive; hook said: ${cleanup.stderr.trim()}\nbroker log tail:\n${exited === "exited" ? "" : brokerLogTail()}`
   );
   assert.equal(loadBrokerSession(workspace), null, "the broker record must be cleared");
 
