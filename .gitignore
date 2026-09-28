@@ -151,5 +151,6 @@ plugins/codex/.generated/
 
 # git worktrees (project-local)
 .worktrees/
-reports/
+# c8/Stryker output at the repo root only; docs/superpowers/reports/ is tracked.
+/reports/
 .stryker-tmp/
