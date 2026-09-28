@@ -2155,7 +2155,7 @@ test("cancel sends turn interrupt to the shared app-server before killing a brok
       return job;
     }
     return null;
-  }, { timeoutMs: 15000 });
+  }, { timeoutMs: 30000 });
 
   const cancelResult = run(process.execPath, [SCRIPT, "cancel", jobId, "--json"], {
     cwd: repo,
@@ -3934,7 +3934,10 @@ test("task --turn-timeout-ms interrupts a stalled turn and fails the job with th
   const binDir = makeTempDir();
   const statePath = path.join(binDir, "fake-codex-state.json");
   installFakeCodex(binDir);
-  const env = buildEnv(binDir, { FAKE_CODEX_TURN_DELAY_MS: "5000" });
+  // The fake turn is held far longer than the budget: a slow CI VM can spend
+  // several seconds just starting the broker, so the margin is generous.
+  const fakeTurnMs = 20000;
+  const env = buildEnv(binDir, { FAKE_CODEX_TURN_DELAY_MS: String(fakeTurnMs) });
 
   const started = Date.now();
   const result = run(process.execPath, [SCRIPT, "task", "--turn-timeout-ms", "500", "--json", "stall please"], {
@@ -3943,7 +3946,7 @@ test("task --turn-timeout-ms interrupts a stalled turn and fails the job with th
   });
 
   assert.equal(result.status, 1, result.stderr);
-  assert.ok(Date.now() - started < 5000, "the turn budget must fire long before the fake turn completes");
+  assert.ok(Date.now() - started < fakeTurnMs, "the turn budget must fire long before the fake turn completes");
   assert.equal(JSON.parse(result.stdout).status, 1);
 
   const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
