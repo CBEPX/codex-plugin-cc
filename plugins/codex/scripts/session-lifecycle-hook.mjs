@@ -17,6 +17,7 @@ import { loadState, resolveJobPid, resolveStateFile, saveState, STATE_LOCK_TIMEO
 import { reapDeadJobs } from "./lib/tracked-jobs.mjs";
 import { TRANSCRIPT_PATH_ENV } from "./lib/claude-session-transfer.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
+import { readHookInput } from "./lib/hook-input.mjs";
 
 export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
 // How long a `busy` broker is given to shed a client this hook has just reaped,
@@ -61,14 +62,6 @@ function resolveSessionEndBudgetMs(env = process.env) {
   return configured;
 }
 const PLUGIN_DATA_ENV = "CLAUDE_PLUGIN_DATA";
-
-function readHookInput() {
-  const raw = fs.readFileSync(0, "utf8").trim();
-  if (!raw) {
-    return {};
-  }
-  return JSON.parse(raw);
-}
 
 function shellEscape(value) {
   return `'${String(value).replace(/'/g, `'\"'\"'`)}'`;
@@ -329,7 +322,15 @@ async function handleSessionEnd(input) {
 }
 
 async function main() {
-  const input = readHookInput();
+  // 1 s: SESSION_END_BUDGET_MS starts after this read, and hooks.json's 15 s
+  // SessionEnd timeout has to cover both (asserted in tests/commands.test.mjs).
+  const { input, error } = await readHookInput({ timeoutMs: 1000 });
+  if (error) {
+    // No payload means no session id to clean up for; guessing one could stop
+    // another session's jobs.
+    process.stderr.write(`[codex] ${process.argv[2] ?? "session"} hook skipped: ${error.code}: ${error.message}\n`);
+    return;
+  }
   const eventName = process.argv[2] ?? input.hook_event_name ?? "";
 
   if (eventName === "SessionStart") {

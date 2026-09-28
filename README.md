@@ -247,7 +247,7 @@ You can also use `/codex:setup` to manage the optional review gate.
 /codex:setup --disable-review-gate
 ```
 
-When the review gate is enabled, the plugin uses a `Stop` hook to run a targeted Codex review based on Claude's response. If that review finds issues, the stop is blocked so Claude can address them first. When the review itself fails (timeout, killed by a signal, invalid output), the block reason says why and ends with `Disable with /codex:setup --disable-review-gate.`
+When the review gate is enabled, the plugin uses a `Stop` hook to run a targeted Codex review based on Claude's response. If that review finds issues, the stop is blocked so Claude can address them first. When the review itself fails (timeout, killed by a signal, invalid output), the block reason says why and ends with `Disable with /codex:setup --disable-review-gate.` Both hooks read their input from stdin against a deadline (1 s for `SessionEnd`, before its budget starts; 2 s for `Stop`), so a disabled gate never waits on a stdin Claude Code leaves open, while an enabled gate blocks when the input never arrives.
 
 To pin the model and reasoning effort the gate's review uses, independently of your Codex config:
 

@@ -477,4 +477,11 @@ test("the SessionEnd hook timeout stays above the hook's own budget", () => {
     timeoutSeconds * 1000 > budgetMs,
     `hooks.json SessionEnd timeout (${timeoutSeconds}s) must exceed the hook budget (${budgetMs}ms)`
   );
+  // The budget starts only after the bounded stdin read, so the timeout covers both.
+  const readMs = Number(/readHookInput\(\{ timeoutMs: (\d+) \}\)/.exec(source)?.[1]);
+  assert.ok(Number.isFinite(readMs), "the hook must bound its stdin read with an explicit timeoutMs");
+  assert.ok(
+    timeoutSeconds * 1000 > budgetMs + readMs,
+    `hooks.json SessionEnd timeout (${timeoutSeconds}s) must exceed the stdin read (${readMs}ms) plus the budget (${budgetMs}ms)`
+  );
 });

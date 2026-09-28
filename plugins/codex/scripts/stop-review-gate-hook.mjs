@@ -1,12 +1,12 @@
 #!/usr/bin/env node
 
-import fs from "node:fs";
 import process from "node:process";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { getCodexAvailability } from "./lib/codex.mjs";
+import { readHookInput } from "./lib/hook-input.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import { getConfig, setConfig, listJobs } from "./lib/state.mjs";
 import { sortJobsNewestFirst } from "./lib/job-control.mjs";
@@ -24,14 +24,6 @@ const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = path.resolve(SCRIPT_DIR, "..");
 const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
 const GATE_ROUNDS_CONFIG_KEY = "stopReviewGateRoundsBySession";
-
-function readHookInput() {
-  const raw = fs.readFileSync(0, "utf8").trim();
-  if (!raw) {
-    return {};
-  }
-  return JSON.parse(raw);
-}
 
 function emitDecision(payload) {
   process.stdout.write(`${JSON.stringify(payload)}\n`);
@@ -150,10 +142,13 @@ function runStopReview(cwd, input = {}, config = {}) {
   if (config.stopReviewGateEffort) {
     args.push("--effort", config.stopReviewGateEffort);
   }
-  args.push(prompt);
+  // Via stdin, not argv: a long last_assistant_message overruns the argv limit
+  // (32 KiB on Windows, 128 KiB per argument on Linux).
+  args.push("--prompt-stdin");
   const result = spawnSync(process.execPath, args, {
     cwd,
     env: childEnv,
+    input: prompt,
     encoding: "utf8",
     timeout: Math.max(1, Math.floor(STOP_REVIEW_TIMEOUT_OVERRIDE_MS || STOP_REVIEW_TIMEOUT_MS)),
     killSignal: "SIGKILL",
@@ -197,14 +192,27 @@ function runStopReview(cwd, input = {}, config = {}) {
   }
 }
 
-function main() {
-  let input;
+function gateEnabledForProject() {
   try {
-    input = readHookInput();
+    return Boolean(getConfig(resolveWorkspaceRoot(process.env.CLAUDE_PROJECT_DIR || process.cwd())).stopReviewGate);
   } catch {
+    return true;
+  }
+}
+
+async function main() {
+  const { input, error } = await readHookInput();
+  if (error) {
+    // Nothing arrived and the gate is off: nothing to review, so allow (#530).
+    if (error.code === "timeout" && error.bytes === 0 && !gateEnabledForProject()) {
+      return;
+    }
     emitDecision({
       decision: "block",
-      reason: "The stop review gate could not read or parse hook input; refusing to fail open."
+      reason:
+        error.code === "invalid-json"
+          ? "The stop review gate could not read or parse hook input; refusing to fail open."
+          : `The stop review gate could not read hook input (${error.message}); refusing to fail open. ${ESCAPE_HATCH}`
     });
     return;
   }
@@ -259,10 +267,8 @@ function main() {
   logNote(runningTaskNote);
 }
 
-try {
-  main();
-} catch (error) {
+main().catch((error) => {
   const message = error instanceof Error ? error.message : String(error);
   process.stderr.write(`${message}\n`);
   process.exitCode = 1;
-}
+});
