@@ -8,7 +8,7 @@
 
 **Tech Stack:** Node ≥18.18, ESM `.mjs`, `node --test` (`scripts/run-tests.mjs`), fake Codex fixture, Windows PowerShell 5.1 (in-box), .NET `System.Diagnostics.Process`, CIM `Win32_Process` (снимок дерева), GitHub Actions с обязательным Windows.
 
-**Spec:** `docs/superpowers/specs/2026-09-28-codex-plugin-cc-v1.4.1-design.md` (rev. 9; план rev. 10); roadmap `/Users/g.mehrenin/.claude/plans/glistening-chasing-backus.md`, разделы «v1.4.1» и «Дизайн: process identity».
+**Spec:** `docs/superpowers/specs/2026-09-28-codex-plugin-cc-v1.4.1-design.md` (rev. 10; план rev. 11); roadmap `/Users/g.mehrenin/.claude/plans/glistening-chasing-backus.md`, разделы «v1.4.1» и «Дизайн: process identity».
 
 ## Global Constraints
 
@@ -436,13 +436,22 @@ test("getProcessIdentities on win32 probes every pid in one PowerShell run and p
   assert.equal(map.get(7), "win32:133700000000000001");
   assert.equal(map.get(99), null, "a pid the probe did not print is null");
   assert.equal(map.size, 3);
-  assert.equal(getProcessIdentity(4242, options), "win32:133700000000000000");
-  // A foreign line, a duplicate pid or an unrequested pid voids the whole answer.
+  // A single probe asks for one pid and gets one row back.
+  resetWindowsIdentityCircuit();
+  assert.equal(getProcessIdentity(4242, { ...options, runCommandImpl: () => ({ status: 0, stdout: "ID 4242 133700000000000000\r\n", stderr: "", error: null }) }), "win32:133700000000000000");
+});
+
+test("getProcessIdentities rejects the whole answer on a foreign line, a duplicate pid or an unrequested pid", () => {
   for (const stdout of ["ID 4242 7\r\nOK\r\n", "ID 4242 7\r\nID 4242 8\r\n", "ID 4242 7\r\nID 5 9\r\n"]) {
     resetWindowsIdentityCircuit();
-    const partial = getProcessIdentities([4242, 7], { ...options, runCommandImpl: () => ({ status: 0, stdout, stderr: "", error: null }) });
+    const partial = getProcessIdentities([4242, 7], { platform: "win32", ...psBase, runCommandImpl: () => ({ status: 0, stdout, stderr: "", error: null }) });
     assert.deepEqual([...partial.values()], [null, null], JSON.stringify(stdout));
   }
+  // Only the pids actually sent to PowerShell (the first 256) may be answered.
+  resetWindowsIdentityCircuit();
+  const overflow = getProcessIdentities(Array.from({ length: 300 }, (_, i) => 1000 + i), { platform: "win32", ...psBase, runCommandImpl: () => ({ status: 0, stdout: "ID 1299 42\r\n", stderr: "", error: null }) });
+  assert.equal(overflow.get(1299), null, "a pid beyond the batch was never asked about");
+  assert.ok([...overflow.values()].every((value) => value === null));
 });
 
 test("getProcessIdentities caps a batch at 256 Int32 pids and never marks the launcher unavailable for size", () => {
@@ -515,17 +524,19 @@ export function getProcessIdentities(pids, options = {}) {
     }
     return map;
   }
-  const probe = runPowerShell(identityProbeScript(wanted.slice(0, WIN32_PROBE_BATCH)), { ...options, timeoutMs: options.timeoutMs ?? 10000 });
+  const sent = new Set(wanted.slice(0, WIN32_PROBE_BATCH));
+  const probe = runPowerShell(identityProbeScript([...sent]), { ...options, timeoutMs: options.timeoutMs ?? 10000 });
   const lines = probe.unavailable || probe.status !== 0 ? null : parseProtocolLines(probe.stdout);
-  // The whole answer must be ID rows, each for a requested pid, each pid at most
-  // once. A stray OK, a duplicate or an unrequested pid voids the answer as a
-  // whole: partial trust in a script's output is how a wrong identity gets in.
+  // The whole answer must be ID rows, each for a pid this run actually sent,
+  // each pid at most once. A stray OK, a duplicate or a pid outside the batch
+  // voids the answer as a whole: partial trust in a script's output is how a
+  // wrong identity gets in.
   const rows = [];
   const seen = new Set();
   for (const line of lines ?? []) {
     const row = WIN32_IDENTITY_ROW.exec(line);
     const pid = row ? Number(row[1]) : null;
-    if (!row || !map.has(pid) || seen.has(pid)) {
+    if (!row || !sent.has(pid) || seen.has(pid)) {
       return map;
     }
     seen.add(pid);
@@ -866,7 +877,7 @@ test("reapDeadJobs on posix keeps its per-pid probe and per-pid budget", () => {
 ```
 
 - [ ] **Step 2: run** → FAIL.
-- [ ] **Step 3: implement reaper** — `tracked-jobs.mjs`: импорт `getProcessIdentities` из `./process.mjs` рядом с `getProcessIdentity`; `reapDeadJobs` целиком (изменения: опция `getProcessIdentitiesImpl`, `probeMs`, `liveIdentityCandidate`, `batch`, ветка `actual`):
+- [ ] **Step 3: implement reaper** — `tracked-jobs.mjs`: импорт `getProcessIdentities` из `./process.mjs` рядом с `getProcessIdentity`; в JSDoc над функцией (`tracked-jobs.mjs:374`) в тип `options` добавить `getProcessIdentitiesImpl?: typeof getProcessIdentities` (иначе `npm run typecheck` даёт TS2339); `reapDeadJobs` целиком (изменения: опция `getProcessIdentitiesImpl`, `probeMs`, `liveIdentityCandidate`, `batch`, ветка `actual`):
 
 ```js
 export function reapDeadJobs(workspaceRoot, jobs, options = {}) {
@@ -1220,11 +1231,13 @@ test("SessionEnd keeps a job whose tree left survivors and drops one whose kill 
     ["win32", { attempted: true, delivered: true, method: "handle", reason: "identity-match" }, false, null],
     ["win32", { attempted: false, delivered: false, reason: "no-pid" }, false, null]
   ];
+  // A pid that is provably dead: a child that has already exited (reaped by
+  // spawnSync), so no table row depends on which pids the host happens to use.
+  const deadPid = spawnSync(process.execPath, ["-e", "0"]).pid;
   for (const [platform, outcome, keptExpected, stderrPattern] of cases) {
     const repo = makeTempDir();
     const sessionId = "session-1";
-    // pid 4300 is not alive here (a dead root); the outcome decides on its own.
-    upsertJob(repo, { id: "job-1", status: "running", sessionId, background: false, pid: 4300, pidIdentity: platform === "win32" ? "win32:1" : "linux:1" });
+    upsertJob(repo, { id: "job-1", status: "running", sessionId, background: false, pid: deadPid, pidIdentity: platform === "win32" ? "win32:1" : "linux:1" });
     const written = [];
     const original = process.stderr.write;
     process.stderr.write = (chunk) => { written.push(String(chunk)); return true; };
@@ -1243,7 +1256,8 @@ test("SessionEnd keeps a job whose tree left survivors and drops one whose kill 
 
 test("SessionEnd passes the broker pid as the excluded subtree", () => {
   const repo = makeTempDir();
-  upsertJob(repo, { id: "job-1", status: "running", sessionId: "s", background: false, pid: 4300, pidIdentity: "win32:1" });
+  const deadPid = spawnSync(process.execPath, ["-e", "0"]).pid;
+  upsertJob(repo, { id: "job-1", status: "running", sessionId: "s", background: false, pid: deadPid, pidIdentity: "win32:1" });
   let seen = null;
   cleanupSessionJobs(repo, "s", 1000, () => 8000, { platform: "win32", brokerPid: 555, terminateRecordedProcessImpl: (pid, options) => { seen = options; return { attempted: true, delivered: true, method: "handle", reason: "identity-match" }; } });
   assert.deepEqual(seen.excludePids, [555]);
@@ -1251,7 +1265,7 @@ test("SessionEnd passes the broker pid as the excluded subtree", () => {
 });
 ```
 
-  (Если `upsertJob` требует полей, которых нет в примере, — взять минимальный набор из существующего теста `tests/tracked-jobs.test.mjs`, где записи сажаются для `reapDeadJobs`; `isPidAlive(4300) === false` предполагается — при коллизии с живым pid тест берёт `pid` из `spawn`+`kill` как в Task 5 Step 1.)
+  (Импорт `spawnSync` из `node:child_process`. Если `upsertJob` требует полей, которых нет в примере, — взять минимальный набор из существующего теста `tests/tracked-jobs.test.mjs`, где записи сажаются для `reapDeadJobs`. Третий тест использует тот же `deadPid` вместо `4300`.)
 
 - [ ] **Step 6: `teardownBrokerSession` kept** — `broker-lifecycle.mjs` (`process` уже импортирован; `terminateRecordedProcess` тоже), функция целиком:
 
