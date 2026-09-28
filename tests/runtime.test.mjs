@@ -38,7 +38,9 @@ const FAKE_RESOLVED_SETTINGS = {
   }
 };
 
-async function waitFor(predicate, { timeoutMs = 5000, intervalMs = 50 } = {}) {
+// 30 s: hosted Windows VMs have been seen 2-3x slower for hours; a detached
+// worker can take >10 s just to reach `running` there.
+async function waitFor(predicate, { timeoutMs = 30000, intervalMs = 50 } = {}) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
     const value = await predicate();
