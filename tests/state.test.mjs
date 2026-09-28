@@ -36,13 +36,14 @@ const STATE_MODULE = path.resolve(
   "state.mjs"
 );
 
-test("resolveStateDir uses a temp-backed per-workspace directory", () => {
+test("resolveStateDir uses a per-user fallback root per workspace", () => {
   const workspace = makeTempDir();
   const stateDir = resolveStateDir(workspace);
+  // Windows with %LOCALAPPDATA% set (CI runners have it) roots under it; everywhere else the temp dir.
+  const expectedRoot = process.platform === "win32" && process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, "codex-companion") : os.tmpdir();
 
-  assert.equal(stateDir.startsWith(os.tmpdir()), true);
+  assert.equal(stateDir.startsWith(expectedRoot), true, stateDir);
   assert.match(path.basename(stateDir), /.+-[a-f0-9]{16}$/);
-  assert.match(stateDir, new RegExp(`^${os.tmpdir().replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
 });
 
 test("resolveStateDir uses CLAUDE_PLUGIN_DATA when it is provided", () => {
