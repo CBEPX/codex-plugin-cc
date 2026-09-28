@@ -487,7 +487,11 @@ test("runTrackedJob records the worker identity and clears it with the pid", asy
     return { exitStatus: 0, payload: {}, rendered: "", summary: "" };
   });
   assert.equal(running.pid, process.pid);
-  assert.equal(running.pidIdentity, process.platform === "win32" ? null : getProcessIdentity(process.pid));
+  const ownIdentity = getProcessIdentity(process.pid);
+  assert.equal(running.pidIdentity, ownIdentity);
+  if (process.platform === "win32") {
+    assert.match(String(running.pidIdentity), /^win32:\d+$/, "a Windows worker records its start-time identity");
+  }
   const done = readJobFile(resolveJobFile(workspace, "job-identity"));
   assert.deepEqual([done.pid, done.pidIdentity], [null, null]);
   const indexed = listJobs(workspace).find((entry) => entry.id === "job-identity");
