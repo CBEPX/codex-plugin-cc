@@ -18,7 +18,9 @@ test("family alias resolves to the listed model with the lowest priority, newest
 
 test("a catalogue-only alias resolves from the catalogue, newest family on a priority tie", () => {
   assert.equal(FALLBACK_ALIASES.has("nova"), false);
+  // The older family is listed first in the fixture, so a stable sort by priority alone would pick it.
   assert.equal(resolveModelAlias("nova", catalog), "gpt-7-nova");
+  assert.equal(resolveModelAlias("nova", [...catalog].reverse()), "gpt-7-nova");
   assert.equal(resolveModelAlias("nova", []), "nova", "without the catalogue it passes through");
 });
 

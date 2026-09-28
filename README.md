@@ -177,8 +177,8 @@ Ask Codex to redesign the database connection to be more resilient.
   | --- | --- |
   | `no-pid` | no broker pid was recorded; nothing to signal |
   | `identity-match` | the pid was proven to be this broker by its recorded identity, so the signal was attempted (`signalled` says whether it landed) |
-  | `command-line-match` | a record without an identity was proven by its command line and signalled |
-  | `identity-mismatch` | the pid now belongs to another process; left alone |
+  | `command-line-match` | a record without an identity was proven by its command line, so the signal was attempted |
+  | `identity-mismatch` | the pid is no longer provably ours (another process, or a command line that did not match or could not be read); left alone |
   | `identity-unavailable` | the identity could not be read (e.g. on Windows); left alone |
   | `kill-failed` | the ownership probe or the kill threw; the broker may still be running |
 

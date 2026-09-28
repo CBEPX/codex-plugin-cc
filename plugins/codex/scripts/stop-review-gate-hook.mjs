@@ -49,7 +49,7 @@ function getMaxRounds() {
   if (Number.isInteger(parsed) && parsed >= 0) {
     return parsed;
   }
-  logNote(`Ignoring CODEX_REVIEW_GATE_MAX_ROUNDS=${JSON.stringify(raw)}: not a non-negative integer; using ${DEFAULT_MAX_ROUNDS}.`);
+  logNote(`Ignoring CODEX_REVIEW_GATE_MAX_ROUNDS=${JSON.stringify(raw)}: not a plain digit string; using ${DEFAULT_MAX_ROUNDS}.`);
   return DEFAULT_MAX_ROUNDS;
 }
 
