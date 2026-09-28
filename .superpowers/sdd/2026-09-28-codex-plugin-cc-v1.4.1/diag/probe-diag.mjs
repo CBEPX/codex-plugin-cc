@@ -1,43 +1,28 @@
-// Temporary Windows diagnostic (v1.4.1 Task 3): which inherited variable makes
-// PowerShell start in 0.4 s instead of 22 s under the clean environment.
+// Temporary Windows diagnostic (v1.4.1 Task 3): minimise the inherited
+// environment to the variables that keep powershell.exe starting in <2 s.
 import { spawnSync } from "node:child_process";
 import path from "node:path";
 import { encodePowerShell, powerShellEnvironment, systemPowerShell, systemRoot } from "../../../../plugins/codex/scripts/lib/process.mjs";
 
 const root = systemRoot(process.env);
 const clean = powerShellEnvironment(root, process.env);
-console.log("clean env:", JSON.stringify(clean));
-console.log("inherited PSModulePath:", JSON.stringify(process.env.PSModulePath));
-const script = "Write-Output 'OK'";
-const launch = (env) => {
+const launchMs = (env) => {
   const t = Date.now();
-  const r = spawnSync(systemPowerShell(root), ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encodePowerShell(script)],
+  const r = spawnSync(systemPowerShell(root), ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encodePowerShell("Write-Output 'OK'")],
     { cwd: path.win32.join(root, "System32"), env, encoding: "utf8", windowsHide: true, timeout: 60000, shell: false });
-  return `${Date.now() - t} ms status ${r.status} stdout ${JSON.stringify(r.stdout)} stderr-len ${r.stderr.length}`;
+  return r.status === 0 ? Date.now() - t : 99999;
 };
-const pick = (...names) => Object.fromEntries(names.filter((n) => process.env[n] !== undefined).map((n) => [n, process.env[n]]));
-const groups = {
-  baseline_clean: {},
-  inherited_full: null,
-  USERPROFILE: pick("USERPROFILE"),
-  APPDATA_LOCALAPPDATA: pick("APPDATA", "LOCALAPPDATA"),
-  HOME: pick("HOMEDRIVE", "HOMEPATH"),
-  SystemDrive: pick("SystemDrive"),
-  ProgramFiles: pick("ProgramFiles", "ProgramFiles(x86)", "ProgramW6432", "CommonProgramFiles", "CommonProgramFiles(x86)", "CommonProgramW6432"),
-  ProgramData: pick("ProgramData", "ALLUSERSPROFILE", "PUBLIC"),
-  ComSpec: pick("ComSpec"),
-  USER: pick("USERNAME", "USERDOMAIN", "COMPUTERNAME", "LOGONSERVER"),
-  PROCESSOR: pick("PROCESSOR_ARCHITECTURE", "PROCESSOR_IDENTIFIER", "PROCESSOR_LEVEL", "PROCESSOR_REVISION", "NUMBER_OF_PROCESSORS", "OS"),
-  inherited_PSModulePath: pick("PSModulePath"),
-  inherited_PATH: pick("PATH", "Path"),
-};
-for (const [name, extra] of Object.entries(groups)) {
-  const env = extra === null ? process.env : { ...clean, ...extra };
-  console.log(`== ${name}: ${launch(env)}`);
+const fast = (keys) => launchMs({ ...clean, ...Object.fromEntries(keys.map((k) => [k, process.env[k]])) }) < 3000;
+let keep = Object.keys(process.env).filter((k) => !(k in clean) && !/^(PATH|Path)$/.test(k));
+console.log("candidates:", keep.length, "clean+all fast:", fast(keep));
+let chunk = Math.ceil(keep.length / 2);
+while (chunk >= 1) {
+  let i = 0;
+  while (i < keep.length) {
+    const without = keep.filter((_, j) => j < i || j >= i + chunk);
+    if (fast(without)) { keep = without; } else { i += chunk; }
+  }
+  chunk = Math.floor(chunk / 2);
 }
-// Complement: inherited env minus one group each (which removal makes it slow?)
-for (const name of ["USERPROFILE", "APPDATA_LOCALAPPDATA", "HOME", "SystemDrive", "ProgramFiles", "ProgramData", "ComSpec", "USER", "PROCESSOR"]) {
-  const env = { ...process.env };
-  for (const k of Object.keys(groups[name])) delete env[k];
-  console.log(`== inherited minus ${name}: ${launch(env)}`);
-}
+console.log("MINIMAL FAST SET:", JSON.stringify(Object.fromEntries(keep.map((k) => [k, process.env[k]]))));
+for (const k of keep) console.log(`== clean + ${k} alone: ${launchMs({ ...clean, [k]: process.env[k] })} ms`);
