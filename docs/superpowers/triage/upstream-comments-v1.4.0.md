@@ -116,3 +116,16 @@ claude plugin marketplace add CBEPX/codex-plugin-cc && claude plugin install cod
 ```
 
 This is a fork release, not an upstream fix, so I'm leaving this issue open for the maintainers here.
+
+---
+
+## Fixed earlier (v1.3.0), not announced yet
+
+### #626 — teardownBrokerSession: unguarded pid/log unlinkSync throws EPERM on Windows
+
+Fixed in CBEPX/codex-plugin-cc v1.3.0 (https://github.com/CBEPX/codex-plugin-cc/releases/tag/v1.3.0): broker teardown now treats the pid-file and log-file unlink as best-effort, the same as the other cleanup steps in that function, so an EPERM on Windows no longer fails the whole job; a broker that already cleared its own record during teardown is tolerated too. Upstream PRs #650 and #666 used as reference, thanks @SomSamantray and @Hughhhhcoder.
+
+### #633 — duplicate of #626
+
+Same fix as #626: shipped in CBEPX/codex-plugin-cc v1.3.0 (https://github.com/CBEPX/codex-plugin-cc/releases/tag/v1.3.0) — best-effort pid/log unlink during broker teardown. Thanks @SomSamantray (#650) and @Hughhhhcoder (#666) for the reference PRs.
+
