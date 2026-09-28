@@ -38,6 +38,7 @@
 - Modify: `plugins/codex/scripts/lib/process.mjs:196-207` (`processCommandLine`, ps-ветка)
 - Test: `tests/process.test.mjs`
 - Investigate: `tests/broker-stale-pid.test.mjs` («session end reaps a SIGKILLed background worker …», ~448–520)
+- Done before Task 1 (commit «fix(app-server): read JSONL frames on newline only»): `node:readline` резал JSONL app-server на U+2028/U+2029, любой turn с таким символом в команде/выводе падал как «connection closed before the turn completed» (оба транспорта); `SpawnedCodexAppServerClient` читает через `handleChunk`, тест «a notification containing U+2028/U+2029 is one frame» в `tests/app-server.test.mjs`, knob `FAKE_CODEX_ANSWER_TEXT`. В Task 6 CHANGELOG: Fixed — эта строка.
 
 **Interfaces:** `processCommandLine(pid, { timeoutMs })` — сигнатура прежняя; `timeoutMs` задан и `≤ 0` → `null` без спавна.
 
