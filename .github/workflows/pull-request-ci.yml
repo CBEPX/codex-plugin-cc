@@ -19,9 +19,6 @@ jobs:
     runs-on: ${{ matrix.os }}
     # Windows runners have been seen 2-3x slower for hours at a time.
     timeout-minutes: 40
-    # Spike: Windows is exploratory until the test harness runs there
-    # (fake codex is a shebang script; see docs/superpowers/plans step 0).
-    continue-on-error: ${{ startsWith(matrix.os, 'windows') }}
     strategy:
       fail-fast: false
       matrix:
@@ -64,7 +61,7 @@ jobs:
 
       # Same check as the local gate. Windows is reported, not enforced, until
       # the Windows kill path lands (v1.4.1); it runs even after a red suite so
-      # the leak list is available while that job is continue-on-error.
+      # the leak list is always available.
       - name: No leaked test processes
         if: always()
         shell: bash
