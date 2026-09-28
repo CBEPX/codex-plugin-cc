@@ -331,11 +331,11 @@ test("quoteForCmd escapes every argument so cmd.exe and the shim's %* both pass 
 
 test("buildLaunch runs .exe directly and .cmd through cmd.exe /d /s /c with verbatim arguments", () => {
   assert.deepEqual(buildLaunch("C:\\bin\\codex.exe", ["a b"], {}), { file: "C:\\bin\\codex.exe", args: ["a b"], env: {}, windowsVerbatimArguments: false });
-  assert.deepEqual(buildLaunch("C:\\Program Files\\npm\\codex.cmd", ["app-server", "a&b"], { ComSpec: "C:\\Windows\\system32\\cmd.exe" }), {
+  assert.deepEqual(buildLaunch("C:\\Program Files\\npm\\codex.cmd", ["app-server", "a&b"], { ComSpec: "C:\\Windows\\system32\\cmd.exe", Path: '.;tools;"C:\\npm";C:\\node' }), {
     file: "C:\\Windows\\system32\\cmd.exe",
     args: ["/d", "/s", "/v:off", "/c", '"C:\\Program^ Files\\npm\\codex.cmd ^^^"app-server^^^" ^^^"a^^^&b^^^""'],
-    // cmd.exe must not find the shim's bare `node` in the cwd.
-    env: { ComSpec: "C:\\Windows\\system32\\cmd.exe", NoDefaultCurrentDirectoryInExePath: "1" },
+    // cmd.exe must not find the shim's bare `node` in the cwd or via a relative PATH entry.
+    env: { ComSpec: "C:\\Windows\\system32\\cmd.exe", Path: "C:\\npm;C:\\node", NoDefaultCurrentDirectoryInExePath: "1" },
     windowsVerbatimArguments: true
   });
   assert.equal(buildLaunch("C:\\x\\run.BAT", [], {}).file, "C:\\Windows\\System32\\cmd.exe");
@@ -382,10 +382,14 @@ test("runCommand round-trips awkward arguments through a .cmd shim in a director
   fs.writeFileSync(path.join(dir, "argv-shim.cmd"), '@echo off\r\nnode "%~dp0argv.cjs" %*\r\n');
   const args = ["plain", "with space", 'q"uote', "", "%PATH%", "a&b", "trail\\", "^caret", "!bang!", "C:\\Program Files (x86)\\x"];
   const env = { ...process.env, PATH: `${dir};${process.env.PATH}` };
-  // A `node.cmd` planted in the cwd must not be what the shim's bare `node` resolves to.
+  // A `node.cmd` planted in the cwd, or under a relative PATH entry, must not be
+  // what the shim's bare `node` resolves to.
   const repo = makeTempDir();
-  fs.writeFileSync(path.join(repo, "node.cmd"), "@echo off\r\necho HIJACKED\r\n");
-  const result = runCommand("argv-shim", args, { env, cwd: repo });
+  fs.mkdirSync(path.join(repo, "tools"));
+  for (const planted of ["node.cmd", path.join("tools", "node.cmd")]) {
+    fs.writeFileSync(path.join(repo, planted), "@echo off\r\necho HIJACKED\r\n");
+  }
+  const result = runCommand("argv-shim", args, { env: { ...env, PATH: `.;tools;${env.PATH}` }, cwd: repo });
   assert.equal(result.error, null);
   assert.equal(result.status, 0, result.stderr);
   assert.deepEqual(JSON.parse(result.stdout), args);

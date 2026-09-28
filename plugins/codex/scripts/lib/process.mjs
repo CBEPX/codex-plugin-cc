@@ -22,14 +22,23 @@ const CMD_META = /([()\][%!^"`<>&|;, *?])/g;
 // install path must survive), and never the current directory — a repo must not
 // plant a codex.cmd, so relative PATH entries are skipped as well. An
 // extensionless file (npm's bash shim next to codex.cmd) is never a hit.
+// PATH as absolute directories only: relative entries (".", "tools") would be
+// resolved against the cwd, i.e. the reviewed repo. Returns the env key that
+// carried it (win32 env keys are case-insensitive; injected objects are not).
+export function absolutePathEntries(env) {
+  const key = Object.keys(env ?? {}).find((name) => name.toUpperCase() === "PATH") ?? "PATH";
+  const dirs = String(env?.[key] ?? "")
+    .split(";")
+    .map((dir) => dir.trim().replace(/^"(.*)"$/, "$1"))
+    .filter((dir) => dir && path.win32.isAbsolute(dir));
+  return { key, dirs };
+}
+
 export function resolveExecutable(command, options = {}) {
   const env = options.env ?? process.env;
   const exists = options.existsSyncImpl ?? fs.existsSync;
   const extensions = String(env.PATHEXT ?? env.Pathext ?? ".COM;.EXE;.BAT;.CMD").split(";").filter((ext) => LAUNCHABLE.test(ext));
-  const dirs = String(env.PATH ?? env.Path ?? "")
-    .split(";")
-    .map((dir) => dir.trim().replace(/^"(.*)"$/, "$1"))
-    .filter((dir) => dir && path.win32.isAbsolute(dir));
+  const { dirs } = absolutePathEntries(env);
   for (const dir of dirs) {
     for (const ext of extensions) {
       const candidate = path.win32.join(dir, command + ext);
@@ -64,13 +73,15 @@ export function buildLaunch(file, args, env = process.env) {
   if (!/\.(bat|cmd)$/i.test(file)) {
     return { file, args, env, windowsVerbatimArguments: false };
   }
+  const { key, dirs } = absolutePathEntries(env);
   const line = [file.replace(CMD_META, "^$1"), ...args.map(quoteForCmd)].join(" ");
   return {
     file: env?.ComSpec || systemExe("cmd.exe", env),
     args: ["/d", "/s", "/v:off", "/c", `"${line}"`],
     // The shim itself runs a bare `node`, which cmd.exe would look up in the
-    // cwd (the reviewed repo) before PATH; this flag turns that off.
-    env: { ...env, NoDefaultCurrentDirectoryInExePath: "1" },
+    // cwd (the reviewed repo) before PATH; the flag turns that off and the
+    // shim sees only the absolute PATH entries the resolver used.
+    env: { ...env, [key]: dirs.join(";"), NoDefaultCurrentDirectoryInExePath: "1" },
     windowsVerbatimArguments: true
   };
 }
