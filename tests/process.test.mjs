@@ -303,10 +303,13 @@ test("resolveExecutable takes where.exe's first PATHEXT hit and skips the extens
   };
   assert.equal(resolveExecutable("codex", { env: { PATHEXT: ".COM;.EXE;.BAT;.CMD" }, cwd: "C:\\w", spawnSyncImpl }), "C:\\npm\\codex.CMD");
   assert.equal(seen.file, "where.exe");
-  assert.deepEqual(seen.args, ["codex"]);
+  assert.deepEqual(seen.args, ["$PATH:codex"]);
   assert.equal(seen.options.shell, false);
   assert.equal(seen.options.timeout, 5000);
   assert.equal(seen.options.cwd, "C:\\w");
+  // The lookup never outlives the caller's own budget.
+  resolveExecutable("codex", { env: {}, timeoutMs: 250, spawnSyncImpl });
+  assert.equal(seen.options.timeout, 250);
   // PATHEXT decides: without .CMD in it the .exe wins.
   assert.equal(resolveExecutable("codex", { env: { PATHEXT: ".EXE" }, spawnSyncImpl }), "C:\\bin\\codex.exe");
   assert.equal(resolveExecutable("codex", { env: {}, spawnSyncImpl: () => ({ status: 1, stdout: "", stderr: "INFO: Could not find files" }) }), null);
@@ -314,7 +317,11 @@ test("resolveExecutable takes where.exe's first PATHEXT hit and skips the extens
   assert.equal(resolveExecutable("codex", { env: {}, spawnSyncImpl: () => ({ error: new Error("ENOENT"), stdout: "" }) }), null);
 });
 
+// The table pins the caret strings; the Windows-only round-trip test below is the
+// behavioural oracle.
 test("quoteForCmd escapes every argument so cmd.exe and the shim's %* both pass it through", () => {
+  assert.throws(() => quoteForCmd("a\nb"), /line break/);
+  assert.throws(() => quoteForCmd("a\rb"), /line break/);
   const table = [
     ["plain", '^^^"plain^^^"'],
     ["with space", '^^^"with^^^ space^^^"'],
@@ -333,7 +340,7 @@ test("buildLaunch runs .exe directly and .cmd through cmd.exe /d /s /c with verb
   assert.deepEqual(buildLaunch("C:\\bin\\codex.exe", ["a b"], {}), { file: "C:\\bin\\codex.exe", args: ["a b"], windowsVerbatimArguments: false });
   assert.deepEqual(buildLaunch("C:\\Program Files\\npm\\codex.cmd", ["app-server", "a&b"], { ComSpec: "C:\\Windows\\system32\\cmd.exe" }), {
     file: "C:\\Windows\\system32\\cmd.exe",
-    args: ["/d", "/s", "/c", '"C:\\Program^ Files\\npm\\codex.cmd ^^^"app-server^^^" ^^^"a^^^&b^^^""'],
+    args: ["/d", "/s", "/v:off", "/c", '"C:\\Program^ Files\\npm\\codex.cmd ^^^"app-server^^^" ^^^"a^^^&b^^^""'],
     windowsVerbatimArguments: true
   });
   assert.equal(buildLaunch("C:\\x\\run.BAT", [], {}).file, "cmd.exe");
@@ -350,7 +357,7 @@ test("runCommand on win32 resolves a bare name with where.exe and launches the s
   const result = runCommand("codex", ["--version"], { platform: "win32", env: { PATHEXT: ".EXE;.CMD" }, spawnSyncImpl });
   assert.deepEqual([result.command, result.args, result.stdout], ["codex", ["--version"], "codex 1.0\n"]);
   assert.equal(calls[1].file, "cmd.exe");
-  assert.deepEqual(calls[1].args, ["/d", "/s", "/c", '"C:\\npm\\codex.cmd ^^^"--version^^^""']);
+  assert.deepEqual(calls[1].args, ["/d", "/s", "/v:off", "/c", '"C:\\npm\\codex.cmd ^^^"--version^^^""']);
   assert.equal(calls[1].options.shell, false);
   assert.equal(calls[1].options.windowsVerbatimArguments, true);
 
@@ -373,7 +380,7 @@ test("runCommand round-trips awkward arguments through a .cmd shim in a director
   fs.mkdirSync(dir);
   fs.writeFileSync(path.join(dir, "argv.cjs"), "process.stdout.write(JSON.stringify(process.argv.slice(2)));\n");
   fs.writeFileSync(path.join(dir, "argv-shim.cmd"), '@echo off\r\nnode "%~dp0argv.cjs" %*\r\n');
-  const args = ["plain", "with space", 'q"uote', "", "%PATH%", "a&b", "trail\\"];
+  const args = ["plain", "with space", 'q"uote', "", "%PATH%", "a&b", "trail\\", "^caret", "!bang!", "C:\\Program Files (x86)\\x"];
   const env = { ...process.env, PATH: `${dir};${process.env.PATH}` };
   const result = runCommand("argv-shim", args, { env });
   assert.equal(result.error, null);

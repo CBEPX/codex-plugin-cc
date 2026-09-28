@@ -3,25 +3,27 @@ import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 
-// Windows has no $SHELL to lean on: Git Bash's (the usual one on CI) mangles
-// `taskkill /PID` and PowerShell arguments. So on win32 nothing runs through a
-// shell — a bare name is resolved with where.exe, .exe/.com run directly, and
+// Windows has no $SHELL to lean on: Git Bash (the usual one on CI) mangles
+// `taskkill /PID` and other Windows-style arguments. So on win32 nothing runs
+// through a shell — a bare name is resolved with where.exe, .exe/.com run directly, and
 // .cmd/.bat shims run under cmd.exe with every argument escaped for it.
 const LAUNCHABLE = /\.(com|exe|bat|cmd)$/i;
 // cmd.exe metacharacters, escaped with ^ (cross-spawn's set).
 const CMD_META = /([()\][%!^"`<>&|;, *?])/g;
 
 // First where.exe hit whose extension is in PATHEXT, or null. An extensionless
-// hit (npm's bash shim next to codex.cmd) is skipped. Raw spawnSync: runCommand
-// calls this, so going through it would recurse.
+// hit (npm's bash shim next to codex.cmd) is skipped. `$PATH:` searches PATH
+// only, never the current directory (a repo must not plant a codex.cmd). Raw
+// spawnSync: runCommand calls this, so going through it would recurse.
 export function resolveExecutable(command, options = {}) {
   const env = options.env ?? process.env;
-  const result = (options.spawnSyncImpl ?? spawnSync)("where.exe", [command], {
+  const result = (options.spawnSyncImpl ?? spawnSync)("where.exe", [`$PATH:${command}`], {
     cwd: options.cwd,
     env,
     encoding: "utf8",
     shell: false,
-    timeout: 5000,
+    // The lookup shares the caller's budget instead of adding up to 5 s to it.
+    timeout: Number.isFinite(options.timeoutMs) ? Math.max(1, Math.min(5000, Math.floor(options.timeoutMs))) : 5000,
     windowsHide: true
   });
   if (result.error || result.status !== 0) {
@@ -39,8 +41,15 @@ export function resolveExecutable(command, options = {}) {
 // quoting for the final program, then every metacharacter caret-escaped twice —
 // once for `cmd /c`, once for the shim's own parse of %*. Escaped quotes never
 // open a quoted region, so `a&b` and `%PATH%` stay literal.
+// A line break cannot be escaped at all (cmd.exe stops reading at it), so it is
+// refused instead of silently dropping the rest of the arguments.
 // ponytail: assumes the .cmd forwards %* (npm shims do); one that reads %1 itself sees carets.
+// ponytail: `%VAR:a=b%` substitution still expands (cmd has no escape for it in
+// command-line mode); every caller passes fixed literals, revisit if user text ever lands here.
 export function quoteForCmd(arg) {
+  if (/[\r\n]/.test(String(arg))) {
+    throw new TypeError("cmd.exe cannot carry a line break in an argument");
+  }
   const quoted = `"${String(arg)
     .replace(/(?=(\\+?)?)\1"/g, '$1$1\\"')
     .replace(/(?=(\\+?)?)\1$/, "$1$1")}"`;
@@ -52,7 +61,7 @@ export function buildLaunch(file, args, env = process.env) {
     return { file, args, windowsVerbatimArguments: false };
   }
   const line = [file.replace(CMD_META, "^$1"), ...args.map(quoteForCmd)].join(" ");
-  return { file: env?.ComSpec || "cmd.exe", args: ["/d", "/s", "/c", `"${line}"`], windowsVerbatimArguments: true };
+  return { file: env?.ComSpec || "cmd.exe", args: ["/d", "/s", "/v:off", "/c", `"${line}"`], windowsVerbatimArguments: true };
 }
 
 export function runCommand(command, args = [], options = {}) {

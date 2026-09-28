@@ -380,7 +380,7 @@ If you need to point the built-in OpenAI provider at a different endpoint, set `
 
 As of v1.3.0, kills issued from stored process records (`/codex:cancel`, `SessionEnd` cleanup, stale-broker replacement, broker teardown) are refused on Windows until process identity lands in v1.4.0. This bounds any leak by the broker idle timeout, and a turn interrupt is still sent regardless — it just cannot be followed by a forced kill on that platform yet.
 
-As of v1.4.0, the plugin no longer runs commands through `$SHELL` on Windows (usually Git Bash, which mangled `taskkill` and PowerShell arguments). It finds `codex`, `npm` and `git` with `where.exe`, runs `.exe` files directly and runs `.cmd` shims through `cmd.exe`. The catch: a `codex` or `npm` that only exists inside Git Bash (an alias, a shell function or a bash-only `PATH` entry) is no longer found. Put `codex.cmd` or `codex.exe` on the Windows `PATH`; a global `npm install -g @openai/codex` already does that.
+As of v1.4.0, the plugin no longer runs commands through `$SHELL` on Windows (usually Git Bash, which mangled `taskkill` arguments). It finds `codex`, `npm` and `git` with `where.exe`, runs `.exe` files directly and runs `.cmd` shims through `cmd.exe`. The catch: a `codex` or `npm` that only exists inside Git Bash (an alias, a shell function or a bash-only `PATH` entry) is no longer found. Put `codex.cmd` or `codex.exe` on the Windows `PATH`; a global `npm install -g @openai/codex` already does that.
 
 ## Development
 
