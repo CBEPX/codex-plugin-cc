@@ -41,7 +41,7 @@ test("terminateProcessTree uses taskkill on Windows", () => {
 
   // Direct taskkill.exe, never through a shell: Git Bash's $SHELL mangles /PID.
   assert.deepEqual(captured, {
-    command: "taskkill.exe",
+    command: "C:\\Windows\\System32\\taskkill.exe",
     args: ["/PID", "1234", "/T", "/F"],
     shell: false
   });
@@ -303,7 +303,7 @@ test("resolveExecutable takes where.exe's first PATHEXT hit and skips the extens
     return { status: 0, stdout: "C:\\tools.d\\codex\r\nC:\\npm\\codex\r\nC:\\npm\\codex.CMD\r\nC:\\bin\\codex.exe\r\n", stderr: "" };
   };
   assert.equal(resolveExecutable("codex", { env: { PATHEXT: ".COM;.EXE;.BAT;.CMD" }, cwd: "C:\\w", spawnSyncImpl }), "C:\\npm\\codex.CMD");
-  assert.equal(seen.file, "where.exe");
+  assert.equal(seen.file, "C:\\Windows\\System32\\where.exe");
   assert.deepEqual(seen.args, ["$PATH:codex"]);
   assert.equal(seen.options.shell, false);
   assert.equal(seen.options.timeout, 5000);
@@ -344,20 +344,21 @@ test("buildLaunch runs .exe directly and .cmd through cmd.exe /d /s /c with verb
     args: ["/d", "/s", "/v:off", "/c", '"C:\\Program^ Files\\npm\\codex.cmd ^^^"app-server^^^" ^^^"a^^^&b^^^""'],
     windowsVerbatimArguments: true
   });
-  assert.equal(buildLaunch("C:\\x\\run.BAT", [], {}).file, "cmd.exe");
+  assert.equal(buildLaunch("C:\\x\\run.BAT", [], {}).file, "C:\\Windows\\System32\\cmd.exe");
+  assert.equal(buildLaunch("C:\\x\\run.BAT", [], { SystemRoot: "D:\\Win" }).file, "D:\\Win\\System32\\cmd.exe");
 });
 
 test("runCommand on win32 resolves a bare name with where.exe and launches the shim without a shell", () => {
   const calls = [];
   const spawnSyncImpl = (file, args, options) => {
     calls.push({ file, args, options });
-    return file === "where.exe"
+    return file.endsWith("\\where.exe")
       ? { status: 0, stdout: "C:\\npm\\codex\r\nC:\\npm\\codex.cmd\r\n", stderr: "" }
       : { status: 0, stdout: "codex 1.0\n", stderr: "" };
   };
   const result = runCommand("codex", ["--version"], { platform: "win32", env: { PATHEXT: ".EXE;.CMD" }, spawnSyncImpl });
   assert.deepEqual([result.command, result.args, result.stdout], ["codex", ["--version"], "codex 1.0\n"]);
-  assert.equal(calls[1].file, "cmd.exe");
+  assert.equal(calls[1].file, "C:\\Windows\\System32\\cmd.exe");
   assert.deepEqual(calls[1].args, ["/d", "/s", "/v:off", "/c", '"C:\\npm\\codex.cmd ^^^"--version^^^""']);
   assert.equal(calls[1].options.shell, false);
   assert.equal(calls[1].options.windowsVerbatimArguments, true);
@@ -371,8 +372,8 @@ test("runCommand on win32 resolves a bare name with where.exe and launches the s
     ["C:\\node\\node.exe", false, false]
   ]);
   calls.length = 0;
-  runCommand("npm", [], { platform: "win32", spawnSyncImpl: (file, args, options) => { calls.push({ file, options }); return file === "where.exe" ? { status: 1, stdout: "" } : { error: Object.assign(new Error("spawn npm ENOENT"), { code: "ENOENT" }) }; } });
-  assert.deepEqual(calls.map((call) => [call.file, call.options.shell]), [["where.exe", false], ["npm", false]]);
+  runCommand("npm", [], { platform: "win32", spawnSyncImpl: (file, args, options) => { calls.push({ file, options }); return file.endsWith("\\where.exe") ? { status: 1, stdout: "" } : { error: Object.assign(new Error("spawn npm ENOENT"), { code: "ENOENT" }) }; } });
+  assert.deepEqual(calls.map((call) => [call.file, call.options.shell]), [["C:\\Windows\\System32\\where.exe", false], ["npm", false]]);
 });
 
 // Only CI runs this: a real cmd.exe parses the line, then the shim's %* re-parses it.

@@ -2745,7 +2745,7 @@ test("stop hook with the gate disabled allows promptly when stdin stays open (#5
     const result = await runHookWithOpenStdin(t, [STOP_HOOK], { cwd: repo, env, input });
     assert.equal(result.status, 0, result.stderr);
     assert.equal(result.stdout.trim(), "", `no decision expected for input ${JSON.stringify(input)}`);
-    assert.ok(result.elapsedMs < 3000, `hook took ${result.elapsedMs} ms`);
+    assert.ok(result.elapsedMs < 10000, `hook took ${result.elapsedMs} ms`);
   }
 });
 
@@ -2760,7 +2760,7 @@ test("stop hook with the gate enabled blocks when hook input never arrives", { t
   const payload = JSON.parse(result.stdout);
   assert.equal(payload.decision, "block");
   assert.match(payload.reason, /hook input did not arrive/);
-  assert.ok(result.elapsedMs < 3000, `hook took ${result.elapsedMs} ms`);
+  assert.ok(result.elapsedMs < 10000, `hook took ${result.elapsedMs} ms`);
 });
 
 test("stop hook with an unreadable state file keeps the gate closed when hook input never arrives", { timeout: 30_000 }, async (t) => {

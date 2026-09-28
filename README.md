@@ -392,7 +392,7 @@ Still limited until v1.4.1: kills issued from stored process records — `/codex
 
 Requirements: `where.exe` and `cmd.exe` ship with Windows, so nothing extra needs installing for them, and PowerShell is not required in v1.4.0. `codex` and `npm` must be on the Windows `PATH` as `.cmd`/`.exe` (a global `npm install -g @openai/codex` already does that for `codex`); a `codex` or `npm` that only exists inside Git Bash (an alias, a shell function or a bash-only `PATH` entry) is no longer found.
 
-When `CLAUDE_PLUGIN_DATA` is not set, job state falls back to a per-user directory: `%LOCALAPPDATA%\codex-companion` on Windows as of v1.4.0 (a private `codex-companion-<uid>` directory under the system temp directory elsewhere). If a pre-1.4.0 state root under `%TEMP%\codex-companion-user` already exists, it keeps being used (with a one-line notice) until you remove it; nothing is migrated. On Windows, state reads and writes also retry briefly (up to 20 attempts, roughly 300 ms worst case) on `EPERM`/`EBUSY`/`EACCES` when another process holds `state.json` or a lock ticket open.
+When `CLAUDE_PLUGIN_DATA` is not set, job state falls back to a per-user directory: `%LOCALAPPDATA%\codex-companion` on Windows as of v1.4.0 (a private `codex-companion-<uid>` directory under the system temp directory elsewhere). If a pre-1.4.0 state root under `%TEMP%\codex-companion-user` already exists, it keeps being used (with a one-line notice) until you remove it; nothing is migrated. On Windows, `state.json` reads and writes and lock-ticket reads also retry briefly (up to 20 attempts, roughly 300 ms worst case) on `EPERM`/`EBUSY`/`EACCES` when another process holds `state.json` or a lock ticket open.
 
 ## Development
 

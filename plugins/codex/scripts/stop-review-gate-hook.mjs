@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 import { getCodexAvailability } from "./lib/codex.mjs";
 import { readHookInput } from "./lib/hook-input.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
-import { getConfig, setConfig, listJobs, resolveStateFile } from "./lib/state.mjs";
+import { getConfig, setConfig, listJobs, resolveStateFile, retryOnWindows } from "./lib/state.mjs";
 import { sortJobsNewestFirst } from "./lib/job-control.mjs";
 import { reapDeadJobs, SESSION_ID_ENV } from "./lib/tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
@@ -206,7 +206,7 @@ function gateEnabledForProject() {
     if (!fs.existsSync(stateFile)) {
       return false;
     }
-    return Boolean(JSON.parse(fs.readFileSync(stateFile, "utf8")).config?.stopReviewGate);
+    return Boolean(JSON.parse(retryOnWindows(() => fs.readFileSync(stateFile, "utf8"), ["EPERM", "EBUSY"])).config?.stopReviewGate);
   } catch {
     return true;
   }

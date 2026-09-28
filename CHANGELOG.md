@@ -3,11 +3,11 @@
 ## 1.4.0 — 2026-09-28
 
 ### Fixed
-- Windows: commands are no longer spawned through `$SHELL` (usually Git Bash under Claude Code, which mangled `taskkill /PID /T /F` and other arguments); executables are resolved with `where.exe`, `.exe`/`.com` files run directly, and `.cmd`/`.bat` shims (including a global `npm install -g @openai/codex`) run through `cmd.exe` with every argument escaped for both `cmd /c` and the shim's own `%*` re-parse (#525, #647, #656, #669, #708, #287, #409, #735).
+- Windows: commands are no longer spawned through `$SHELL` (usually Git Bash under Claude Code, which mangled `taskkill /PID /T /F` and other arguments); executables are resolved with `where.exe`, `.exe`/`.com` files run directly, and `.cmd`/`.bat` shims (including a global `npm install -g @openai/codex`) run through `cmd.exe` with every argument escaped for both `cmd /c` and the shim's own `%*` re-parse (`%VAR:a=b%` substitution is the one documented ceiling; an argument containing CR/LF is refused) (#525, #647, #656, #669, #708, #287, #409, #735).
 - Windows: the broker and app-server child processes no longer flash a visible console window on spawn (`windowsHide: true`) (#440, #451).
 - The `Stop`, `SessionStart` and `SessionEnd` hooks read stdin with a bounded deadline (2 s / 5 s / 1 s respectively) and a 1 MiB limit instead of a blocking `readFileSync(0)`; a disabled Stop review gate no longer hangs until the 900 s hook timeout when stdin never arrives, and the companion no longer crashes with `EAGAIN` reading a non-blocking stdin under concurrent sessions (#530, #544, #120, #247, #123, #150, #165).
 - `--args-stdin` (and `$ARGUMENTS`) no longer eats a backslash that does not escape a quote, another backslash or whitespace, so Windows paths such as `C:\Users\me\project\file.mjs` survive; `\\server\share` is a documented limitation, and `--prompt-stdin` remains available for byte-exact text.
-- Windows: reads and writes of `state.json` and lock tickets retry briefly (bounded, roughly 300 ms worst case) on `EPERM`/`EBUSY`/`EACCES` instead of failing outright when another process holds the file open.
+- Windows: `state.json` reads and writes and lock-ticket reads retry briefly (bounded, roughly 300 ms worst case) on `EPERM`/`EBUSY`/`EACCES` instead of failing outright when another process holds the file open.
 
 ### Added
 - `SECURITY.md` (supported versions, GitHub Security Advisories reporting) (#326).

@@ -8,6 +8,11 @@ import process from "node:process";
 // through a shell — a bare name is resolved with where.exe, .exe/.com run directly, and
 // .cmd/.bat shims run under cmd.exe with every argument escaped for it.
 const LAUNCHABLE = /\.(com|exe|bat|cmd)$/i;
+// In-box tools by absolute path: libuv searches the child's cwd before PATH, so a
+// bare "where.exe" would run a same-named file planted in the reviewed repo.
+export function systemExe(name, env = process.env) {
+  return path.win32.join(env?.SystemRoot || env?.SYSTEMROOT || "C:\\Windows", "System32", name);
+}
 // cmd.exe metacharacters, escaped with ^ (cross-spawn's set).
 const CMD_META = /([()\][%!^"`<>&|;, *?])/g;
 
@@ -17,7 +22,7 @@ const CMD_META = /([()\][%!^"`<>&|;, *?])/g;
 // spawnSync: runCommand calls this, so going through it would recurse.
 export function resolveExecutable(command, options = {}) {
   const env = options.env ?? process.env;
-  const result = (options.spawnSyncImpl ?? spawnSync)("where.exe", [`$PATH:${command}`], {
+  const result = (options.spawnSyncImpl ?? spawnSync)(systemExe("where.exe", env), [`$PATH:${command}`], {
     cwd: options.cwd,
     env,
     encoding: "utf8",
@@ -61,7 +66,7 @@ export function buildLaunch(file, args, env = process.env) {
     return { file, args, windowsVerbatimArguments: false };
   }
   const line = [file.replace(CMD_META, "^$1"), ...args.map(quoteForCmd)].join(" ");
-  return { file: env?.ComSpec || "cmd.exe", args: ["/d", "/s", "/v:off", "/c", `"${line}"`], windowsVerbatimArguments: true };
+  return { file: env?.ComSpec || systemExe("cmd.exe", env), args: ["/d", "/s", "/v:off", "/c", `"${line}"`], windowsVerbatimArguments: true };
 }
 
 export function runCommand(command, args = [], options = {}) {
@@ -317,7 +322,7 @@ export function terminateProcessTree(pid, options = {}) {
   const killImpl = options.killImpl ?? process.kill.bind(process);
 
   if (platform === "win32") {
-    const result = runCommandImpl("taskkill.exe", ["/PID", String(pid), "/T", "/F"], {
+    const result = runCommandImpl(systemExe("taskkill.exe", options.env), ["/PID", String(pid), "/T", "/F"], {
       cwd: options.cwd,
       env: options.env,
       shell: false
