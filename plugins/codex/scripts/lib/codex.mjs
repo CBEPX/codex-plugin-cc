@@ -12,6 +12,7 @@
  *   threadId: string,
  *   rootThreadId: string,
  *   threadIds: Set<string>,
+ *   sawSubagents: boolean,
  *   threadTurnIds: Map<string, string>,
  *   threadLabels: Map<string, string>,
  *   turnId: string | null,
