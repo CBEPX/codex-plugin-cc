@@ -48,7 +48,13 @@ export function systemPowerShell(root) {
 // a repository, no CLR profiler hooks, no PATH. Exactly what it needs to start.
 export function powerShellEnvironment(root, env = process.env) {
   const temp = (name) => (typeof env?.[name] === "string" && path.win32.isAbsolute(env[name]) ? env[name] : path.win32.join(root, "Temp"));
+  // Data locations only, they choose no executable (PATH and PSModulePath stay
+  // pinned). Without the module-analysis cache every launch re-analyses modules:
+  // 22-33 s cold vs 0.3 s warm, measured on the Windows runner.
+  const dataDir = (name) => (typeof env?.[name] === "string" && path.win32.isAbsolute(env[name]) ? { [name]: env[name] } : {});
   return {
+    ...dataDir("LOCALAPPDATA"),
+    ...dataDir("PSModuleAnalysisCachePath"),
     SystemRoot: root,
     windir: root,
     TEMP: temp("TEMP"),

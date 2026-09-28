@@ -445,6 +445,17 @@ test("powerShellEnvironment is minimal and never inherits the job's variables", 
   });
 });
 
+test("powerShellEnvironment passes through only absolute LOCALAPPDATA and PSModuleAnalysisCachePath", () => {
+  const withBoth = powerShellEnvironment("D:\\Win", { LOCALAPPDATA: "C:\\Users\\x\\AppData\\Local", PSModuleAnalysisCachePath: "C:\\cache\\mac" });
+  assert.equal(withBoth.LOCALAPPDATA, "C:\\Users\\x\\AppData\\Local");
+  assert.equal(withBoth.PSModuleAnalysisCachePath, "C:\\cache\\mac");
+  for (const bad of [{ LOCALAPPDATA: "relative", PSModuleAnalysisCachePath: "" }, {}, { LOCALAPPDATA: 5 }]) {
+    const env = powerShellEnvironment("D:\\Win", bad);
+    assert.equal("LOCALAPPDATA" in env, false, JSON.stringify(bad));
+    assert.equal("PSModuleAnalysisCachePath" in env, false, JSON.stringify(bad));
+  }
+});
+
 test("parseProtocolLines accepts only upper-case words followed by integers", () => {
   assert.deepEqual(parseProtocolLines("KILL\r\nSURVIVOR 4300 1337\r\nSURVIVOR 4301 1338\r\n"), ["KILL", "SURVIVOR 4300 1337", "SURVIVOR 4301 1338"]);
   assert.deepEqual(parseProtocolLines(""), []);
