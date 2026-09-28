@@ -1,9 +1,68 @@
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
+import path from "node:path";
 import process from "node:process";
 
+// Windows has no $SHELL to lean on: Git Bash's (the usual one on CI) mangles
+// `taskkill /PID` and PowerShell arguments. So on win32 nothing runs through a
+// shell — a bare name is resolved with where.exe, .exe/.com run directly, and
+// .cmd/.bat shims run under cmd.exe with every argument escaped for it.
+const LAUNCHABLE = /\.(com|exe|bat|cmd)$/i;
+// cmd.exe metacharacters, escaped with ^ (cross-spawn's set).
+const CMD_META = /([()\][%!^"`<>&|;, *?])/g;
+
+// First where.exe hit whose extension is in PATHEXT, or null. An extensionless
+// hit (npm's bash shim next to codex.cmd) is skipped. Raw spawnSync: runCommand
+// calls this, so going through it would recurse.
+export function resolveExecutable(command, options = {}) {
+  const env = options.env ?? process.env;
+  const result = (options.spawnSyncImpl ?? spawnSync)("where.exe", [command], {
+    cwd: options.cwd,
+    env,
+    encoding: "utf8",
+    shell: false,
+    timeout: 5000,
+    windowsHide: true
+  });
+  if (result.error || result.status !== 0) {
+    return null;
+  }
+  const extensions = String(env.PATHEXT || ".COM;.EXE;.BAT;.CMD").toLowerCase().split(";");
+  const hit = String(result.stdout ?? "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find((line) => LAUNCHABLE.test(line) && extensions.includes(path.win32.extname(line).toLowerCase()));
+  return hit ?? null;
+}
+
+// One argument for a cmd.exe line that a .cmd shim forwards with %*: CRT
+// quoting for the final program, then every metacharacter caret-escaped twice —
+// once for `cmd /c`, once for the shim's own parse of %*. Escaped quotes never
+// open a quoted region, so `a&b` and `%PATH%` stay literal.
+// ponytail: assumes the .cmd forwards %* (npm shims do); one that reads %1 itself sees carets.
+export function quoteForCmd(arg) {
+  const quoted = `"${String(arg)
+    .replace(/(?=(\\+?)?)\1"/g, '$1$1\\"')
+    .replace(/(?=(\\+?)?)\1$/, "$1$1")}"`;
+  return quoted.replace(CMD_META, "^$1").replace(CMD_META, "^$1");
+}
+
+export function buildLaunch(file, args, env = process.env) {
+  if (!/\.(bat|cmd)$/i.test(file)) {
+    return { file, args, windowsVerbatimArguments: false };
+  }
+  const line = [file.replace(CMD_META, "^$1"), ...args.map(quoteForCmd)].join(" ");
+  return { file: env?.ComSpec || "cmd.exe", args: ["/d", "/s", "/c", `"${line}"`], windowsVerbatimArguments: true };
+}
+
 export function runCommand(command, args = [], options = {}) {
-  const result = spawnSync(command, args, {
+  const windows = (options.platform ?? process.platform) === "win32";
+  // win32: a path or an explicit extension is used as is, a bare name goes
+  // through where.exe; nothing found keeps the bare name, so the spawn fails
+  // with ENOENT as before.
+  const target = !windows || /[\\/]/.test(command) || LAUNCHABLE.test(command) ? command : (resolveExecutable(command, options) ?? command);
+  const launch = windows ? buildLaunch(target, args, options.env) : { file: command, args };
+  const result = (options.spawnSyncImpl ?? spawnSync)(launch.file, launch.args, {
     cwd: options.cwd,
     env: options.env,
     encoding: "utf8",
@@ -13,7 +72,8 @@ export function runCommand(command, args = [], options = {}) {
     // spawnSync throws on a fractional timeout and reads 0 as "no timeout":
     // whatever budget arithmetic a caller did, a bound stays a bound.
     timeout: Number.isFinite(options.timeoutMs) ? Math.max(1, Math.floor(options.timeoutMs)) : undefined,
-    shell: options.shell ?? (process.platform === "win32" ? (process.env.SHELL || true) : false),
+    shell: windows ? false : (options.shell ?? false),
+    windowsVerbatimArguments: launch.windowsVerbatimArguments,
     windowsHide: true
   });
 
@@ -248,9 +308,10 @@ export function terminateProcessTree(pid, options = {}) {
   const killImpl = options.killImpl ?? process.kill.bind(process);
 
   if (platform === "win32") {
-    const result = runCommandImpl("taskkill", ["/PID", String(pid), "/T", "/F"], {
+    const result = runCommandImpl("taskkill.exe", ["/PID", String(pid), "/T", "/F"], {
       cwd: options.cwd,
-      env: options.env
+      env: options.env,
+      shell: false
     });
 
     if (!result.error && result.status === 0) {

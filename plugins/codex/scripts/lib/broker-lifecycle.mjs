@@ -131,7 +131,8 @@ export function spawnBrokerProcess({ scriptPath, cwd, endpoint, pidFile, logFile
     cwd,
     env,
     detached: true,
-    stdio: ["ignore", logFd, logFd]
+    stdio: ["ignore", logFd, logFd],
+    windowsHide: true
   });
   child.unref();
   fs.closeSync(logFd);

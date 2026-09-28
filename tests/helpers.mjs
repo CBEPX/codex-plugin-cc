@@ -26,7 +26,7 @@ export function run(command, args, options = {}) {
     encoding: "utf8",
     input: options.input,
     timeout: options.timeout,
-    // Tests spawn process.execPath / git directly; opt in to a shell only for .cmd targets.
+    // Tests spawn process.execPath / git directly, never through a shell.
     shell: options.shell ?? false,
     windowsHide: true
   });
