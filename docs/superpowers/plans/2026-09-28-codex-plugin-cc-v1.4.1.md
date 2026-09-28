@@ -223,6 +223,7 @@ export function powerShellEnvironment(root, env = process.env) {
     PATH: `${path.win32.join(root, "System32")};${root}`,
     PATHEXT: ".EXE",
     PSModulePath: path.win32.join(root, "System32", "WindowsPowerShell", "v1.0", "Modules"),
+    // Task 3 fix (2026-09-29, spec §2 rev. 11): LOCALAPPDATA and PSModuleAnalysisCachePath pass through when absolute — see the executed code.
     NoDefaultCurrentDirectoryInExePath: "1"
   };
 }
