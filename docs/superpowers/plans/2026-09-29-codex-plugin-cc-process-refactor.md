@@ -266,7 +266,7 @@ Requirements: `cmd.exe` and Windows PowerShell 5.1 (both ship with Windows; no S
 - [ ] **Step 3: Move the two FAQ bodies** («A command failed with "Timed out … waiting for the Codex state lock"» and «A command failed with a raw `EACCES` or `EIO` …») verbatim into `docs/state-and-lifecycle.md` under `# State and lifecycle` → `## "Timed out … waiting for the Codex state lock"` → `## Raw EACCES / EIO from the state directory` → `## Code path` (`plugins/codex/scripts/lib/state.mjs` (ticket lock, atomic writes), `plugins/codex/scripts/lib/tracked-jobs.mjs` (reaper)). In README keep each FAQ heading with two sentences (the first sentence of the original body, then `See [docs/state-and-lifecycle.md](docs/state-and-lifecycle.md).`).
 - [ ] **Step 4: Fix the anchor** at README line 335: `#what-does-the-review-gate-do` → `#enabling-review-gate`.
 - [ ] **Step 5: Development section:** keep the four command bullets; replace the coverage sentence with `thresholds live in `.c8rc.json` (88% lines and statements, 78% branches, 95% functions)`; add a final bullet: `` Working rules for agents and maintainers: `AGENTS.md` and `docs/agent/`. ``
-- [ ] **Step 6: Run the pinned README tests:** `node --import ./tests/test-env.mjs --test tests/commands.test.mjs` → pass. `wc -l README.md` ≈ 300.
+- [ ] **Step 6: Run the pinned README tests:** `node --import ./tests/test-env.mjs --test tests/commands.test.mjs` → pass. `wc -l README.md` drops by ~20 lines only (422 → 402): the moved internals were long single-line paragraphs, so the win is in content, not line count.
 - [ ] **Step 7: Commit** (gate chain).
 
 Lazier alternative: move only «### Windows» and leave the FAQ — acceptable if time is short; the FAQ move is the smaller half.

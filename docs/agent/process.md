@@ -34,7 +34,7 @@ Each pass brief must tag findings that already existed in the previous release (
 ## SDD ledger and evidence
 
 - `.superpowers/sdd/<plan>/progress.md` is the only source of rulings during a release; briefs, reports, `adv-*-passN.json` and `review-<a>..<b>.diff` live beside it. At archive time everything except `*.diff` and `*.log` moves to `docs/superpowers/reports/vX.Y.Z/` with private paths replaced.
-- A CI line in the ledger has the form `CI <run-id> <sha>: rc=<n>; <job>: <assertion text | n pass/m fail/k skip>`, where `rc` comes from `gh run watch <id> --exit-status; rc=$?`. Never write "all green" without `rc=0` and the job list.
+- A CI line in the ledger has the form `CI <run-id> <sha>: rc=<n>; <job>: <assertion text | n pass/m fail/k skip>`, where `rc` is the watcher exit code captured as described in `docs/agent/testing-and-ci.md` (Watching CI). Never write "all green" without `rc=0` and the job list.
 - A claim about code ("keep rule unchanged") must quote the diff hunk or name the test that proves it.
 - A failing assertion in a lifecycle test must print the stored record and the job-log tail, so a CI-only failure can be read from the job log.
 
