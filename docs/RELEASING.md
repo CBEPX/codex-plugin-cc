@@ -5,6 +5,13 @@ a git tag, a GitHub Release with hand-written notes, and the `npm pack` tarball 
 SHA-256) attached as the release artifact. There is no npm publish (`package.json` is
 `private`); users install from this repository through `.claude-plugin/marketplace.json`.
 
+## 0. Before the release branch is bumped
+
+- Draft PR against `main` is the work item (issues are disabled); claim it with `agent-work claim --target <PR url>`.
+- The adversarial gate is closed per `docs/agent/process.md` (stop rule): every parked finding is listed in the spec `## Limits` section and in the CHANGELOG "Known limitations" bullets.
+- Spec and plan revision tables are current; the CHANGELOG section for the new version exists.
+- `npm audit --omit=dev` reports 0 vulnerabilities. (The CI matrix must be green on the final release commit — the SHA that step 3 tags — which only exists after steps 1–2; record that run id and `rc` in the ledger.)
+
 ## 1. Prepare the release branch
 
 ```bash
@@ -74,3 +81,10 @@ gate on the tag (tests, leak check, build, version check, audit, pack dry run).
 ```bash
 claude plugin marketplace update cbepx && claude plugin update codex@cbepx
 ```
+
+## 6. After the release
+
+- Update the local installs (step 5) in every Claude config directory (`CLAUDE_CONFIG_DIR=~/.claude …` for the primary one), restart the session, then smoke the installed plugin: `/codex:status`, `/codex:rescue --effort low Strictly read-only: reply PONG` (sync and `--background`), `/codex:review --background` → `/codex:result`. Record smoke-review findings in the ledger as inputs for the next release.
+- Archive the SDD directory: everything under `.superpowers/sdd/<plan>/` except `*.diff` and `*.log` goes to `docs/superpowers/reports/vX.Y.Z/` (`progress.md` becomes `sdd-ledger.md`; adversarial passes under `adversarial/`); replace private paths (`/Users/<name>/…` → `<repo>/`) before committing.
+- Upstream comments: draft into `docs/superpowers/triage/upstream-comments-vX.Y.Z.md`, post only after the user's approval (one comment per issue), then mark the file as posted.
+- `agent-work release --stopped --gate "<release summary>"`; remove the release worktree.
