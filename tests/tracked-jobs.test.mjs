@@ -12,6 +12,7 @@ import {
   listJobs,
   readJobFile,
   recordWorkerPid,
+  removeJobPidFile,
   resolveJobFile,
   resolveJobPid,
   resolveJobPidFile,
@@ -652,6 +653,23 @@ test("recordWorkerPid writes the pid sidecar before the identity probe runs", ()
   assert.deepEqual(resolveJobPid(workspace, { id: "job-spawned", status: "queued", pid: null }), { pid: 4242, identity: "win32:4242" });
   const indexed = listJobs(workspace).find((entry) => entry.id === "job-spawned");
   assert.deepEqual([indexed.pid, indexed.pidIdentity], [4242, "win32:4242"]);
+});
+
+// A cancel inside the (win32, seconds-long) identity probe removes the sidecar
+// and writes `cancelled`; the probe's second write must not bring the pid back.
+test("recordWorkerPid does not revive the sidecar of a job cancelled during the probe", () => {
+  const workspace = makeTempDir();
+  seedJob(workspace, { id: "job-mid-probe", status: "queued", pid: null, logFile: null });
+  recordWorkerPid(workspace, "job-mid-probe", 4244, {
+    getProcessIdentityImpl: (pid) => {
+      upsertJob(workspace, { id: "job-mid-probe", status: "cancelled", pid: null, pidIdentity: null });
+      removeJobPidFile(workspace, "job-mid-probe");
+      return `win32:${pid}`;
+    }
+  });
+  assert.equal(fs.existsSync(resolveJobPidFile(workspace, "job-mid-probe")), false, "a cancelled job must not get its sidecar back");
+  const indexed = listJobs(workspace).find((entry) => entry.id === "job-mid-probe");
+  assert.deepEqual([indexed.status, indexed.pid, indexed.pidIdentity], ["cancelled", null, null]);
 });
 
 // A cancel that landed between the spawn and the worker's start already wrote

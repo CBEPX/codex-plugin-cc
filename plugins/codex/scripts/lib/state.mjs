@@ -715,15 +715,18 @@ export function upsertJob(cwd, jobPatch) {
 // index patch, and readers fall back to the sidecar (`resolveJobPid`) only while
 // the job is still active.
 export function updateJobPid(cwd, jobId, pid, identity = null) {
-  writeJobPidFile(cwd, jobId, pid, identity);
-  // The index is patch-based, so it cannot lose a field — but a worker that
-  // already reported `running` wrote its own pid there, and that record is the
-  // newer one. A job that is gone from the index needs no pid at all. The read
-  // and the patch share one lock: between them the worker could otherwise report
-  // `running`, and the patch would put this stale pid over its own.
+  // Sidecar and index patch share one lock, and neither is written for a job
+  // that is no longer active: a cancel (or the worker's terminal write) that
+  // landed first removed the sidecar, and a rewrite would hand a finished job's
+  // pid to the next reader. Only `queued` gets the index patch — a worker that
+  // already reported `running` wrote its own pid there, the newer one.
   withStateLock(cwd, () => {
     const indexed = listJobs(cwd).find((job) => job.id === jobId);
-    if (indexed?.status === "queued") {
+    if (indexed?.status !== "queued" && indexed?.status !== "running") {
+      return;
+    }
+    writeJobPidFile(cwd, jobId, pid, identity);
+    if (indexed.status === "queued") {
       upsertJob(cwd, { id: jobId, pid, pidIdentity: identity });
     }
   });
