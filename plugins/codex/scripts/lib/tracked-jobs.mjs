@@ -152,6 +152,10 @@ export function createProgressReporter({ stderr = false, logFile = null, onEvent
   };
 }
 
+function isActiveStatus(status) {
+  return status === "queued" || status === "running";
+}
+
 function readStoredJobOrNull(workspaceRoot, jobId) {
   const jobFile = resolveJobFile(workspaceRoot, jobId);
   if (!fs.existsSync(jobFile)) {
@@ -174,17 +178,35 @@ function writeTerminalUnlessCancelled(workspaceRoot, jobId, logFile, write) {
 }
 
 export async function runTrackedJob(job, runner, options = {}) {
+  // Probed outside the lock: on win32 it is a PowerShell start.
+  const pidIdentity = getProcessIdentity(process.pid);
   const runningRecord = {
     ...job,
     status: "running",
     startedAt: nowIso(),
     phase: "starting",
     pid: process.pid,
-    pidIdentity: getProcessIdentity(process.pid),
+    pidIdentity,
     logFile: options.logFile ?? job.logFile ?? null
   };
-  writeJobFile(job.workspaceRoot, job.id, runningRecord);
-  upsertJob(job.workspaceRoot, runningRecord);
+  // A cancel between the spawn and here already wrote a terminal record: the
+  // check and the takeover share the lock so none can land in between, and a
+  // job that is no longer queued or running is never run.
+  const refused = withStateLock(job.workspaceRoot, () => {
+    const stored = readStoredJobOrNull(job.workspaceRoot, job.id);
+    if (stored && !isActiveStatus(stored.status)) {
+      appendLogLine(runningRecord.logFile, `Worker started after the job was ${stored.status}; the turn was not run.`);
+      removeJobPidFile(job.workspaceRoot, job.id);
+      removeJobRequestFile(job.workspaceRoot, job.id);
+      return true;
+    }
+    writeJobFile(job.workspaceRoot, job.id, runningRecord);
+    upsertJob(job.workspaceRoot, runningRecord);
+    return false;
+  });
+  if (refused) {
+    return null;
+  }
 
   try {
     const execution = await runner();

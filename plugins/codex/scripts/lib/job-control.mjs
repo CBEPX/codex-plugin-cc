@@ -323,6 +323,18 @@ export function resolveCancelableJob(cwd, reference, options = {}) {
   throw new Error("No active Codex jobs to cancel.");
 }
 
+function isTerminalRecord(stored) {
+  return Boolean(stored) && stored.status !== "queued" && stored.status !== "running";
+}
+
+// A terminal record the worker wrote itself, not the reaper's dead-worker
+// failure (its variants all start with DEAD_WORKER_MESSAGE, "… (pid reused: …)").
+// The worker writes it only after closing its app-server client, so it proves a
+// cooperative exit.
+export function isWorkerTerminalRecord(stored) {
+  return isTerminalRecord(stored) && !(typeof stored.errorMessage === "string" && stored.errorMessage.startsWith(DEAD_WORKER_MESSAGE));
+}
+
 // The cancel's terminal write, one locked step: another process's `saveState`
 // prune works off a diff of the index, so a cancel split across the write can
 // have its record pruned away, or the payload it deleted counted as still owned.
@@ -334,9 +346,8 @@ export function resolveCancelableJob(cwd, reference, options = {}) {
 export function commitCancel(workspaceRoot, job, nextJob, existing, { leftRunning, log, causedByCancel = false }) {
   return withStateLock(workspaceRoot, () => {
     const stored = readStoredJob(workspaceRoot, job.id);
-    const terminal = stored && stored.status !== "queued" && stored.status !== "running";
-    // The reaper's variants all start with its message ("… (pid reused: …)").
-    const reaped = terminal && typeof stored.errorMessage === "string" && stored.errorMessage.startsWith(DEAD_WORKER_MESSAGE);
+    const terminal = isTerminalRecord(stored);
+    const reaped = terminal && !isWorkerTerminalRecord(stored);
     if (terminal && (reaped || causedByCancel !== true)) {
       log(`cancel: record already ${stored.status}, kept (${reaped ? "written by the reaper" : "interrupt not acknowledged"})`);
       return stored;
@@ -369,15 +380,17 @@ export function commitCancel(workspaceRoot, job, nextJob, existing, { leftRunnin
 // What cancel does with a kill outcome. posix keeps its v1.4.0 answer; win32
 // treats survivors and an unverified attempt as "not cancelled": the job stays
 // running and the survivors are reported, never followed by a record (spec §1).
-export function cancelDecision({ pid, kill, alive, platform = process.platform }) {
+export function cancelDecision({ pid, kill, alive, platform = process.platform, workerProved = false }) {
   if (!pid) {
     return { pending: false, reason: null, survivors: [] };
   }
   // win32, the root was already gone (241): the kill script looked for orphans it
-  // left. Any → pending with them; none → the worker is gone, cancel proceeds.
+  // left. Any → pending with them. None proves nothing on its own (the walk misses
+  // a descendant whose parent already exited), so cancel proceeds only on the
+  // worker's own terminal record (`workerProved`); otherwise the reaper judges it.
   if (platform === "win32" && kill.attempted === false && kill.reason === "process-missing") {
     const survivors = kill.survivors ?? [];
-    return survivors.length > 0 ? { pending: true, reason: kill.reason, survivors, rootAlive: alive } : { pending: false, reason: null, survivors: [] };
+    return survivors.length > 0 || !workerProved ? { pending: true, reason: kill.reason, survivors, rootAlive: alive } : { pending: false, reason: null, survivors: [] };
   }
   // win32, the kill was refused and the root is dead: its tree was never
   // examined, so "cancelled" is a guess — the reaper judges the job.
@@ -434,7 +447,7 @@ export function renderCancelPending(decision, pid, jobId) {
   const rootGone = survivors.length > 0 && decision.rootAlive === false;
   const tail = rootGone
     ? `worker pid ${pid} exited but part of its tree is still running (survivors: ${survivorText}); the job stays running until the reaper judges it.`
-    : (decision.reason === "identity-unavailable" || decision.reason === "identity-mismatch") && decision.rootAlive === false
+    : (decision.reason === "identity-unavailable" || decision.reason === "identity-mismatch" || decision.reason === "process-missing") && decision.rootAlive === false
     ? `worker pid ${pid} exited before it could be verified; the job stays running until the reaper judges it.`
     : "the job stays running until the worker exits.";
   return {

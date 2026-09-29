@@ -2184,6 +2184,27 @@ test("cancel sends turn interrupt to the shared app-server before killing a brok
   assert.equal(cleanup.status, 0, cleanup.stderr);
 });
 
+// A cancel that lands after the spawn but before the worker takes the record
+// over writes `cancelled`; the worker that starts afterwards must not run it.
+test("a worker started against a cancelled job exits without running the turn", () => {
+  const repo = seededRepo();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
+  const jobId = "task-cancelled-before-start";
+  const record = { id: jobId, kind: "task", jobClass: "task", title: "Codex Task", workspaceRoot: repo, status: "cancelled", phase: "cancelled", background: true, pid: null, pidIdentity: null, errorMessage: "Cancelled by user.", completedAt: new Date().toISOString(), request: { prompt: "never run" } };
+  writeJobFile(repo, jobId, record);
+  upsertJob(repo, record);
+  const worker = run(process.execPath, [SCRIPT, "task-worker", "--cwd", repo, "--job-id", jobId], { cwd: repo, env: buildEnv(binDir) });
+  assert.equal(worker.status, 0, worker.stderr);
+  const stored = readJobFile(resolveJobFile(repo, jobId));
+  assert.equal(stored.status, "cancelled");
+  assert.equal(stored.startedAt, undefined, "no running record was written");
+  assert.equal(stored.result, undefined);
+  const appServerStarts = fs.existsSync(fakeStatePath) ? JSON.parse(fs.readFileSync(fakeStatePath, "utf8")).appServerStarts : 0;
+  assert.equal(appServerStarts, 0, "no Codex turn may start for a cancelled job");
+});
+
 test("session end fully cleans up jobs for the ending session", async (t) => {
   const repo = makeTempDir();
   initGitRepo(repo);

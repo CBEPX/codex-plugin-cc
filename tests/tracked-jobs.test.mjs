@@ -11,6 +11,7 @@ import { reapDeadJobs, resetWin32ProbeMemo, runTrackedJob } from "../plugins/cod
 import {
   listJobs,
   readJobFile,
+  recordWorkerPid,
   resolveJobFile,
   resolveJobPid,
   resolveJobPidFile,
@@ -610,4 +611,45 @@ test("reapDeadJobs on win32 gives the batch probe a cold-start budget bounded by
   resetWin32ProbeMemo();
   reapDeadJobs(workspace, jobs, { platform: "win32", getProcessIdentitiesImpl: impl, remainingMs: () => 1500 });
   assert.deepEqual(seen, [6000, 1500]);
+});
+
+// A cancel between the spawn and a slow (win32 PowerShell) identity probe must
+// already find the worker's pid: the sidecar is written first, the identity after.
+test("recordWorkerPid writes the pid sidecar before the identity probe runs", () => {
+  const workspace = makeTempDir();
+  seedJob(workspace, { id: "job-spawned", status: "queued", pid: null, logFile: null });
+  let seenDuringProbe = null;
+  recordWorkerPid(workspace, "job-spawned", 4242, {
+    getProcessIdentityImpl: (pid) => {
+      seenDuringProbe = resolveJobPid(workspace, { id: "job-spawned", status: "queued", pid: null });
+      return `win32:${pid}`;
+    }
+  });
+  assert.deepEqual(seenDuringProbe, { pid: 4242, identity: null }, "the pid must be recorded before the probe returns");
+  assert.deepEqual(resolveJobPid(workspace, { id: "job-spawned", status: "queued", pid: null }), { pid: 4242, identity: "win32:4242" });
+  const indexed = listJobs(workspace).find((entry) => entry.id === "job-spawned");
+  assert.deepEqual([indexed.pid, indexed.pidIdentity], [4242, "win32:4242"]);
+});
+
+// A cancel that landed between the spawn and the worker's start already wrote
+// the terminal record: the worker must not take it over and run the turn.
+test("runTrackedJob refuses a job that is already cancelled and leaves its record alone", async () => {
+  const workspace = makeTempDir();
+  const cancelled = { id: "job-cancelled", workspaceRoot: workspace, status: "cancelled", phase: "cancelled", pid: null, errorMessage: "Cancelled by user.", logFile: null };
+  seedJob(workspace, cancelled);
+  writeJobPidFile(workspace, "job-cancelled", 4243, null);
+  writeJobRequestFile(workspace, "job-cancelled", { prompt: "x" });
+  let ran = false;
+  const execution = await runTrackedJob(cancelled, async () => {
+    ran = true;
+    return { exitStatus: 0, payload: {}, rendered: "", summary: "" };
+  });
+  assert.equal(ran, false, "the turn must not run");
+  assert.equal(execution, null);
+  const stored = readJobFile(resolveJobFile(workspace, "job-cancelled"));
+  assert.equal(stored.status, "cancelled");
+  assert.equal(stored.startedAt, undefined, "no running record was written");
+  assert.equal(listJobs(workspace).find((entry) => entry.id === "job-cancelled").status, "cancelled");
+  assert.equal(fs.existsSync(resolveJobPidFile(workspace, "job-cancelled")), false);
+  assert.equal(fs.existsSync(resolveJobRequestFile(workspace, "job-cancelled")), false);
 });

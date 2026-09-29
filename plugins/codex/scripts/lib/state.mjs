@@ -729,6 +729,14 @@ export function updateJobPid(cwd, jobId, pid, identity = null) {
   });
 }
 
+// A just-spawned worker's pid is recorded before its identity is probed: the
+// win32 probe is a PowerShell start (seconds), and a cancel in that window must
+// already find the pid rather than a pid-less queued job it would call cancelled.
+export function recordWorkerPid(cwd, jobId, pid, { getProcessIdentityImpl = getProcessIdentity } = {}) {
+  updateJobPid(cwd, jobId, pid, null);
+  updateJobPid(cwd, jobId, pid, getProcessIdentityImpl(pid));
+}
+
 export function listJobs(cwd) {
   return loadState(cwd).jobs;
 }
