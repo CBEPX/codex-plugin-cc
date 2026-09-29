@@ -369,7 +369,8 @@ async function handleSessionEnd(input) {
   // was shutting down. Clearing unconditionally would delete the live broker's
   // ownership record, which is exactly what the broker's own endpoint-guarded
   // `clearOwnSessionRecord` avoids on its side. A kept record is kept here too.
-  if (!teardown.kept && loadBrokerSession(cwd)?.endpoint === brokerEndpoint) {
+  // An unreadable record (recordedBroker null) is left for whoever can read it.
+  if (recordedBroker && !teardown.kept && loadBrokerSession(cwd)?.endpoint === brokerEndpoint) {
     clearBrokerSession(cwd);
   }
 }

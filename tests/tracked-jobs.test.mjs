@@ -524,7 +524,7 @@ test("reapDeadJobs on win32 probes the live identities in one batch after the ch
   }
 });
 
-test("reapDeadJobs on win32 memoises live probes for 2 s, nulls included", () => {
+test("reapDeadJobs on win32 memoises a matching probe for 2 s and never reuses a null", () => {
   const workspace = makeTempDir();
   const jobs = [{ id: "j", status: "running", pid: process.pid, pidIdentity: "win32:1" }];
   seedJob(workspace, jobs[0]);
@@ -536,11 +536,42 @@ test("reapDeadJobs on win32 memoises live probes for 2 s, nulls included", () =>
     reapDeadJobs(workspace, jobs, options);
     clock += 1999;
     reapDeadJobs(workspace, jobs, options);
-    assert.equal(calls, 1, `within the TTL (${answer}) nothing is re-probed`);
+    assert.equal(calls, answer === null ? 2 : 1, `within the TTL (${answer}) only a match is served from the memo`);
     clock += 2;
     reapDeadJobs(workspace, jobs, options);
-    assert.equal(calls, 2, `after the TTL (${answer}) it probes again`);
+    assert.equal(calls, answer === null ? 3 : 2, `after the TTL (${answer}) it probes again`);
   }
+});
+
+test("reapDeadJobs on win32 reuses a memo only for a cached match; a different recorded identity is probed fresh", () => {
+  const workspace = makeTempDir();
+  resetWin32ProbeMemo();
+  let clock = 1000;
+  let calls = 0;
+  const options = { platform: "win32", now: () => clock, getProcessIdentitiesImpl: (pids) => { calls += 1; return new Map(pids.map((pid) => [pid, "win32:A"])); } };
+  const a = { id: "j-a", status: "running", pid: process.pid, pidIdentity: "win32:A" };
+  seedJob(workspace, a);
+  reapDeadJobs(workspace, [a], options);
+  reapDeadJobs(workspace, [a], options);
+  assert.equal(calls, 1, "a cached match skips the probe");
+  const b = { id: "j-b", status: "running", pid: process.pid, pidIdentity: "win32:B" };
+  seedJob(workspace, b);
+  clock += 100;
+  const reaped = reapDeadJobs(workspace, [b], options);
+  assert.equal(calls, 2, "the cached identity differs from the record: probe fresh");
+  assert.equal(reaped[0].status, "failed", "the fresh probe (not the cache) judges the reused pid");
+  // A cached mismatch never changes job state on its own.
+  resetWin32ProbeMemo();
+  calls = 0;
+  const mismatch = { platform: "win32", now: () => clock, getProcessIdentitiesImpl: (pids) => { calls += 1; return new Map(pids.map((pid) => [pid, calls === 1 ? "win32:X" : "win32:B"])); } };
+  const c = { id: "j-c", status: "running", pid: process.pid, pidIdentity: "win32:B" };
+  seedJob(workspace, c);
+  reapDeadJobs(workspace, [c], mismatch);
+  const d = { id: "j-d", status: "running", pid: process.pid, pidIdentity: "win32:B" };
+  seedJob(workspace, d);
+  const again = reapDeadJobs(workspace, [d], mismatch);
+  assert.equal(calls, 2);
+  assert.equal(again[0].status, "running", "the second probe matched; the earlier mismatch was not trusted");
 });
 
 test("reapDeadJobs on win32 leaves every job alone when the batch answers nothing", () => {

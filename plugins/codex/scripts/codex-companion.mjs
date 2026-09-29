@@ -1353,13 +1353,16 @@ async function handleCancel(argv) {
   // A worker we may not signal, or whose signal reached nothing, but that is
   // still alive is not cancelled: the job stays running, and the sidecar stays
   // so a later cancel or the reaper can still find it.
-  const decision = cancelDecision({ pid, kill, alive: isPidAlive(pid), interrupted: interrupt.interrupted === true });
+  // The worker's own terminal record proves it finished cooperatively.
+  const storedAfter = readStoredJob(workspaceRoot, job.id);
+  const workerFinished = Boolean(storedAfter) && storedAfter.status !== "running" && storedAfter.status !== "queued";
+  const decision = cancelDecision({ pid, kill, alive: isPidAlive(pid), workerFinished });
   if (decision.pending) {
     emitCancelPending(decision, pid, job.id, { json: options.json, appendLog: (line) => appendLogLine(job.logFile, line) });
     process.exitCode = 1;
     return;
   }
-  const leftRunning = pid && !kill.attempted ? `worker pid ${pid} left running: ${kill.reason}` : null;
+  const leftRunning = pid && !kill.attempted && !workerFinished ? `worker pid ${pid} left running: ${kill.reason}` : null;
   if (leftRunning) {
     appendLogLine(job.logFile, leftRunning);
   }

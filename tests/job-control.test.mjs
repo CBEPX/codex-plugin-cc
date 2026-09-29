@@ -20,12 +20,14 @@ test("cancelDecision: what each kill outcome means for the job", () => {
     [{ pid: 1, kill: { attempted: true, delivered: false, unverified: true }, alive: false, platform: "win32" }, { pending: true, reason: "kill-failed", survivors: [], rootAlive: false }],
     [{ pid: 1, kill: { attempted: false, delivered: false, method: "handle", reason: "process-missing" }, alive: false, platform: "win32" }, { pending: true, reason: "process-missing", survivors: [], rootAlive: false }],
     [{ pid: 1, kill: { attempted: false, delivered: false, method: "handle", reason: "process-missing" }, alive: false, platform: "linux" }, { pending: false, reason: null, survivors: [] }],
-    [{ pid: 1, kill: { attempted: false, delivered: false, method: "handle", reason: "process-missing" }, alive: false, platform: "win32", interrupted: true }, { pending: false, reason: null, survivors: [] }],
-    [{ pid: 1, kill: { attempted: false, delivered: false, method: "handle", reason: "process-missing" }, alive: false, platform: "win32", interrupted: false }, { pending: true, reason: "process-missing", survivors: [], rootAlive: false }],
-    [{ pid: 1, kill: { attempted: false, reason: "identity-unavailable" }, alive: false, platform: "win32", interrupted: true }, { pending: false, reason: null, survivors: [] }],
-    [{ pid: 1, kill: { attempted: false, reason: "identity-unavailable" }, alive: false, platform: "win32", interrupted: false }, { pending: true, reason: "identity-unavailable", survivors: [], rootAlive: false }],
-    [{ pid: 1, kill: { attempted: false, reason: "process-missing" }, alive: true, platform: "win32", interrupted: true }, { pending: true, reason: "process-missing", survivors: [], rootAlive: true }],
-    [{ pid: 1, kill: { attempted: false, reason: "identity-unavailable" }, alive: false, platform: "linux", interrupted: false }, { pending: false, reason: null, survivors: [] }],
+    [{ pid: 1, kill: { attempted: false, delivered: false, method: "handle", reason: "process-missing" }, alive: false, platform: "win32", workerFinished: true }, { pending: false, reason: null, survivors: [] }],
+    [{ pid: 1, kill: { attempted: false, delivered: false, method: "handle", reason: "process-missing" }, alive: false, platform: "win32", workerFinished: false }, { pending: true, reason: "process-missing", survivors: [], rootAlive: false }],
+    [{ pid: 1, kill: { attempted: false, reason: "identity-unavailable" }, alive: false, platform: "win32", workerFinished: true }, { pending: false, reason: null, survivors: [] }],
+    [{ pid: 1, kill: { attempted: false, reason: "identity-unavailable" }, alive: false, platform: "win32", workerFinished: false }, { pending: true, reason: "identity-unavailable", survivors: [], rootAlive: false }],
+    [{ pid: 1, kill: { attempted: false, reason: "identity-mismatch" }, alive: false, platform: "win32", workerFinished: false }, { pending: true, reason: "identity-mismatch", survivors: [], rootAlive: false }],
+    [{ pid: 1, kill: { attempted: false, reason: "identity-mismatch" }, alive: false, platform: "win32", workerFinished: true }, { pending: false, reason: null, survivors: [] }],
+    [{ pid: 1, kill: { attempted: false, reason: "process-missing" }, alive: true, platform: "win32", workerFinished: true }, { pending: true, reason: "process-missing", survivors: [], rootAlive: true }],
+    [{ pid: 1, kill: { attempted: false, reason: "identity-unavailable" }, alive: false, platform: "linux", workerFinished: false }, { pending: false, reason: null, survivors: [] }],
     [{ pid: 1, kill: { attempted: true, delivered: false }, alive: true, platform: "linux" }, { pending: true, reason: "not-delivered", survivors: [], rootAlive: true }],
     [{ pid: null, kill: { attempted: false, reason: "no-pid" }, alive: null, platform: "win32" }, { pending: false, reason: null, survivors: [] }]
   ];
@@ -76,6 +78,13 @@ test("renderCancelPending renders process-missing plainly", () => {
   assert.match(rendered.text, /worker pid 4300 exited before it could be signalled; the job stays running until the reaper judges it/);
   assert.equal(rendered.json.reason, "process-missing");
   assert.equal(rendered.diagnostic, null);
+});
+
+test("renderCancelPending says an unverifiable dead worker waits for the reaper", () => {
+  for (const reason of ["identity-unavailable", "identity-mismatch"]) {
+    const rendered = renderCancelPending({ pending: true, reason, survivors: [], rootAlive: false }, 4300, "job-1");
+    assert.match(rendered.text, /worker pid 4300 exited before it could be verified; the job stays running until the reaper judges it\./);
+  }
 });
 
 test("renderCancelPending reports survivors on win32", () => {

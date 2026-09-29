@@ -283,6 +283,12 @@ export async function ensureBrokerSession(cwd, options = {}) {
     logFile,
     env: options.env ?? process.env
   });
+  // Provisional record: a session ending inside the start window must find this
+  // broker's pid. Without an identity it refuses kills (fail closed) until the
+  // final save below overwrites it.
+  if (Number.isInteger(child.pid) && child.pid > 0) {
+    saveBrokerSession(cwd, { endpoint, pidFile, logFile, sessionDir, pid: child.pid, pidIdentity: null });
+  }
   // Recorded for later teardowns, which only trust a stored pid by identity.
   const pidIdentity = (options.getProcessIdentityImpl ?? getProcessIdentity)(child.pid ?? Number.NaN);
 
@@ -305,6 +311,10 @@ export async function ensureBrokerSession(cwd, options = {}) {
       }
     }
     teardownBrokerSession({ endpoint, pidFile, logFile, sessionDir });
+    // The failed child is cleaned up, so its provisional record goes with it.
+    if (loadBrokerSession(cwd)?.endpoint === endpoint) {
+      clearBrokerSession(cwd);
+    }
     return null;
   }
 

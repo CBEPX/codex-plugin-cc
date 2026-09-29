@@ -14,12 +14,14 @@ import {
   clearBrokerSession,
   ensureBrokerSession,
   loadBrokerSession,
+  resolveBrokerStateFile,
   saveBrokerSession,
   sendBrokerShutdown,
   teardownBrokerSession,
   waitForBrokerEndpoint
 } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
 import { terminateProcessTree } from "../plugins/codex/scripts/lib/process.mjs";
+import { brokerExclusion } from "../plugins/codex/scripts/lib/job-control.mjs";
 import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -1438,4 +1440,42 @@ test("teardownBrokerSession keeps the records on Windows when the outcome is unk
   // No pid at all is settled: nothing to keep.
   const sessionDir = makeTempDir();
   assert.deepEqual(teardownBrokerSession({ pidFile: null, logFile: null, sessionDir, pid: null, killProcess: () => {}, platform: "win32", keepOnUnknown: true }), { signalled: false, reason: "no-pid", kept: false });
+});
+
+test("ensureBrokerSession records the broker's pid before it captures the identity (start window)", async () => {
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const workspace = makeTempDir();
+  let inWindow = null;
+  const session = await ensureBrokerSession(workspace, {
+    env: buildEnv(binDir),
+    getProcessIdentityImpl: (pid) => {
+      inWindow = loadBrokerSession(workspace);
+      return `win32:${pid}`;
+    }
+  });
+  try {
+    assert.ok(session);
+    assert.equal(inWindow?.pid, session.pid, "the provisional record carries the pid");
+    assert.equal(inWindow.pidIdentity, null);
+    assert.equal(inWindow.endpoint, session.endpoint);
+    assert.equal(brokerExclusion(inWindow), null, "a record without identity refuses kills");
+    const final = loadBrokerSession(workspace);
+    assert.equal(final.pidIdentity, `win32:${session.pid}`);
+  } finally {
+    if (session?.pid) { try { process.kill(session.pid, "SIGTERM"); } catch {} }
+    clearBrokerSession(workspace);
+  }
+});
+
+test("SessionEnd leaves an unreadable broker.json in place", () => {
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const workspace = makeTempDir();
+  const stateFile = resolveBrokerStateFile(workspace);
+  fs.mkdirSync(path.dirname(stateFile), { recursive: true });
+  fs.writeFileSync(stateFile, "{ not json", "utf8");
+  const result = runSessionEndHook(workspace, { env: buildEnv(binDir) });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(fs.existsSync(stateFile), true, "an unreadable record is not erased");
 });

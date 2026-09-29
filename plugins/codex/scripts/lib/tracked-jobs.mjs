@@ -432,12 +432,16 @@ export function reapDeadJobs(workspaceRoot, jobs, options = {}) {
   // ponytail: each win32 candidate's job file is read twice (here and in the loop).
   let batch = new Map();
   if (platform === "win32") {
-    const allPids = [...new Set(jobs.map(liveIdentityCandidate).filter(Boolean).map((candidate) => candidate.pid))];
+    const candidates = jobs.map(liveIdentityCandidate).filter(Boolean);
+    const identityByPid = new Map(candidates.map((candidate) => [candidate.pid, candidate.identity]));
+    const allPids = [...identityByPid.keys()];
     const at = now();
     const candidatePids = [];
     for (const pid of allPids) {
       const memo = win32ProbeMemo.get(pid);
-      if (memo && at - memo.at < WIN32_PROBE_MEMO_MS) {
+      // Only a cached match is reused: a cached mismatch (or a `null`, "not
+      // judged") may belong to another process that had this pid, so it is probed fresh.
+      if (memo && at - memo.at < WIN32_PROBE_MEMO_MS && memo.identity === identityByPid.get(pid)) {
         batch.set(pid, memo.identity);
       } else {
         candidatePids.push(pid);
@@ -453,7 +457,8 @@ export function reapDeadJobs(workspaceRoot, jobs, options = {}) {
           win32ProbeMemo.set(pid, { identity, at: stamp });
         }
       } catch {
-        // A failed batch judges nothing and is not remembered.
+        // A failed launcher yields an empty Map, which memoises `null` ("not
+        // judged"); a `null` memo is never reused, so it judges nothing later either.
       }
     }
   }
