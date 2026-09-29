@@ -19,7 +19,13 @@ test("SessionEnd keeps a job whose tree left survivors and drops one whose kill 
     ["win32", { attempted: true, delivered: false, method: "handle", reason: "kill-failed", survivors: [], unverified: true }, true, /tree survivors: unverified/],
     ["linux", { attempted: true, delivered: false, reason: "not-delivered" }, false, null],
     ["win32", { attempted: true, delivered: true, method: "handle", reason: "identity-match" }, false, null],
-    ["win32", { attempted: false, delivered: false, reason: "no-pid" }, false, null]
+    ["win32", { attempted: false, delivered: false, reason: "no-pid" }, false, null],
+    // Never examined the tree (refused, or the kill threw): a dead root proves nothing — the broker teardown's rule.
+    ["win32", { attempted: false, delivered: false, reason: "identity-unavailable" }, true, /left job-1 running: identity-unavailable/],
+    ["win32", () => { throw new Error("powershell crashed"); }, true, /left job-1 running: kill-failed/],
+    // Proven not ours, or gone without orphans: a stale record, the reaper's domain.
+    ["win32", { attempted: false, delivered: false, method: "handle", reason: "identity-mismatch" }, false, null],
+    ["win32", { attempted: false, delivered: false, method: "handle", reason: "process-missing" }, false, null]
   ];
   // A pid that is provably dead: a child that has already exited (reaped by
   // spawnSync), so no table row depends on which pids the host happens to use.
@@ -32,7 +38,7 @@ test("SessionEnd keeps a job whose tree left survivors and drops one whose kill 
     const original = process.stderr.write;
     process.stderr.write = (chunk) => { written.push(String(chunk)); return true; };
     try {
-      cleanupSessionJobs(repo, sessionId, 1000, () => 8000, { platform, terminateRecordedProcessImpl: () => outcome, broker: { pid: 555, pidIdentity: "win32:1" } });
+      cleanupSessionJobs(repo, sessionId, 1000, () => 8000, { platform, terminateRecordedProcessImpl: typeof outcome === "function" ? outcome : () => outcome, broker: { pid: 555, pidIdentity: "win32:1" } });
     } finally {
       process.stderr.write = original;
     }
