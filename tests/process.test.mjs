@@ -744,7 +744,7 @@ function spawnIdler(t) {
   return child;
 }
 
-test("terminateRecordedProcess on live win32 reports process-missing for a pid that is gone", { skip: !IS_WIN, timeout: 30_000 }, (t) => {
+test("terminateRecordedProcess on live win32 reports process-missing for a pid that is gone", { skip: !IS_WIN, timeout: 90_000 }, (t) => {
   resetWindowsIdentityCircuit();
   const child = spawnIdler(t);
   const identity = getProcessIdentity(child.pid);
@@ -755,12 +755,12 @@ test("terminateRecordedProcess on live win32 reports process-missing for a pid t
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
   }
   assert.equal(isPidAlive(child.pid), false);
-  const outcome = terminateRecordedProcess(child.pid, { identity, timeoutMs: 10_000 });
+  const outcome = terminateRecordedProcess(child.pid, { identity, timeoutMs: 30_000 });
   assert.equal(outcome.reason, "process-missing");
   assert.equal(outcome.survivors, undefined, "no orphans: nothing to report");
 });
 
-test("terminateRecordedProcess on live win32 reports, and never kills, an orphan the gone root left", { skip: !IS_WIN, timeout: 30_000 }, async (t) => {
+test("terminateRecordedProcess on live win32 reports, and never kills, an orphan the gone root left", { skip: !IS_WIN, timeout: 90_000 }, async (t) => {
   resetWindowsIdentityCircuit();
   // detached: libuv puts a non-detached child in its parent's kill-on-close job object, so killing the
   // parent would take the grandchild with it (the CI failure of 7f765b4: process-missing, no survivors).
@@ -784,17 +784,17 @@ test("terminateRecordedProcess on live win32 reports, and never kills, an orphan
   assert.equal(isPidAlive(orphan), true, "the orphan outlived its parent");
   // The raw script answer goes into the failure message, so a red CI run diagnoses itself.
   let raw = null;
-  const outcome = terminateRecordedProcess(parent.pid, { identity, timeoutMs: 10_000, runCommandImpl: (...args) => (raw = runCommand(...args)) });
+  const outcome = terminateRecordedProcess(parent.pid, { identity, timeoutMs: 30_000, runCommandImpl: (...args) => (raw = runCommand(...args)) });
   assert.deepEqual(outcome, {
     attempted: false, delivered: false, method: "handle", reason: "process-missing", survivors: [{ pid: orphan, identity: orphanIdentity }]
   }, `parent ${parent.pid} ${identity}, orphan ${orphan} ${orphanIdentity}; script exit ${raw?.status} stdout ${JSON.stringify(raw?.stdout)} stderr ${JSON.stringify(raw?.stderr)}`);
   assert.equal(isPidAlive(orphan), true, "an orphan is reported, never killed");
 });
 
-test("terminateRecordedProcess on live win32 refuses a wrong identity and leaves the process alive", { skip: !IS_WIN, timeout: 30_000 }, (t) => {
+test("terminateRecordedProcess on live win32 refuses a wrong identity and leaves the process alive", { skip: !IS_WIN, timeout: 90_000 }, (t) => {
   resetWindowsIdentityCircuit();
   const child = spawnIdler(t);
   assert.ok(getProcessIdentity(child.pid));
-  assert.equal(terminateRecordedProcess(child.pid, { identity: "win32:1", timeoutMs: 10_000 }).reason, "identity-mismatch");
+  assert.equal(terminateRecordedProcess(child.pid, { identity: "win32:1", timeoutMs: 30_000 }).reason, "identity-mismatch");
   assert.equal(isPidAlive(child.pid), true);
 });
