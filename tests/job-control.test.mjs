@@ -1,7 +1,10 @@
 import test from "node:test";
+import { makeTempDir } from "./helpers.mjs";
+import { BROKER_ENDPOINT_ENV } from "../plugins/codex/scripts/lib/app-server.mjs";
+import { saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
 import assert from "node:assert/strict";
 
-import { brokerExclusion, cancelDecision, emitCancelPending, renderCancelPending } from "../plugins/codex/scripts/lib/job-control.mjs";
+import { brokerExclusion, brokerPresence, cancelDecision, emitCancelPending, renderCancelPending } from "../plugins/codex/scripts/lib/job-control.mjs";
 
 const SURVIVORS = [{ pid: 4301, identity: "win32:7" }];
 
@@ -12,7 +15,8 @@ test("cancelDecision: what each kill outcome means for the job", () => {
     [{ pid: 1, kill: { attempted: true, delivered: false, survivors: SURVIVORS }, alive: false, platform: "linux" }, { pending: false, reason: null, survivors: [] }],
     [{ pid: 1, kill: { attempted: false, reason: "identity-unavailable" }, alive: true, platform: "win32" }, { pending: true, reason: "identity-unavailable", survivors: [] }],
     [{ pid: 1, kill: { attempted: true, delivered: false, unverified: true }, alive: false, platform: "win32" }, { pending: true, reason: "kill-failed", survivors: [] }],
-    [{ pid: 1, kill: { attempted: false, reason: "process-missing" }, alive: false, platform: "win32" }, { pending: false, reason: null, survivors: [] }],
+    [{ pid: 1, kill: { attempted: false, delivered: false, method: "handle", reason: "process-missing" }, alive: false, platform: "win32" }, { pending: true, reason: "process-missing", survivors: [] }],
+    [{ pid: 1, kill: { attempted: false, delivered: false, method: "handle", reason: "process-missing" }, alive: false, platform: "linux" }, { pending: false, reason: null, survivors: [] }],
     [{ pid: 1, kill: { attempted: true, delivered: false }, alive: true, platform: "linux" }, { pending: true, reason: "not-delivered", survivors: [] }],
     [{ pid: null, kill: { attempted: false, reason: "no-pid" }, alive: null, platform: "win32" }, { pending: false, reason: null, survivors: [] }]
   ];
@@ -26,6 +30,24 @@ test("brokerExclusion: none, a verified pair, or null when the broker cannot be 
   assert.deepEqual(brokerExclusion({ pid: 555, pidIdentity: "win32:12" }), [{ pid: 555, identity: "win32:12" }]);
   assert.equal(brokerExclusion({ pid: 555, pidIdentity: null }), null);
   assert.equal(brokerExclusion({ pid: 555, pidIdentity: "linux:12" }), null);
+  assert.equal(brokerExclusion("unknown"), null);
+});
+
+test("brokerPresence: a record, unknown while an endpoint is advertised, or null", () => {
+  const workspace = makeTempDir();
+  assert.equal(brokerPresence(workspace, {}), null);
+  assert.equal(brokerPresence(workspace, { [BROKER_ENDPOINT_ENV]: "" }), null);
+  assert.equal(brokerPresence(workspace, { [BROKER_ENDPOINT_ENV]: "unix:/tmp/x.sock" }), "unknown");
+  saveBrokerSession(workspace, { endpoint: "unix:/tmp/x.sock", pid: null, pidFile: null, logFile: null, sessionDir: null });
+  assert.equal(brokerPresence(workspace, { [BROKER_ENDPOINT_ENV]: "unix:/tmp/x.sock" }).endpoint, "unix:/tmp/x.sock");
+  assert.equal(brokerPresence(workspace, {}).endpoint, "unix:/tmp/x.sock");
+});
+
+test("renderCancelPending renders process-missing plainly", () => {
+  const rendered = renderCancelPending({ pending: true, reason: "process-missing", survivors: [] }, 4300, "job-1");
+  assert.equal(rendered.logLine, "cancellation not confirmed: worker pid 4300 left running (process-missing)");
+  assert.equal(rendered.json.reason, "process-missing");
+  assert.equal(rendered.diagnostic, null);
 });
 
 test("renderCancelPending reports survivors on win32", () => {

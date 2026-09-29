@@ -15,7 +15,7 @@ import {
   teardownBrokerSession
 } from "./lib/broker-lifecycle.mjs";
 import { loadState, resolveJobPid, resolveStateFile, saveState, STATE_LOCK_TIMEOUT_CODE, withStateLock } from "./lib/state.mjs";
-import { brokerExclusion } from "./lib/job-control.mjs";
+import { brokerExclusion, brokerPresence } from "./lib/job-control.mjs";
 import { reapDeadJobs } from "./lib/tracked-jobs.mjs";
 import { TRANSCRIPT_PATH_ENV } from "./lib/claude-session-transfer.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
@@ -188,7 +188,7 @@ export function cleanupSessionJobs(cwd, sessionId, lockWaitMs, remainingMs, deps
           reason = reason ?? "kill-failed";
           process.stderr.write(
             refused
-              ? `[codex] SessionEnd left ${job.id} tree: refused (broker record without identity)\n`
+              ? `[codex] SessionEnd left ${job.id} tree: refused (broker record unreadable or without identity)\n`
               : `[codex] SessionEnd left ${job.id} tree survivors: ${(outcome?.survivors ?? []).map((s) => `${s.pid}:${s.identity ?? "unknown"}`).join(" ") || "unverified"}\n`
           );
         }
@@ -261,7 +261,7 @@ async function handleSessionEnd(input) {
   let activeJobs;
   try {
     cleanupSessionJobs(cwd, input.session_id || process.env[SESSION_ID_ENV], stepBudget(STATE_LOCK_STEP_MS), remainingMs, {
-      broker: process.platform === "win32" ? recordedBroker : null
+      broker: process.platform === "win32" ? brokerPresence(cwd) : null
     });
     activeJobs = activeWorkspaceJobs(cwd, stepBudget(STATE_LOCK_STEP_MS), remainingMs);
   } catch (error) {

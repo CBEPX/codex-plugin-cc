@@ -1,5 +1,7 @@
 import fs from "node:fs";
 
+import { BROKER_ENDPOINT_ENV } from "./app-server.mjs";
+import { loadBrokerSession } from "./broker-lifecycle.mjs";
 import { getSessionRuntimeStatus } from "./codex.mjs";
 import { getConfig, listJobs, readJobFile, resolveJobFile } from "./state.mjs";
 import { reapDeadJobs, SESSION_ID_ENV } from "./tracked-jobs.mjs";
@@ -328,6 +330,11 @@ export function cancelDecision({ pid, kill, alive, platform = process.platform }
   if (!pid) {
     return { pending: false, reason: null, survivors: [] };
   }
+  // The root vanished between the interrupt and the kill: its tree was never
+  // examined, so "cancelled" would be a guess. The reaper fails the job instead.
+  if (platform === "win32" && kill.reason === "process-missing") {
+    return { pending: true, reason: "process-missing", survivors: [] };
+  }
   const win32Unknown = platform === "win32" && kill.attempted && (kill.survivors?.length > 0 || kill.unverified === true);
   const stillHere = (!kill.attempted || !kill.delivered) && alive === true;
   if (!stillHere && !win32Unknown) {
@@ -337,12 +344,25 @@ export function cancelDecision({ pid, kill, alive, platform = process.platform }
   return { pending: true, reason, survivors: platform === "win32" ? (kill.survivors ?? []) : [] };
 }
 
+// The loaded broker record, `"unknown"` when none is readable but an endpoint is
+// advertised (a broker is presumed until proven absent), or `null`.
+export function brokerPresence(workspaceRoot, env = process.env) {
+  const record = loadBrokerSession(workspaceRoot);
+  if (record) {
+    return record;
+  }
+  return typeof env[BROKER_ENDPOINT_ENV] === "string" && env[BROKER_ENDPOINT_ENV] !== "" ? "unknown" : null;
+}
+
 // The pairs a worker kill must skip: `[]` without a broker, one verified
 // `{ pid, identity }` pair, or `null` when a broker is recorded but cannot be
 // excluded safely (no win32 identity) — the caller then refuses the kill.
 export function brokerExclusion(broker) {
   if (!broker) {
     return [];
+  }
+  if (broker === "unknown") {
+    return null;
   }
   const identity = typeof broker.pidIdentity === "string" && /^win32:\d+$/.test(broker.pidIdentity) ? broker.pidIdentity : null;
   return Number.isInteger(broker.pid) && broker.pid >= 1 && identity ? [{ pid: broker.pid, identity }] : null;

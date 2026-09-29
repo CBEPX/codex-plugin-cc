@@ -21,7 +21,6 @@ import {
     runAppServerReview,
     runAppServerTurn
   } from "./lib/codex.mjs";
-import { loadBrokerSession } from "./lib/broker-lifecycle.mjs";
 import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
 import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
@@ -47,6 +46,7 @@ import {
 import {
   buildSingleJobSnapshot,
   brokerExclusion,
+  brokerPresence,
   buildStatusSnapshot,
   cancelDecision,
   emitCancelPending,
@@ -1343,7 +1343,7 @@ async function handleCancel(argv) {
 
   // Only a pid that is provably still this job's worker is signalled (#743).
   const { pid, identity } = resolveJobPid(workspaceRoot, job);
-  const broker = process.platform === "win32" ? loadBrokerSession(workspaceRoot) : null;
+  const broker = process.platform === "win32" ? brokerPresence(workspaceRoot) : null;
   const exclude = brokerExclusion(broker);
   // A broker record without a win32 identity cannot be excluded safely: refuse
   // rather than risk killing the shared broker under the worker (spec §3.4 rev. 12).

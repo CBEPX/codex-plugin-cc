@@ -63,7 +63,23 @@ test("SessionEnd passes the verified broker as the excluded subtree and refuses 
   }
   assert.deepEqual(loadState(repo2).jobs.map((job) => job.id), ["job-1"]);
   assert.match(written.join(""), /left job-1 running: identity-unavailable/);
-  assert.match(written.join(""), /left job-1 tree: refused \(broker record without identity\)/);
+  assert.match(written.join(""), /left job-1 tree: refused \(broker record unreadable or without identity\)/);
+});
+
+test("SessionEnd keeps the job untouched when the broker presence is unknown", () => {
+  const repo = makeTempDir();
+  const deadPid = spawnSync(process.execPath, ["-e", "0"]).pid;
+  upsertJob(repo, { id: "job-1", status: "running", sessionId: "s", background: false, pid: deadPid, pidIdentity: "win32:1" });
+  const written = [];
+  const original = process.stderr.write;
+  process.stderr.write = (chunk) => { written.push(String(chunk)); return true; };
+  try {
+    cleanupSessionJobs(repo, "s", 1000, () => 8000, { platform: "win32", broker: "unknown", terminateRecordedProcessImpl: () => assert.fail("must not kill") });
+  } finally {
+    process.stderr.write = original;
+  }
+  assert.deepEqual(loadState(repo).jobs.map((job) => job.id), ["job-1"]);
+  assert.match(written.join(""), /left job-1 tree: refused \(broker record unreadable or without identity\)/);
 });
 
 test("SessionEnd without a recorded broker still kills the worker, excluding nothing", () => {

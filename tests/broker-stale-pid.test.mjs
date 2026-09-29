@@ -1089,6 +1089,22 @@ test("ensureBrokerSession retries the readiness probe before giving up on a slow
   }
 });
 
+test("saveBrokerSession writes atomically: no temp file is left and the record loads", () => {
+  const workspace = makeTempDir();
+  const renames = [];
+  const realRename = fs.renameSync;
+  fs.renameSync = (from, to) => { renames.push([from, to]); return realRename(from, to); };
+  try {
+    saveBrokerSession(workspace, { endpoint: "unix:/tmp/x.sock", pid: null, pidFile: null, logFile: null, sessionDir: null });
+  } finally {
+    fs.renameSync = realRename;
+  }
+  assert.equal(renames.length, 1, "the record is swapped in by one rename");
+  assert.equal(renames[0][0], `${renames[0][1]}.${process.pid}.tmp`);
+  assert.deepEqual(fs.readdirSync(resolveStateDir(workspace)).filter((name) => name.endsWith(".tmp")), []);
+  assert.equal(loadBrokerSession(workspace)?.endpoint, "unix:/tmp/x.sock");
+});
+
 test("loadBrokerSession ignores a malformed record instead of trusting it", () => {
   const workspace = makeTempDir();
   const stateDir = resolveStateDir(workspace);

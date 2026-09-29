@@ -192,7 +192,12 @@ export function loadBrokerSession(cwd) {
 export function saveBrokerSession(cwd, session) {
   const stateDir = resolveStateDir(cwd);
   fs.mkdirSync(stateDir, { recursive: true });
-  fs.writeFileSync(resolveBrokerStateFile(cwd), `${JSON.stringify(session, null, 2)}\n`, "utf8");
+  // Tmp + rename: a reader sees the old record or the new one, never a truncated
+  // file that reads as "no broker" (same pattern as state.mjs).
+  const stateFile = resolveBrokerStateFile(cwd);
+  const tempFile = `${stateFile}.${process.pid}.tmp`;
+  fs.writeFileSync(tempFile, `${JSON.stringify(session, null, 2)}\n`, "utf8");
+  fs.renameSync(tempFile, stateFile);
 }
 
 export function clearBrokerSession(cwd) {
