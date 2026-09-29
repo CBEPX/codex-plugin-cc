@@ -2234,9 +2234,10 @@ test("a brokered cancel whose interrupt is ignored stays pending and kills nothi
   await waitFor(() => !isAlive(running.pid));
 });
 
-// The direct path is trusted only when the job file and the index agree: both
-// are written in one patch, so a file that says direct while the index says
-// broker is forged or torn, and the kill (no turn end) would strand the turn.
+// The direct path is trusted only when the job file and the index agree: the
+// updater patches the index (locked) and then the file, so a file that says
+// direct while the index says broker is forged or torn, and the kill (no turn
+// end) would strand the turn.
 test("a job file forged to transport direct does not take the direct kill path while the index says broker", { skip: IS_WIN, timeout: 90_000 }, async (t) => {
   const repo = seededRepo();
   const binDir = makeTempDir();

@@ -1340,8 +1340,8 @@ async function handleCancel(argv) {
   const turnId = existing.turnId ?? job.turnId ?? null;
   // A direct worker owns its app-server: a second client cannot reach it (it
   // would start a codex of its own), and the kill below takes it down.
-  // Defense in depth: the updater writes the index, then the file, unlocked
-  // (the index leads by one synchronous write); a file that says direct while
+  // Defense in depth: the updater patches the index under the state lock, then
+  // the file outside it (the index leads by one write); a file that says direct while
   // the index does not is forged or torn, and the brokered path (no kill
   // without the turn's end) is the safe one.
   const direct = existing.transport === "direct" && job.transport === "direct";

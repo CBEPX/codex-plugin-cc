@@ -1,6 +1,6 @@
 # codex-plugin-cc v1.4.2 — cancel waits for the turn, close reports the exit
 
-Date: 2026-09-29 (rev. 3, 2026-09-30)
+Date: 2026-09-29 (rev. 4, 2026-09-30)
 
 ## Goal
 
@@ -30,7 +30,7 @@ Success: a brokered cancel whose interrupt is ignored answers `cancellationPendi
 
 `handleCancel` order: resolve the job (reaper first, as today) → read the record → interrupt unless `transport === "direct"` → resolve the pid → **brokered wait** → (win32) take the state lock → `finishCancel` (kill, `cancelDecision`, `commitCancel`) as in v1.4.1. The wait runs outside every lock: the worker's terminal write takes the state lock.
 
-Brokered wait: only when a turn is recorded (`turnId`) and the transport is not `direct`. If the interrupt was acknowledged, `readStoredJob` is polled every 100 ms for up to `TURN_INTERRUPT_ACK_MS` (10 000, now exported from `lib/codex.mjs`; the window the turn timeout grants the terminal notification) until the record is terminal. A terminal record ends the wait; the worker is done with the job, so the pid is dropped and nothing is killed. `causedByCancel` is true only when that record carries the worker's `workerClosed` marker; `interrupt.interrupted` alone never counts. For a direct job and for a job without a turn, `causedByCancel` is "kill delivered", as before.
+Brokered wait: only when a turn is recorded (`turnId`) and the transport is not `direct`. If the interrupt was acknowledged, `readStoredJob` is polled every 100 ms for up to `TURN_INTERRUPT_ACK_MS` (10 000, now exported from `lib/codex.mjs`; the window the turn timeout grants the terminal notification) until the record is terminal. A terminal record ends the wait; the worker is done with the job, so the pid is dropped and nothing is killed. `causedByCancel` is true only when that record carries the worker's `workerClosed` marker and the interrupt was acknowledged by the shared broker client (`interrupt.transport === "broker"`): with no broker record the interrupt client is a stray direct app-server that may acknowledge a turn it never ran, and its acknowledgement never counts; `interrupt.interrupted` alone never counts. For a direct job and for a job without a turn, `causedByCancel` is "kill delivered", as before.
 
 | # | transport | turn recorded | interrupt | record during the wait | kill | answer (posix and win32) |
 |---|---|---|---|---|---|---|
@@ -90,3 +90,4 @@ Rows 3–4 answer `{ jobId, status: "running", cancellationPending: true, reason
 | 1 | 2026-09-29 | v1.4.1 adversarial pass 13 parked limits; controller rulings 1–5 | initial |
 | 2 | 2026-09-29 | T4 review + implementation observations | transport kept on the final record; row 3 reads the record first; pending text without pid |
 | 3 | 2026-09-30 | adversarial pass 1 + whole-branch review | transport must agree between file and index; causation needs the acknowledged interrupt |
+| 4 | 2026-09-30 | fix-wave re-reviews | causation needs the shared broker's acknowledgement (a stray direct app-server's does not count); write-order comments corrected |
