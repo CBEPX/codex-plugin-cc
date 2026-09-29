@@ -18,7 +18,7 @@
 - No behaviour change outside the spec's five items. `tests/commands.test.mjs` README pins untouched (run it after every README edit). `docs/agent/windows-threat-model.md` does not apply: no spawn path changes (the T4 fixture knob is test-only and spawns nothing).
 - Timing rules (`docs/agent/testing-and-ci.md`): no absolute `< N ms` under 10 s; `waitFor` 30 s; `{ timeout }` + `t.after` SIGKILL on child-spawning tests; failing lifecycle assertions print `jobDiagnostics(repo, jobId)` (T4 Step 1).
 - Line numbers are verified on 4d7d62c. Corrections to the brief: the pinned log assertion is `tests/job-control.test.mjs:172`; `tests/runtime.test.mjs:3888` is a **brokered** job, so T4 converts it to the direct case (the only other direct cancel test is win32-only, L4340).
-- Commit trailer: the implementer's own `Co-Authored-By:` line.
+- Commit trailer, always: `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>` (the controller's line, whatever model implements).
 
 ## Review Focus
 
