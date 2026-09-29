@@ -264,7 +264,7 @@ async function handleSessionEnd(input) {
   let activeJobs;
   try {
     cleanupSessionJobs(cwd, input.session_id || process.env[SESSION_ID_ENV], stepBudget(STATE_LOCK_STEP_MS), remainingMs, {
-      broker: process.platform === "win32" ? brokerPresence(cwd) : null
+      broker: process.platform === "win32" ? brokerPresence(cwd, process.env, { record: recordedBroker }) : null
     });
     activeJobs = activeWorkspaceJobs(cwd, stepBudget(STATE_LOCK_STEP_MS), remainingMs);
   } catch (error) {

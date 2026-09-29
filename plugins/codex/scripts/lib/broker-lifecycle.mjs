@@ -7,7 +7,7 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { createBrokerEndpoint, parseBrokerEndpoint } from "./broker-endpoint.mjs";
 import { getProcessIdentity, isPidAlive, processCommandLine, terminateProcessTree, terminateRecordedProcess } from "./process.mjs";
-import { resolveStateDir } from "./state.mjs";
+import { resolveStateDir, retryOnWindows } from "./state.mjs";
 
 export const PID_FILE_ENV = "CODEX_COMPANION_APP_SERVER_PID_FILE";
 export const LOG_FILE_ENV = "CODEX_COMPANION_APP_SERVER_LOG_FILE";
@@ -139,7 +139,7 @@ export function spawnBrokerProcess({ scriptPath, cwd, endpoint, pidFile, logFile
   return child;
 }
 
-function resolveBrokerStateFile(cwd) {
+export function resolveBrokerStateFile(cwd) {
   return path.join(resolveStateDir(cwd), BROKER_STATE_FILE);
 }
 
@@ -177,7 +177,7 @@ export function loadBrokerSession(cwd) {
 
   let record;
   try {
-    record = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+    record = JSON.parse(retryOnWindows(() => fs.readFileSync(stateFile, "utf8"), ["EPERM", "EBUSY", "EACCES"]));
   } catch {
     return null;
   }
@@ -189,7 +189,7 @@ export function loadBrokerSession(cwd) {
   return record;
 }
 
-export function saveBrokerSession(cwd, session) {
+export function saveBrokerSession(cwd, session, { renameImpl = (from, to) => fs.renameSync(from, to), platform = process.platform } = {}) {
   const stateDir = resolveStateDir(cwd);
   fs.mkdirSync(stateDir, { recursive: true });
   // Tmp + rename: a reader sees the old record or the new one, never a truncated
@@ -197,7 +197,7 @@ export function saveBrokerSession(cwd, session) {
   const stateFile = resolveBrokerStateFile(cwd);
   const tempFile = `${stateFile}.${process.pid}.tmp`;
   fs.writeFileSync(tempFile, `${JSON.stringify(session, null, 2)}\n`, "utf8");
-  fs.renameSync(tempFile, stateFile);
+  retryOnWindows(() => renameImpl(tempFile, stateFile), ["EPERM", "EBUSY", "EACCES"], { platform });
 }
 
 export function clearBrokerSession(cwd) {

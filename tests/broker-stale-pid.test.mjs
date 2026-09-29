@@ -1105,6 +1105,22 @@ test("saveBrokerSession writes atomically: no temp file is left and the record l
   assert.equal(loadBrokerSession(workspace)?.endpoint, "unix:/tmp/x.sock");
 });
 
+test("saveBrokerSession rides out a transient EPERM on the rename on win32", () => {
+  const workspace = makeTempDir();
+  let calls = 0;
+  const renameImpl = (from, to) => {
+    calls += 1;
+    if (calls === 1) {
+      throw Object.assign(new Error("locked"), { code: "EPERM" });
+    }
+    fs.renameSync(from, to);
+  };
+  saveBrokerSession(workspace, { endpoint: "unix:/tmp/x.sock", pid: null, pidFile: null, logFile: null, sessionDir: null }, { renameImpl, platform: "win32" });
+  assert.equal(calls, 2);
+  assert.equal(loadBrokerSession(workspace)?.endpoint, "unix:/tmp/x.sock");
+  assert.throws(() => saveBrokerSession(workspace, { endpoint: "unix:/tmp/y.sock" }, { renameImpl: () => { throw Object.assign(new Error("locked"), { code: "EPERM" }); }, platform: "linux" }), /locked/);
+});
+
 test("loadBrokerSession ignores a malformed record instead of trusting it", () => {
   const workspace = makeTempDir();
   const stateDir = resolveStateDir(workspace);

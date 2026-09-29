@@ -1,7 +1,7 @@
 import fs from "node:fs";
 
 import { BROKER_ENDPOINT_ENV } from "./app-server.mjs";
-import { loadBrokerSession } from "./broker-lifecycle.mjs";
+import { loadBrokerSession, resolveBrokerStateFile } from "./broker-lifecycle.mjs";
 import { getSessionRuntimeStatus } from "./codex.mjs";
 import { getConfig, listJobs, readJobFile, resolveJobFile } from "./state.mjs";
 import { reapDeadJobs, SESSION_ID_ENV } from "./tracked-jobs.mjs";
@@ -326,14 +326,16 @@ export function resolveCancelableJob(cwd, reference, options = {}) {
 // What cancel does with a kill outcome. posix keeps its v1.4.0 answer; win32
 // treats survivors and an unverified attempt as "not cancelled": the job stays
 // running and the survivors are reported, never followed by a record (spec §1).
-export function cancelDecision({ pid, kill, alive, platform = process.platform }) {
+export function cancelDecision({ pid, kill, alive, platform = process.platform, interrupted = false }) {
   if (!pid) {
     return { pending: false, reason: null, survivors: [] };
   }
-  // The root vanished between the interrupt and the kill: its tree was never
-  // examined, so "cancelled" would be a guess. The reaper fails the job instead.
-  if (platform === "win32" && kill.reason === "process-missing") {
-    return { pending: true, reason: "process-missing", survivors: [], rootAlive: alive };
+  // win32, nothing was signalled (root already gone, or the kill was refused) and
+  // the root is dead: its tree was never examined, so "cancelled" is a guess — the
+  // reaper judges the job. Unless the worker acknowledged the turn interrupt: it
+  // then exited cooperatively and closed its own app-server (v1.4.0 behaviour).
+  if (platform === "win32" && kill.attempted === false && kill.reason !== "no-pid" && alive === false && !interrupted) {
+    return { pending: true, reason: kill.reason, survivors: [], rootAlive: alive };
   }
   const win32Unknown = platform === "win32" && kill.attempted && (kill.survivors?.length > 0 || kill.unverified === true);
   const stillHere = (!kill.attempted || !kill.delivered) && alive === true;
@@ -346,10 +348,13 @@ export function cancelDecision({ pid, kill, alive, platform = process.platform }
 
 // The loaded broker record, `"unknown"` when none is readable but an endpoint is
 // advertised (a broker is presumed until proven absent), or `null`.
-export function brokerPresence(workspaceRoot, env = process.env) {
-  const record = loadBrokerSession(workspaceRoot);
+export function brokerPresence(workspaceRoot, env = process.env, { record = loadBrokerSession(workspaceRoot) } = {}) {
   if (record) {
     return record;
+  }
+  // A record file that exists but did not load is unreadable: presume a broker.
+  if (fs.existsSync(resolveBrokerStateFile(workspaceRoot))) {
+    return "unknown";
   }
   return typeof env[BROKER_ENDPOINT_ENV] === "string" && env[BROKER_ENDPOINT_ENV] !== "" ? "unknown" : null;
 }
@@ -380,7 +385,9 @@ export function renderCancelPending(decision, pid, jobId) {
     : decision.reason === "kill-failed" ? " (unverified)" : "";
   // The root exited but part of its tree did not: nothing "waits for the worker".
   const rootGone = decision.reason === "kill-failed" && survivors.length > 0 && decision.rootAlive === false;
-  const tail = rootGone
+  const tail = decision.reason === "process-missing" && decision.rootAlive === false
+    ? `worker pid ${pid} exited before it could be signalled; the job stays running until the reaper judges it.`
+    : rootGone
     ? `worker pid ${pid} exited but part of its tree is still running (survivors: ${survivorText}); the job stays running until the reaper judges it.`
     : "the job stays running until the worker exits.";
   return {

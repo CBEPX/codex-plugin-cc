@@ -1353,7 +1353,7 @@ async function handleCancel(argv) {
   // A worker we may not signal, or whose signal reached nothing, but that is
   // still alive is not cancelled: the job stays running, and the sidecar stays
   // so a later cancel or the reaper can still find it.
-  const decision = cancelDecision({ pid, kill, alive: isPidAlive(pid) });
+  const decision = cancelDecision({ pid, kill, alive: isPidAlive(pid), interrupted: interrupt.interrupted === true });
   if (decision.pending) {
     emitCancelPending(decision, pid, job.id, { json: options.json, appendLog: (line) => appendLogLine(job.logFile, line) });
     process.exitCode = 1;
