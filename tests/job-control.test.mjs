@@ -181,13 +181,16 @@ test("commitCancel writes cancelled over an active record and keeps a terminal o
 test("commitCancel keeps a reaper-written failure even when this cancel's interrupt was acknowledged", () => {
   const job = { id: "task-1", status: "running", title: "T" };
   const next = { ...job, status: "cancelled", phase: "cancelled", pid: null, pidIdentity: null, requestFile: null, completedAt: "2026-09-29T00:00:00.000Z", errorMessage: "Cancelled by user." };
+  // Only the reaper's records (DEAD_WORKER_MESSAGE prefix) are kept unconditionally; any other
+  // terminal record is kept only when this cancel did not cause it.
   // [stored errorMessage, workerClosed, causedByCancel, kept]
   const cases = [
     [DEAD_WORKER_MESSAGE, undefined, true, true],
     [DEAD_WORKER_MESSAGE, undefined, false, true],
     [`${DEAD_WORKER_MESSAGE} (pid reused: 5 now belongs to another process)`, undefined, true, true],
-    ["worker uncaughtException: boom", undefined, true, true],
-    ["Turn interrupted.", undefined, true, true],
+    ["worker uncaughtException: boom", undefined, true, false],
+    ["Turn interrupted.", undefined, true, false],
+    ["Codex CLI is not installed or is missing required runtime support. Install it with `npm install -g @openai/codex`, then rerun `/codex:setup`.", undefined, true, false],
     ["Turn interrupted.", true, true, false],
     ["Turn interrupted.", true, false, true]
   ];
