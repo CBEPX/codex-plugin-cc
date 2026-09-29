@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
@@ -163,7 +164,12 @@ function describeBrokerRecordProblem(record) {
   }
   // Legacy records carry no state and count as ready.
   if (record.state != null && !BROKER_STATES.includes(record.state)) {
-    return "state is not starting or ready";
+    return "state is not starting, replacing or ready";
+  }
+  for (const key of ["startedAt", "replacingAt"]) {
+    if (record[key] != null && !Number.isFinite(record[key])) {
+      return `${key} is not a number`;
+    }
   }
   for (const key of ["pidFile", "logFile", "sessionDir"]) {
     if (record[key] != null && !(typeof record[key] === "string" && path.isAbsolute(record[key]))) {
@@ -173,7 +179,9 @@ function describeBrokerRecordProblem(record) {
   return null;
 }
 
-const BROKER_STATES = ["starting", "ready"];
+// starting: spawned (or about to be) by a start in progress; replacing: reserved
+// by a stale caller that is tearing it down; ready: the start finished.
+const BROKER_STATES = ["starting", "replacing", "ready"];
 
 export function loadBrokerSession(cwd) {
   const stateFile = resolveBrokerStateFile(cwd);
@@ -220,17 +228,48 @@ export function clearBrokerSession(cwd) {
   }
 }
 
-// The one conditional delete: compare the record's endpoint and clear it inside
-// a single state-lock section, so a replacement written by another start after
-// the caller decided cannot be deleted. `loadBrokerSessionImpl` is a test seam.
-export function clearBrokerSessionIfEndpoint(cwd, endpoint, { loadBrokerSessionImpl = loadBrokerSession } = {}) {
-  return withStateLock(cwd, () => {
-    if (loadBrokerSessionImpl(cwd)?.endpoint !== endpoint) {
-      return false;
-    }
-    clearBrokerSession(cwd);
-    return true;
-  });
+// The one conditional write: re-load the record, test it and save `next` (or
+// clear it, `next === null`) inside a single state-lock section, so a record
+// written by another start or replacer after the caller decided is left alone.
+// `loadBrokerSessionImpl` and `saveImpl` are test seams.
+function writeBrokerSessionIf(cwd, matches, next, { waitMs = undefined, loadBrokerSessionImpl = loadBrokerSession, saveImpl = saveBrokerSession } = {}) {
+  return withStateLock(
+    cwd,
+    () => {
+      if (!matches(loadBrokerSessionImpl(cwd))) {
+        return false;
+      }
+      if (next === null) {
+        clearBrokerSession(cwd);
+      } else {
+        saveImpl(cwd, next);
+      }
+      return true;
+    },
+    { waitMs }
+  );
+}
+
+export function clearBrokerSessionIfEndpoint(cwd, endpoint, options = {}) {
+  return writeBrokerSessionIf(cwd, (record) => record?.endpoint === endpoint, null, options);
+}
+
+// A stale caller's clear: only the record it reserved (its replacer nonce).
+export function clearBrokerSessionIfNonce(cwd, nonce, options = {}) {
+  return writeBrokerSessionIf(cwd, (record) => record?.replacer === nonce, null, options);
+}
+
+// The claim a stale decision was made on: any change (a pid or identity saved, a
+// promotion, a reservation, another endpoint) invalidates the decision.
+function sameClaim(record, claim) {
+  return (
+    Boolean(record) &&
+    record.endpoint === claim.endpoint &&
+    record.pid === claim.pid &&
+    record.pidIdentity === claim.pidIdentity &&
+    record.state === claim.state &&
+    record.replacer === claim.replacer
+  );
 }
 
 async function isBrokerEndpointReady(endpoint) {
@@ -255,6 +294,14 @@ const FAILED_START_EXIT_WAIT_MS = 2000;
 // path for it again; bounded, so records that keep appearing cannot loop forever.
 const CLAIM_ATTEMPTS = 3;
 const READY_SAVE_RETRY_MS = 250;
+// How long a starting record without a pid, or a replacing record, is presumed to
+// belong to a start or a teardown still in progress. Past it the claim is settled:
+// a crashed spawner or replacer blocks the broker for at most this long.
+export const STARTING_GRACE_MS = 60_000;
+
+function withinGrace(at) {
+  return Number.isFinite(at) && Date.now() - at <= STARTING_GRACE_MS;
+}
 
 export async function ensureBrokerSession(cwd, options = {}, attempt = 1) {
   try {
@@ -273,35 +320,91 @@ async function ensureBrokerSessionLocked(cwd, options, attempt) {
   const isAliveImpl = options.isAliveImpl ?? isPidAlive;
   const ownsProcessImpl = options.ownsProcessImpl ?? ownsBrokerProcess;
   const getProcessIdentityImpl = options.getProcessIdentityImpl ?? getProcessIdentity;
+  const platform = options.platform ?? process.platform;
+  const retryClaim = async (why) => {
+    if (attempt >= CLAIM_ATTEMPTS) {
+      process.stderr.write(`[codex] broker start gave up: ${why} (${attempt} attempts).\n`);
+      return null;
+    }
+    return await ensureBrokerSession(cwd, options, attempt + 1);
+  };
+
+  // A broker whose endpoint answers is used; a starting (or, past its grace, a
+  // replacing) one is first promoted to ready under the lock with its identity, so
+  // no live broker stays starting for life. win32 needs the identity to exclude
+  // the broker from worker kills: without one it is kept as is and this request
+  // takes the direct transport.
+  const adopt = (record) => {
+    if (record.state !== "starting" && record.state !== "replacing") {
+      return record;
+    }
+    if (record.state === "replacing" && withinGrace(record.replacingAt)) {
+      process.stderr.write(`[codex] broker ${record.endpoint} is being replaced; this request uses the direct transport.\n`);
+      return null;
+    }
+    const identity = record.pid == null ? null : (record.pidIdentity ?? getProcessIdentityImpl(record.pid));
+    if (!identity && platform === "win32") {
+      process.stderr.write(`[codex] broker pid ${record.pid ?? "none"} answers but has no identity; its record is kept and this request uses the direct transport.\n`);
+      return null;
+    }
+    if (record.pid == null) {
+      return record;
+    }
+    const { replacer, replacingAt, ...rest } = record;
+    const promoted = { ...rest, state: "ready", pidIdentity: identity };
+    return writeBrokerSessionIf(cwd, (current) => sameClaim(current, record), promoted) ? promoted : undefined;
+  };
+  const adoptOrRetry = async (record) => {
+    if (record.state !== "starting" && record.state !== "replacing") {
+      return record;
+    }
+    const adopted = withStateLock(cwd, () => {
+      const current = loadBrokerSession(cwd);
+      return current && current.endpoint === record.endpoint ? adopt(current) : undefined;
+    });
+    return adopted === undefined ? await retryClaim("the broker record kept changing") : adopted;
+  };
+
   const existing = loadBrokerSession(cwd);
   if (existing && (await isBrokerEndpointReady(existing.endpoint))) {
-    return existing;
+    return await adoptOrRetry(existing);
   }
 
   if (existing) {
     const pid = Number.isFinite(existing.pid) ? existing.pid : null;
+    const replacing = existing.state === "replacing";
     const liveOwned = pid !== null && isAliveImpl(pid) === true && ownsProcessImpl(pid, existing.endpoint ?? null, options.timeoutMs);
     // A live broker that missed the 150 ms probe is not a dead one (#768), and a
     // starting record belongs to a start in progress: give either the full window
-    // before deciding it is wedged. On exhaustion a starting record goes through
-    // the same settled/unverified teardown below as any other.
-    if (liveOwned || existing.state === "starting") {
+    // before deciding it is wedged. A replacing one is being torn down: no wait.
+    if (!replacing && (liveOwned || existing.state === "starting")) {
       const ready = await waitForBrokerEndpoint(existing.endpoint, options.retryTimeoutMs ?? STALE_BROKER_RETRY_MS).catch(() => false);
       if (ready) {
-        return loadBrokerSession(cwd) ?? existing;
+        return await adoptOrRetry(loadBrokerSession(cwd) ?? existing);
       }
     }
-    // Act on the current claim, not the snapshot: another start may have saved
-    // its pid/identity (or replaced the record) while this call waited.
-    const current = withStateLock(cwd, () => loadBrokerSession(cwd));
-    if (current && (current.endpoint !== existing.endpoint || current.pid !== existing.pid || current.pidIdentity !== existing.pidIdentity)) {
-      if (attempt >= CLAIM_ATTEMPTS) {
-        process.stderr.write(`[codex] broker start gave up: the broker record kept changing (${attempt} attempts).\n`);
-        return null;
-      }
-      return await ensureBrokerSession(cwd, options, attempt + 1);
+    // No pid to verify (a start still spawning, or one whose pid save failed) or
+    // a teardown in progress: kept until the grace period says it is abandoned.
+    const graceFrom = replacing ? existing.replacingAt : existing.state === "starting" && pid === null ? existing.startedAt : undefined;
+    if (withinGrace(graceFrom)) {
+      process.stderr.write(`[codex] broker record ${existing.endpoint} is ${existing.state} and within its grace period; it is kept and this request uses the direct transport.\n`);
+      return null;
     }
-    if (current) {
+    // Reserve the teardown under the lock, on the current claim — not the
+    // snapshot: another start may have saved its pid/identity, promoted it or
+    // replaced it while this call waited. A reserved record refuses the starter's
+    // later saves, so nothing can promote the broker this call is about to kill.
+    const nonce = randomUUID();
+    const reserved = writeBrokerSessionIf(cwd, (current) => sameClaim(current, existing), {
+      ...existing,
+      state: "replacing",
+      replacer: nonce,
+      replacingAt: Date.now()
+    });
+    if (!reserved && loadBrokerSession(cwd)) {
+      return await retryClaim("the broker record kept changing");
+    }
+    if (reserved) {
       const outcome = teardownBrokerSession({
         endpoint: existing.endpoint ?? null,
         pidFile: existing.pidFile ?? null,
@@ -321,10 +424,12 @@ async function ensureBrokerSessionLocked(cwd, options, attempt) {
         keepOnUnknownAnyPlatform: true
       });
       if (outcome.kept) {
+        // Back to the claim it was, so SessionEnd or the next start retries it.
+        writeBrokerSessionIf(cwd, (current) => current?.replacer === nonce, existing);
         process.stderr.write(`[codex] stale broker pid ${pid} could not be verified stopped (${outcome.reason}); its record is kept and this request uses the direct transport.\n`);
         return null;
       }
-      clearBrokerSessionIfEndpoint(cwd, existing.endpoint);
+      clearBrokerSessionIfNonce(cwd, nonce);
     }
   }
 
@@ -344,7 +449,7 @@ async function ensureBrokerSessionLocked(cwd, options, attempt) {
   // identity is saved below; `state: "starting"` marks it until the ready save. The claim is made inside the lock: a record found
   // there (another start's, starting or ready) means this call spawns nothing.
   const base = { endpoint, pidFile, logFile, sessionDir };
-  const starting = { ...base, state: "starting" };
+  const starting = { ...base, state: "starting", startedAt: Date.now() };
   let pidSaveFailed = false;
   const child = withStateLock(cwd, () => {
     if (loadBrokerSession(cwd)) {
@@ -375,27 +480,26 @@ async function ensureBrokerSessionLocked(cwd, options, attempt) {
     } catch {
       // Ignore: nothing was spawned into it.
     }
-    if (attempt >= CLAIM_ATTEMPTS) {
-      process.stderr.write(`[codex] broker start gave up: another start kept claiming the broker record (${attempt} attempts).\n`);
-      return null;
-    }
-    return await ensureBrokerSession(cwd, options, attempt + 1);
+    return await retryClaim("another start kept claiming the broker record");
   }
 
   // Every later save is guarded by the claim: the record on disk must still be
-  // this start's (its endpoint, unique to its session dir, and its pid). One that
-  // was replaced or cleared meanwhile is left alone.
+  // this start's (its endpoint, unique to its session dir, and its pid) and not
+  // reserved by a stale caller's teardown. One that was replaced, reserved or
+  // cleared meanwhile is left alone.
+  const saveImpl = options.saveBrokerSessionImpl ?? saveBrokerSession;
   const saveClaimed = (record, what) => {
     try {
-      return withStateLock(cwd, () => {
-        const current = loadBrokerSession(cwd);
-        if (current?.endpoint !== endpoint || current.pid !== (child.pid ?? null)) {
-          process.stderr.write(`[codex] broker ${what} not saved: the record no longer belongs to broker pid ${child.pid}.\n`);
-          return false;
-        }
-        (options.saveBrokerSessionImpl ?? saveBrokerSession)(cwd, record);
-        return true;
-      });
+      const saved = writeBrokerSessionIf(
+        cwd,
+        (current) => current?.endpoint === endpoint && current.pid === (child.pid ?? null) && current.state !== "replacing",
+        record,
+        { saveImpl }
+      );
+      if (!saved) {
+        process.stderr.write(`[codex] broker ${what} not saved: the record no longer belongs to broker pid ${child.pid} or is reserved for replacement.\n`);
+      }
+      return saved;
     } catch (error) {
       if (error?.code !== STATE_LOCK_TIMEOUT_CODE) {
         throw error;
@@ -441,13 +545,14 @@ async function ensureBrokerSessionLocked(cwd, options, attempt) {
       clearBrokerSessionIfEndpoint(cwd, endpoint);
       return null;
     }
-    // Kept, files and record, with an identity when one can still be read, so
-    // SessionEnd or the next start can kill it verifiably.
-    if (!pidIdentity) {
-      pidIdentity = getProcessIdentityImpl(child.pid);
-      if (pidIdentity && !pidSaveFailed) {
-        saveClaimed({ ...starting, pid: child.pid, pidIdentity }, "identity");
-      }
+    // Kept, files and record, and the record names the live child — its pid, and
+    // an identity when one can still be read — so SessionEnd or the next start can
+    // kill it verifiably; a pid-null record would read as a start still spawning.
+    pidIdentity ??= getProcessIdentityImpl(child.pid);
+    try {
+      writeBrokerSessionIf(cwd, (current) => current?.endpoint === endpoint, { ...starting, pid: child.pid, pidIdentity }, { saveImpl });
+    } catch (error) {
+      process.stderr.write(`[codex] broker pid ${child.pid} could not be recorded: ${error.message}\n`);
     }
     process.stderr.write(`[codex] broker pid ${child.pid} was not stopped after the failed start; its record and files are kept.\n`);
     return null;
@@ -506,7 +611,8 @@ export function ownsBrokerProcess(pid, endpoint, timeoutMs, commandLine = proces
 // `identity-unavailable` (refused), `process-missing` (Windows: provably gone
 // before anything was signalled), `kill-failed` (the probe or kill threw, or a
 // Windows kill left survivors), `starting` (`state: "starting"`, pid or not: its
-// broker is being started; kept with its files on every platform).
+// broker is being started) and `replacing` (a stale caller is tearing it down):
+// both kept with their files on every platform.
 export function teardownBrokerSession({
   endpoint = null,
   pidFile,
@@ -523,8 +629,8 @@ export function teardownBrokerSession({
   state = undefined,
   terminateRecordedProcessImpl = terminateRecordedProcess
 }) {
-  if (state === "starting") {
-    return { signalled: false, reason: "starting", kept: true };
+  if (state === "starting" || state === "replacing") {
+    return { signalled: false, reason: state, kept: true };
   }
   let signalled = false;
   let reason = "no-pid";

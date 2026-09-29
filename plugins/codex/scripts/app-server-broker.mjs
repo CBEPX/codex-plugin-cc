@@ -27,6 +27,8 @@ const STREAMING_METHODS = new Set(["turn/start", "review/start", "thread/compact
 // been processed yet — leaves the connection open. Anything still open after this
 // is closed outright.
 const SHUTDOWN_SOCKET_GRACE_MS = 1000;
+// The broker's own record clear at shutdown waits at most this long for the state lock.
+const OWN_RECORD_CLEAR_WAIT_MS = 1500;
 
 const IDLE_TIMEOUT_ENV = "CODEX_COMPANION_BROKER_IDLE_TIMEOUT_MS";
 const DEFAULT_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
@@ -172,11 +174,12 @@ async function main() {
   // record that still points at this broker — a newer broker may have replaced
   // us in it. The state dir derives from --cwd plus the inherited environment,
   // exactly as it did in the process that spawned us.
+  // Best-effort and bounded: never block shutdown for long on state-file cleanup.
   function clearOwnSessionRecord() {
     try {
-      clearBrokerSessionIfEndpoint(cwd, endpoint);
-    } catch {
-      // Best-effort: never block shutdown on state-file cleanup.
+      clearBrokerSessionIfEndpoint(cwd, endpoint, { waitMs: OWN_RECORD_CLEAR_WAIT_MS });
+    } catch (error) {
+      process.stderr.write(`[codex] broker record not cleared: ${error instanceof Error ? error.message : String(error)}\n`);
     }
   }
 

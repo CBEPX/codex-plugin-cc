@@ -383,8 +383,11 @@ async function handleSessionEnd(input) {
   // An unreadable record (recordedBroker null) is left for whoever can read it.
   if (recordedBroker && !teardown.kept) {
     try {
-      clearBrokerSessionIfEndpoint(cwd, brokerEndpoint);
+      clearBrokerSessionIfEndpoint(cwd, brokerEndpoint, { waitMs: stepBudget(STATE_LOCK_STEP_MS) });
     } catch (error) {
+      if (error?.code !== STATE_LOCK_TIMEOUT_CODE) {
+        throw error;
+      }
       process.stderr.write(`[codex] Broker record not cleared: ${error.message}\n`);
     }
   }
