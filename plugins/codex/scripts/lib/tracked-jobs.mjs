@@ -28,6 +28,7 @@ function normalizeProgressEvent(value) {
       phase: typeof value.phase === "string" && value.phase.trim() ? value.phase.trim() : null,
       threadId: typeof value.threadId === "string" && value.threadId.trim() ? value.threadId.trim() : null,
       turnId: typeof value.turnId === "string" && value.turnId.trim() ? value.turnId.trim() : null,
+      transport: value.transport === "broker" || value.transport === "direct" ? value.transport : null,
       resolved: value.resolved && typeof value.resolved === "object" && !Array.isArray(value.resolved) ? value.resolved : null,
       stderrMessage: value.stderrMessage == null ? null : String(value.stderrMessage).trim(),
       logTitle: typeof value.logTitle === "string" && value.logTitle.trim() ? value.logTitle.trim() : null,
@@ -40,6 +41,7 @@ function normalizeProgressEvent(value) {
     phase: null,
     threadId: null,
     turnId: null,
+    transport: null,
     resolved: null,
     stderrMessage: String(value ?? "").trim(),
     logTitle: null,
@@ -85,6 +87,7 @@ export function createJobProgressUpdater(workspaceRoot, jobId) {
   let lastPhase = null;
   let lastThreadId = null;
   let lastTurnId = null;
+  let lastTransport = null;
   let lastResolved = null;
 
   return (event) => {
@@ -107,6 +110,13 @@ export function createJobProgressUpdater(workspaceRoot, jobId) {
     if (normalized.turnId && normalized.turnId !== lastTurnId) {
       lastTurnId = normalized.turnId;
       patch.turnId = normalized.turnId;
+      changed = true;
+    }
+
+    // Arrives with `turnId` in the same event, so both land in one patch.
+    if (normalized.transport && normalized.transport !== lastTransport) {
+      lastTransport = normalized.transport;
+      patch.transport = normalized.transport;
       changed = true;
     }
 

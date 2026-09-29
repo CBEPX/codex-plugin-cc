@@ -7,7 +7,7 @@
  * @typedef {NonNullable<ThreadStartParams["config"]>} ThreadConfig
  * @typedef {import("./app-server-protocol").Turn} Turn
  * @typedef {import("./app-server-protocol").UserInput} UserInput
- * @typedef {((update: string | { message: string, phase: string | null, threadId?: string | null, turnId?: string | null, stderrMessage?: string | null, logTitle?: string | null, logBody?: string | null }) => void)} ProgressReporter
+ * @typedef {((update: string | { message: string, phase: string | null, threadId?: string | null, turnId?: string | null, transport?: string | null, stderrMessage?: string | null, logTitle?: string | null, logBody?: string | null }) => void)} ProgressReporter
  * @typedef {{
  *   threadId: string,
  *   rootThreadId: string,
@@ -35,7 +35,8 @@
  *   messages: Array<{ lifecycle: string, phase: string | null, text: string }>,
  *   fileChanges: ThreadItem[],
  *   commandExecutions: ThreadItem[],
- *   onProgress: ProgressReporter | null
+ *   onProgress: ProgressReporter | null,
+ *   transport: string | null
  * }} TurnCaptureState
  */
 import crypto from "node:crypto";
@@ -404,7 +405,9 @@ function createTurnCaptureState(threadId, options = {}) {
     messages: [],
     fileChanges: [],
     commandExecutions: [],
-    onProgress: options.onProgress ?? null
+    onProgress: options.onProgress ?? null,
+    // "broker" | "direct": recorded with the turn so cancel knows who owns the runtime.
+    transport: options.transport ?? null
   };
 }
 
@@ -598,7 +601,8 @@ function applyTurnNotification(state, message) {
         (message.params.threadId ?? null) === state.threadId
           ? {
               threadId: message.params.threadId ?? null,
-              turnId: message.params.turn.id ?? null
+              turnId: message.params.turn.id ?? null,
+              transport: state.transport
             }
           : {}
       );
@@ -681,7 +685,7 @@ const TURN_INTERRUPT_GRACE_MS = 2000;
 // How long the turn's own terminal notification (`turn/completed`, whatever
 // status it carries) may take after the interrupt. Answering `turn/interrupt`
 // proves nothing: only that notification proves the runtime stopped the turn.
-const TURN_INTERRUPT_ACK_MS = 10000;
+export const TURN_INTERRUPT_ACK_MS = 10000;
 
 // Resolves true once the turn reached a terminal notification (which is what
 // runs `completeTurn`), false if the runtime stayed silent for the whole window
@@ -762,7 +766,7 @@ async function failTurnOnTimeout(client, state, timeoutMs) {
 }
 
 async function captureTurn(client, threadId, startRequest, options = {}) {
-  const state = createTurnCaptureState(threadId, options);
+  const state = createTurnCaptureState(threadId, { ...options, transport: client.transport });
   const previousHandler = client.notificationHandler;
   const timeoutMs = resolveTurnTimeoutMs(options.turnTimeoutMs);
   let timeoutTimer = null;

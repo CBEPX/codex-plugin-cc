@@ -19,7 +19,8 @@ import {
     parseStructuredOutput,
     readOutputSchema,
     runAppServerReview,
-    runAppServerTurn
+    runAppServerTurn,
+    TURN_INTERRUPT_ACK_MS
   } from "./lib/codex.mjs";
 import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
@@ -52,6 +53,7 @@ import {
   commitCancel,
   emitCancelPending,
   isWorkerProvedRecord,
+  isWorkerTerminalRecord,
   readStoredJob,
   resolveCancelableJob,
   resolveResultJob,
@@ -1336,8 +1338,13 @@ async function handleCancel(argv) {
   const existing = readStoredJob(workspaceRoot, job.id) ?? {};
   const threadId = existing.threadId ?? job.threadId ?? null;
   const turnId = existing.turnId ?? job.turnId ?? null;
+  // A direct worker owns its app-server: a second client cannot reach it (it
+  // would start a codex of its own), and the kill below takes it down.
+  const direct = (existing.transport ?? job.transport ?? null) === "direct";
 
-  const interrupt = await interruptAppServerTurn(cwd, { threadId, turnId });
+  const interrupt = direct
+    ? { attempted: false, interrupted: false, transport: "direct", detail: "direct transport: the kill stops the worker's own app-server" }
+    : await interruptAppServerTurn(cwd, { threadId, turnId });
   if (interrupt.attempted) {
     appendLogLine(
       job.logFile,
@@ -1348,21 +1355,55 @@ async function handleCancel(argv) {
   }
 
   // Only a pid that is provably still this job's worker is signalled (#743).
-  const { pid, identity } = resolveJobPid(workspaceRoot, job);
+  let { pid, identity } = resolveJobPid(workspaceRoot, job);
+  // Brokered, or recorded before v1.4.2 (no `transport`): the turn runs in the
+  // shared runtime, so a dead worker would not stop it. Only a terminal record
+  // ends the wait; polled outside the state lock, which the worker's own
+  // terminal write takes. No turn recorded → nothing to wait for (v1.4.1 path).
+  let turnEnded = false;
+  if (!direct && turnId) {
+    const stored = interrupt.interrupted ? await waitForTerminalRecord(workspaceRoot, job.id, TURN_INTERRUPT_ACK_MS) : null;
+    if (!stored) {
+      emitCancelPending({ pending: true, reason: "turn-not-interrupted", survivors: [] }, pid, job.id, { json: options.json, appendLog: (line) => appendLogLine(job.logFile, line) });
+      process.exitCode = 1;
+      return;
+    }
+    // Caused by this cancel only when the worker itself wrote it; a crash-guard
+    // or reaper record is kept by commitCancel. Either way the worker is done
+    // with the job: nothing is killed.
+    turnEnded = isWorkerTerminalRecord(stored);
+    pid = null;
+    identity = null;
+  }
   // win32: the broker read, the kill and the record write share one state lock.
   // A broker saves its starting record under the same lock before it spawns, so
   // none can start between this read and the kill script's snapshot. The kill
   // is bounded like SessionEnd's win32 step, under the other takers' lock wait.
   if (process.platform === "win32") {
-    withStateLock(workspaceRoot, () => finishCancel({ workspaceRoot, job, existing, interrupt, pid, identity, options }));
+    withStateLock(workspaceRoot, () => finishCancel({ workspaceRoot, job, existing, interrupt, pid, identity, turnEnded, options }));
   } else {
-    finishCancel({ workspaceRoot, job, existing, interrupt, pid, identity, options });
+    finishCancel({ workspaceRoot, job, existing, interrupt, pid, identity, turnEnded, options });
+  }
+}
+
+// Polls the job file until a terminal record appears, or `null` once the window closes.
+async function waitForTerminalRecord(workspaceRoot, jobId, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const stored = readStoredJob(workspaceRoot, jobId);
+    if (stored && stored.status !== "queued" && stored.status !== "running") {
+      return stored;
+    }
+    if (Date.now() >= deadline) {
+      return null;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
   }
 }
 
 const WIN32_CANCEL_KILL_MS = 4000;
 
-function finishCancel({ workspaceRoot, job, existing, interrupt, pid, identity, options }) {
+function finishCancel({ workspaceRoot, job, existing, interrupt, pid, identity, turnEnded = false, options }) {
   const win32 = process.platform === "win32";
   const broker = win32 ? brokerPresence(workspaceRoot) : null;
   const exclude = brokerExclusion(broker);
@@ -1398,7 +1439,9 @@ function finishCancel({ workspaceRoot, job, existing, interrupt, pid, identity, 
     completedAt,
     errorMessage: "Cancelled by user."
   };
-  const kept = commitCancel(workspaceRoot, job, nextJob, existing, { leftRunning, causedByCancel: interrupt.interrupted === true || (kill.attempted === true && kill.delivered === true), log: (line) => appendLogLine(job.logFile, line) });
+  // A brokered cancel caused the finish only when the worker's own record ended
+  // the wait; an acknowledged interrupt alone proves nothing.
+  const kept = commitCancel(workspaceRoot, job, nextJob, existing, { leftRunning, causedByCancel: turnEnded || (kill.attempted === true && kill.delivered === true), log: (line) => appendLogLine(job.logFile, line) });
   const common = {
     jobId: job.id,
     title: job.title,

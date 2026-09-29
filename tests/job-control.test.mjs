@@ -88,6 +88,14 @@ test("renderCancelPending says an unverifiable dead worker waits for the reaper"
   }
 });
 
+test("renderCancelPending says a brokered turn that did not end leaves the job running", () => {
+  const rendered = renderCancelPending({ pending: true, reason: "turn-not-interrupted", survivors: [] }, 4300, "job-1");
+  assert.deepEqual(rendered.json, { jobId: "job-1", status: "running", cancellationPending: true, reason: "turn-not-interrupted" });
+  assert.equal(rendered.logLine, "cancellation not confirmed: worker pid 4300 left running (turn-not-interrupted)");
+  assert.match(rendered.text, /the shared runtime has not ended the turn, so the worker was not stopped; the job stays running\. Re-run cancel or wait for result\./);
+  assert.equal(rendered.diagnostic, null);
+});
+
 test("renderCancelPending reports survivors on win32", () => {
   const rendered = renderCancelPending({ pending: true, reason: "kill-failed", survivors: SURVIVORS }, 4300, "job-1");
   assert.deepEqual(rendered.json.survivors, SURVIVORS);

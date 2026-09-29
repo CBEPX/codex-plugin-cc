@@ -454,6 +454,8 @@ export function renderCancelPending(decision, pid, jobId) {
   const rootGone = survivors.length > 0 && decision.rootAlive === false;
   const tail = rootGone
     ? `worker pid ${pid} exited but part of its tree is still running (survivors: ${survivorText}); the job stays running until the reaper judges it.`
+    : decision.reason === "turn-not-interrupted"
+    ? "the shared runtime has not ended the turn, so the worker was not stopped; the job stays running."
     : (decision.reason === "identity-unavailable" || decision.reason === "identity-mismatch" || decision.reason === "process-missing") && decision.rootAlive === false
     ? `worker pid ${pid} exited before it could be verified; the job stays running until the reaper judges it.`
     : "the job stays running until the worker exits.";
