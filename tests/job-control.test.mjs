@@ -5,6 +5,7 @@ import { makeTempDir } from "./helpers.mjs";
 import { readJobFile, resolveJobFile, resolveStateDir, writeJobFile } from "../plugins/codex/scripts/lib/state.mjs";
 import { BROKER_ENDPOINT_ENV } from "../plugins/codex/scripts/lib/app-server.mjs";
 import { saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
+import { DEAD_WORKER_MESSAGE } from "../plugins/codex/scripts/lib/tracked-jobs.mjs";
 import assert from "node:assert/strict";
 
 import { brokerExclusion, brokerPresence, cancelDecision, commitCancel, emitCancelPending, renderCancelPending } from "../plugins/codex/scripts/lib/job-control.mjs";
@@ -162,4 +163,26 @@ test("commitCancel writes cancelled over an active record and keeps a terminal o
   assert.equal(commitCancel(workspace, job, next, {}, { leftRunning: null, causedByCancel: true, log: (line) => log.push(line) }), null);
   assert.equal(readJobFile(resolveJobFile(workspace, "task-1")).status, "cancelled");
   assert.deepEqual(log, ["Cancelled by user."]);
+});
+
+test("commitCancel keeps a reaper-written failure even when this cancel's interrupt was acknowledged", () => {
+  const job = { id: "task-1", status: "running", title: "T" };
+  const next = { ...job, status: "cancelled", phase: "cancelled", pid: null, pidIdentity: null, requestFile: null, completedAt: "2026-09-29T00:00:00.000Z", errorMessage: "Cancelled by user." };
+  // [stored errorMessage, causedByCancel, kept]
+  const cases = [
+    [DEAD_WORKER_MESSAGE, true, true],
+    [DEAD_WORKER_MESSAGE, false, true],
+    [`${DEAD_WORKER_MESSAGE} (pid reused: 5 now belongs to another process)`, true, true],
+    ["Turn interrupted.", true, false],
+    ["Turn interrupted.", false, true]
+  ];
+  for (const [errorMessage, causedByCancel, kept] of cases) {
+    const workspace = makeTempDir();
+    const stored = { ...job, status: "failed", phase: "failed", errorMessage };
+    writeJobFile(workspace, "task-1", stored);
+    const result = commitCancel(workspace, job, next, {}, { leftRunning: null, causedByCancel, log: () => {} });
+    const label = `${errorMessage} causedByCancel=${causedByCancel}`;
+    assert.deepEqual(result, kept ? stored : null, label);
+    assert.equal(readJobFile(resolveJobFile(workspace, "task-1")).status, kept ? "failed" : "cancelled", label);
+  }
 });

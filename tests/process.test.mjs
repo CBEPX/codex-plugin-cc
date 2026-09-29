@@ -670,17 +670,23 @@ test("terminateRecordedProcess on win32 runs the pinned verify-and-kill script a
     assert.equal(script.match(/exit 244/g).length, 1, "244 is only the CLM guard");
     assert.match(script, new RegExp(`FromFileTimeUtc\\(${expectedDeadline}\\)`), "absolute deadline counts the PowerShell start-up");
     assert.match(script, /\$null = \$h\.Handle/, "the handle is pinned before StartTime is read");
-    // 241: the root is gone; orphans it left (same parent pid, created no earlier than the recorded start) are reported, never killed.
+    // 241: the root is gone; its orphans (the same walk as the kill tree: transitive, time-ordered, the
+    // verified exclusion skipped) are reported, never killed.
     const missingAt = script.indexOf("try { $root = Pin $target } catch [System.ArgumentException] {");
     const missingEnd = script.indexOf("$code = 241; throw 'missing'");
     assert.ok(missingAt > 0 && missingEnd > missingAt, "241 is decided after the orphan report");
     const missing = script.slice(missingAt, missingEnd);
     assert.match(missing, /\$floor = Micro \(\[DateTime\]::FromFileTimeUtc\(\[long\]\$expected\)\)/, "the recorded start in the microsecond domain");
-    assert.match(missing, /Get-CimInstance -ClassName Win32_Process -Filter "ParentProcessId = \$target" -Property ProcessId,CreationDate/);
-    assert.match(missing, /if \(\(Micro \$r\.CreationDate\) -lt \$floor\) \{ continue \}/, "older than the root: not its child");
-    assert.match(missing, /if \(\(Micro \$h\.StartTime\) -ne \(Micro \$r\.CreationDate\)\) \{ continue \}/, "a reused pid is not an orphan");
-    assert.doesNotMatch(missing, /Kill\(\)/, "orphans are reported, never killed");
+    assert.match(missing, /foreach \(\$h in @\(Walk \$target \$floor\)\)/, "the orphans come from the kill tree's own walk, rooted at the recorded start");
+    assert.match(script, /\$tree = @\(\$root\) \+ @\(Walk \$target \(Micro \$root\.StartTime\)\)/, "the kill tree uses the same walk");
+    assert.doesNotMatch(missing, /Kill\(\)|-Filter/, "orphans are reported, never killed; no direct-children-only query");
     assert.ok(missing.indexOf("Write-Output") > missing.indexOf("$orphans +="), "rows are printed only after a complete pass (245 until then)");
+    const walk = script.slice(script.indexOf("function Walk("), script.indexOf("$tree = @()"));
+    assert.ok(walk.length > 0, "one walk function");
+    assert.match(walk, /if \(\$exclude\.ContainsKey\(\$cid\) -and \$exclude\[\$cid\] -eq \$h\.StartTime\.ToFileTimeUtc\(\)\.ToString\(\)\) \{ continue \}/, "an excluded broker is never in the tree nor an orphan");
+    assert.match(walk, /if \(\$live -ne \(Micro \$r\.CreationDate\)\) \{ continue \}/, "a reused pid is not ours");
+    assert.match(walk, /if \(\$live -lt \$starts\[\$pp\]\) \{ continue \}/, "time-ordered: never older than its parent (or the recorded root)");
+    assert.match(walk, /\$queue \+= \$cid/, "transitive: children of found processes are walked too");
     assert.match(script, /catch \[System\.ArgumentException\] \{ continue \}/, "a child that is already gone is skipped, any other pin error aborts with 245");
     assert.match(script, /\$t - \(\$t % 10\)/, "exact Int64 microsecond truncation");
     assert.match(script, /\.Kill\(\)/);
@@ -756,7 +762,9 @@ test("terminateRecordedProcess on live win32 reports process-missing for a pid t
 
 test("terminateRecordedProcess on live win32 reports, and never kills, an orphan the gone root left", { skip: !IS_WIN, timeout: 30_000 }, async (t) => {
   resetWindowsIdentityCircuit();
-  const parent = spawn(process.execPath, ["-e", "const c=require('child_process').spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});console.log(c.pid);setInterval(()=>{},1000)"], { stdio: ["ignore", "pipe", "ignore"] });
+  // detached: libuv puts a non-detached child in its parent's kill-on-close job object, so killing the
+  // parent would take the grandchild with it (the CI failure of 7f765b4: process-missing, no survivors).
+  const parent = spawn(process.execPath, ["-e", "const c=require('child_process').spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore',detached:true});c.unref();console.log(c.pid);setInterval(()=>{},1000)"], { stdio: ["ignore", "pipe", "ignore"] });
   let orphan = null;
   t.after(() => {
     try { parent.kill(); } catch { /* already gone */ }
@@ -773,9 +781,13 @@ test("terminateRecordedProcess on live win32 reports, and never kills, an orphan
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
   assert.equal(isPidAlive(parent.pid), false);
-  assert.deepEqual(terminateRecordedProcess(parent.pid, { identity, timeoutMs: 10_000 }), {
+  assert.equal(isPidAlive(orphan), true, "the orphan outlived its parent");
+  // The raw script answer goes into the failure message, so a red CI run diagnoses itself.
+  let raw = null;
+  const outcome = terminateRecordedProcess(parent.pid, { identity, timeoutMs: 10_000, runCommandImpl: (...args) => (raw = runCommand(...args)) });
+  assert.deepEqual(outcome, {
     attempted: false, delivered: false, method: "handle", reason: "process-missing", survivors: [{ pid: orphan, identity: orphanIdentity }]
-  });
+  }, `parent ${parent.pid} ${identity}, orphan ${orphan} ${orphanIdentity}; script exit ${raw?.status} stdout ${JSON.stringify(raw?.stdout)} stderr ${JSON.stringify(raw?.stderr)}`);
   assert.equal(isPidAlive(orphan), true, "an orphan is reported, never killed");
 });
 

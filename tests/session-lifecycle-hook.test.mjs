@@ -1,9 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
 
 import { makeTempDir } from "./helpers.mjs";
-import { loadState, upsertJob } from "../plugins/codex/scripts/lib/state.mjs";
+import { loadState, resolveStateDir, upsertJob } from "../plugins/codex/scripts/lib/state.mjs";
 import { cleanupSessionJobs, killStepMs } from "../plugins/codex/scripts/session-lifecycle-hook.mjs";
 
 test("killStepMs gives a Windows kill one PowerShell run's worth of budget", () => {
@@ -108,4 +110,22 @@ test("SessionEnd drops a pid-less job even when the broker presence is unknown",
   }
   assert.deepEqual(loadState(repo).jobs, []);
   assert.doesNotMatch(written.join(""), /refused/);
+});
+
+test("SessionEnd reads the broker presence for worker kills under the cleanup lock", () => {
+  const repo = makeTempDir();
+  const deadPid = spawnSync(process.execPath, ["-e", "0"]).pid;
+  upsertJob(repo, { id: "job-1", status: "running", sessionId: "s", background: false, pid: deadPid, pidIdentity: "win32:1" });
+  let tickets = null;
+  let seen = null;
+  cleanupSessionJobs(repo, "s", 1000, () => 8000, {
+    platform: "win32",
+    loadBroker: () => {
+      tickets = fs.readdirSync(path.join(resolveStateDir(repo), "state.lock.d")).filter((name) => name.endsWith(".ticket"));
+      return { pid: 555, pidIdentity: "win32:1" };
+    },
+    terminateRecordedProcessImpl: (pid, options) => { seen = options; return { attempted: true, delivered: true, method: "handle", reason: "identity-match" }; }
+  });
+  assert.equal(tickets?.length, 1, "the broker record is read while the state lock is held");
+  assert.deepEqual(seen.exclude, [{ pid: 555, identity: "win32:1" }]);
 });

@@ -4,7 +4,7 @@ import { BROKER_ENDPOINT_ENV } from "./app-server.mjs";
 import { loadBrokerSession, resolveBrokerStateFile } from "./broker-lifecycle.mjs";
 import { getSessionRuntimeStatus } from "./codex.mjs";
 import { getConfig, listJobs, readJobFile, removeJobPidFile, removeJobRequestFile, resolveJobFile, upsertJob, withStateLock, writeJobFile } from "./state.mjs";
-import { reapDeadJobs, SESSION_ID_ENV } from "./tracked-jobs.mjs";
+import { DEAD_WORKER_MESSAGE, reapDeadJobs, SESSION_ID_ENV } from "./tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
 export const DEFAULT_MAX_STATUS_JOBS = 8;
@@ -326,16 +326,19 @@ export function resolveCancelableJob(cwd, reference, options = {}) {
 // The cancel's terminal write, one locked step: another process's `saveState`
 // prune works off a diff of the index, so a cancel split across the write can
 // have its record pruned away, or the payload it deleted counted as still owned.
-// A record already terminal (the worker's own, or the reaper's) is kept and
-// returned for the caller to report — unless this cancel caused it (its
-// interrupt was acknowledged, or its kill was delivered): the worker's record is
-// then a consequence of this cancel and is overwritten with `cancelled`
-// (v1.4.0). Otherwise `null` once written.
+// A record already terminal is kept and returned for the caller to report when
+// the reaper wrote it (its dead-worker failure, whatever this cancel did), or
+// when this cancel did not cause it. The worker's own record after this cancel's
+// acknowledged interrupt or delivered kill is a consequence of the cancel and is
+// overwritten with `cancelled` (v1.4.0). Otherwise `null` once written.
 export function commitCancel(workspaceRoot, job, nextJob, existing, { leftRunning, log, causedByCancel = false }) {
   return withStateLock(workspaceRoot, () => {
     const stored = readStoredJob(workspaceRoot, job.id);
-    if (causedByCancel !== true && stored && stored.status !== "queued" && stored.status !== "running") {
-      log(`cancel: record already ${stored.status}, kept (interrupt not acknowledged)`);
+    const terminal = stored && stored.status !== "queued" && stored.status !== "running";
+    // The reaper's variants all start with its message ("… (pid reused: …)").
+    const reaped = terminal && typeof stored.errorMessage === "string" && stored.errorMessage.startsWith(DEAD_WORKER_MESSAGE);
+    if (terminal && (reaped || causedByCancel !== true)) {
+      log(`cancel: record already ${stored.status}, kept (${reaped ? "written by the reaper" : "interrupt not acknowledged"})`);
       return stored;
     }
     if (leftRunning) {

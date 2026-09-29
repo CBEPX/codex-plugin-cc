@@ -335,7 +335,7 @@ function markJobDeadLocked(workspaceRoot, jobSummary, errorMessage) {
   return record;
 }
 
-const DEAD_WORKER_MESSAGE = "worker exited before completing";
+export const DEAD_WORKER_MESSAGE = "worker exited before completing";
 
 // How long a queued job may sit without a recorded pid before it counts as dead.
 // `enqueueBackgroundTask` patches the pid in immediately after the spawn, so the

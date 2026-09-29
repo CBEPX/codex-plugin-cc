@@ -104,8 +104,9 @@ function appendEnvVar(name, value) {
 }
 
 export function cleanupSessionJobs(cwd, sessionId, lockWaitMs, remainingMs, deps = {}) {
-  const { platform = process.platform, terminateRecordedProcessImpl = terminateRecordedProcess, broker = null } = deps;
-  const exclude = brokerExclusion(broker);
+  const { platform = process.platform, terminateRecordedProcessImpl = terminateRecordedProcess } = deps;
+  // Read under the lock below: a broker cannot start between this read and the kills.
+  const loadBroker = deps.loadBroker ?? (() => deps.broker ?? null);
   if (!cwd || !sessionId) {
     return;
   }
@@ -126,6 +127,8 @@ export function cleanupSessionJobs(cwd, sessionId, lockWaitMs, remainingMs, deps
     if (sessionJobs.length === 0) {
       return;
     }
+    const broker = loadBroker();
+    const exclude = brokerExclusion(broker);
 
     // A record is only dropped once its worker is stopped or provably gone; one
     // this hook refused to signal, failed to signal or never reached stays, so
@@ -258,13 +261,11 @@ async function handleSessionEnd(input) {
   const pidFile = brokerSession?.pidFile ?? null;
   const logFile = brokerSession?.logFile ?? null;
   const sessionDir = brokerSession?.sessionDir ?? null;
-  const pid = brokerSession?.pid ?? null;
-  const pidIdentity = brokerSession?.pidIdentity ?? null;
 
   let activeJobs;
   try {
     cleanupSessionJobs(cwd, input.session_id || process.env[SESSION_ID_ENV], stepBudget(STATE_LOCK_STEP_MS), remainingMs, {
-      broker: process.platform === "win32" ? brokerPresence(cwd, process.env, { record: recordedBroker }) : null
+      loadBroker: () => (process.platform === "win32" ? brokerPresence(cwd, process.env) : null)
     });
     activeJobs = activeWorkspaceJobs(cwd, stepBudget(STATE_LOCK_STEP_MS), remainingMs);
   } catch (error) {
@@ -345,6 +346,15 @@ async function handleSessionEnd(input) {
     return;
   }
 
+  // Re-read now, not the snapshot from the top: a starting record may have gained
+  // its pid and identity meanwhile. Only a record for the endpoint that answered
+  // the handshake counts (another endpoint is a replacement broker); a record the
+  // broker already cleared falls back to the snapshot (the kill is verified). A
+  // record without a pid is a start in progress and is kept.
+  const current = recordedBroker ? loadBrokerSession(cwd) : null;
+  const record = current?.endpoint === brokerEndpoint ? current : recordedBroker;
+  const pid = record?.pid ?? null;
+  const pidIdentity = record?.pidIdentity ?? null;
   const teardown = teardownBrokerSession({
     endpoint: brokerEndpoint,
     pidFile,
@@ -352,6 +362,7 @@ async function handleSessionEnd(input) {
     sessionDir,
     pid,
     pidIdentity,
+    starting: Boolean(record) && pid === null,
     killProcess: terminateProcessTree,
     // posix halved: a broker gone from its group is re-proved with a second
     // probe. win32: one PowerShell run does verify and kill, hence the kill step.
