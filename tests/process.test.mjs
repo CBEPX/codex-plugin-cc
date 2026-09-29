@@ -623,7 +623,7 @@ test("getProcessIdentity and getProcessIdentities agree on a live win32 process 
 test("terminateRecordedProcess on win32 runs the pinned verify-and-kill script and maps its protocol", () => {
   const clock = () => 1_700_000_000_000; // ms; deadline = clock + 3000 - 500
   const expectedDeadline = (BigInt(1_700_000_000_000 + 2500) * 10000n + 116444736000000000n).toString();
-  const base = { identity: "win32:133700000000000000", platform: "win32", ...psBase, timeoutMs: 3000, excludePids: [555], clock };
+  const base = { identity: "win32:133700000000000000", platform: "win32", ...psBase, timeoutMs: 3000, exclude: [{ pid: 555, identity: "win32:133700000000000000" }, { pid: 556, identity: "linux:5" }, { pid: 0, identity: "win32:1" }], clock };
   const cases = [
     [0, "KILL\r\nOK\r\n", { attempted: true, delivered: true, method: "handle", reason: "identity-match" }],
     [0, "failure 5\r\n", { attempted: false, delivered: false, reason: "identity-unavailable" }],
@@ -631,6 +631,12 @@ test("terminateRecordedProcess on win32 runs the pinned verify-and-kill script a
     [241, "", { attempted: false, delivered: false, method: "handle", reason: "process-missing" }],
     [241, "KILL\r\n", { attempted: true, delivered: false, method: "handle", reason: "kill-failed", survivors: [], unverified: true }],
     [242, "", { attempted: false, delivered: false, method: "handle", reason: "identity-mismatch" }],
+    [241, "junk\r\n", { attempted: false, delivered: false, reason: "identity-unavailable" }],
+    [242, "OK\r\n", { attempted: false, delivered: false, reason: "identity-unavailable" }],
+    [245, "", { attempted: false, delivered: false, reason: "identity-unavailable" }],
+    [245, "KILL\r\n", { attempted: true, delivered: false, method: "handle", reason: "kill-failed", survivors: [], unverified: true }],
+    [243, "KILL\r\nSURVIVOR 0 0\r\n", { attempted: true, delivered: false, method: "handle", reason: "kill-failed", survivors: [], unverified: true }],
+    [243, "KILL\r\nSURVIVOR 4300 1\r\nSURVIVOR 4300 2\r\n", { attempted: true, delivered: false, method: "handle", reason: "kill-failed", survivors: [], unverified: true }],
     [242, "KILL\r\n", { attempted: true, delivered: false, method: "handle", reason: "kill-failed", survivors: [], unverified: true }],
     [243, "KILL\r\nSURVIVOR 4300 1337\r\nSURVIVOR 4301 0\r\n", { attempted: true, delivered: false, method: "handle", reason: "kill-failed", survivors: [{ pid: 4300, identity: "win32:1337" }, { pid: 4301, identity: null }] }],
     [243, "KILL\r\nfailure 5\r\n", { attempted: true, delivered: false, method: "handle", reason: "kill-failed", survivors: [], unverified: true }],
@@ -650,13 +656,17 @@ test("terminateRecordedProcess on win32 runs the pinned verify-and-kill script a
     assert.match(script, /LanguageMode -ne 'FullLanguage'\) \{ exit 244 \}/);
     assert.match(script, /\$target = 4242\n/);
     assert.match(script, /\$expected = '133700000000000000'/);
-    assert.match(script, /\$exclude = @\(555\)/);
+    assert.match(script, /\$exclude = @\{ 555 = '133700000000000000' \}\n/, "only the verified win32 exclusion survives");
+    assert.doesNotMatch(script, /app-server-broker/, "no command-line marker exclusion");
+    assert.ok(script.indexOf("$exclude.ContainsKey($cid)") > script.indexOf("$live = Micro $h.StartTime"), "exclusion is decided after the pin and start-time read");
+    assert.match(script, /\$code = 245\n/);
+    assert.match(script, /\$code = 245; throw 'budget'/);
+    assert.equal(script.match(/exit 244/g).length, 1, "244 is only the CLM guard");
     assert.match(script, new RegExp(`FromFileTimeUtc\\(${expectedDeadline}\\)`), "absolute deadline counts the PowerShell start-up");
     assert.match(script, /\$null = \$h\.Handle/, "the handle is pinned before StartTime is read");
     assert.match(script, /catch \[System\.ArgumentException\] \{ \$code = 241; throw \}/);
     assert.match(script, /catch \[System\.ArgumentException\] \{ continue \}/, "a child that is already gone is skipped, any other pin error aborts with 244");
     assert.match(script, /\$t - \(\$t % 10\)/, "exact Int64 microsecond truncation");
-    assert.match(script, /app-server-broker\.mjs/);
     assert.match(script, /\.Kill\(\)/);
     assert.doesNotMatch(script, /taskkill|& "|Start-Process/, "no external program is ever started");
     assert.match(script, /finally \{\n {2}foreach \(\$h in \$pinned\)/);
@@ -678,4 +688,29 @@ test("terminateRecordedProcess on win32 runs the pinned verify-and-kill script a
     const { pid = 4242, ...rest } = override;
     assert.equal(terminateRecordedProcess(pid, { ...base, ...rest, runCommandImpl: () => assert.fail("must not run") }).reason, "identity-unavailable");
   }
+});
+
+test("terminateRecordedProcess win32: empty exclusion is an empty hashtable and a kill timeout leaves the breaker closed", () => {
+  const base = { identity: "win32:1337", platform: "win32", ...psBase, timeoutMs: 3000 };
+  resetWindowsIdentityCircuit();
+  let script = "";
+  terminateRecordedProcess(4242, { ...base, exclude: [], runCommandImpl: (f, a) => { script = Buffer.from(a[6], "base64").toString("utf16le"); return { status: 0, stdout: "KILL\r\nOK\r\n", stderr: "", error: null }; } });
+  assert.match(script, /\$exclude = @\{\}\n/);
+  const timedOut = { status: null, stdout: "", stderr: "", error: Object.assign(new Error("t"), { code: "ETIMEDOUT" }) };
+  const working = { status: 0, stdout: "", stderr: "", error: null };
+  resetWindowsIdentityCircuit();
+  terminateRecordedProcess(4242, { ...base, runCommandImpl: () => timedOut });
+  let ran = false;
+  runPowerShell("x", { ...psBase, runCommandImpl: () => { ran = true; return working; } });
+  assert.ok(ran, "a timed-out kill does not open the breaker");
+  resetWindowsIdentityCircuit();
+  runPowerShell("x", { ...psBase, runCommandImpl: () => timedOut });
+  ran = false;
+  runPowerShell("x", { ...psBase, runCommandImpl: () => { ran = true; return working; } });
+  assert.equal(ran, false, "a timed-out probe still opens it");
+  resetWindowsIdentityCircuit();
+  runPowerShell("x", { ...psBase, runCommandImpl: () => ({ ...working, status: 245 }) });
+  ran = false;
+  runPowerShell("x", { ...psBase, runCommandImpl: () => { ran = true; return working; } });
+  assert.ok(ran, "exit 245 never trips the breaker");
 });

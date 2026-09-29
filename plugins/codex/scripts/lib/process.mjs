@@ -18,6 +18,7 @@ export const WINDOWS_PROCESS_MISSING_EXIT = 241;
 export const WINDOWS_IDENTITY_MISMATCH_EXIT = 242;
 export const WINDOWS_TERMINATION_FAILED_EXIT = 243;
 export const WINDOWS_IDENTITY_UNAVAILABLE_EXIT = 244;
+export const WINDOWS_KILL_ABORTED_EXIT = 245;
 export const WIN32_MAX_PID = 2147483647;
 export const isWin32Pid = (pid) => Number.isInteger(pid) && pid >= 1 && pid <= WIN32_MAX_PID;
 const WINDOWS_IDENTITY_CIRCUIT_MS = 60000;
@@ -112,7 +113,10 @@ export function runPowerShell(script, options = {}) {
   );
   const timedOut = result.error?.code === "ETIMEDOUT" || (!result.error && result.status === null);
   if (result.error?.code === "ENOENT" || timedOut || result.status === WINDOWS_IDENTITY_UNAVAILABLE_EXIT) {
-    windowsIdentityUnavailableAt = now();
+    // A kill that timed out says something about the target, not the launcher.
+    if (!(timedOut && options.tripOnTimeout === false)) {
+      windowsIdentityUnavailableAt = now();
+    }
     return { ...unavailable, stdout: String(result.stdout ?? ""), timedOut };
   }
   if (!result.error) {
@@ -453,13 +457,13 @@ export function fileTimeAt(ms) {
 }
 
 // Every substitution is digits only (validated by the caller).
-export function terminateScript(pid, fileTime, excludePids, deadlineFileTime) {
+export function terminateScript(pid, fileTime, exclude, deadlineFileTime) {
   return [
     "$ErrorActionPreference = 'Stop'",
     "if ($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage') { exit 244 }",
     "$target = <pid>",
     "$expected = '<fileTime>'",
-    "$exclude = @(<excludePids or nothing>)",
+    "$exclude = @{<exclude>}",
     "$deadline = [DateTime]::FromFileTimeUtc(<deadlineFileTime>)",
     "$pinned = @()",
     "function Pin([int]$id) {",
@@ -471,12 +475,12 @@ export function terminateScript(pid, fileTime, excludePids, deadlineFileTime) {
     "function Micro($dt) { $t = [long]$dt.ToUniversalTime().Ticks; return $t - ($t % 10) }",
     "function Remaining() { return [int][Math]::Floor([Math]::Max(0, ($deadline - [DateTime]::UtcNow).TotalMilliseconds)) }",
     "$tree = @()",
-    "$code = 244",
+    "$code = 245",
     "try {",
     "  try {",
     "    try { $root = Pin $target } catch [System.ArgumentException] { $code = 241; throw } ",
     "    if ($root.StartTime.ToFileTimeUtc().ToString() -ne $expected) { $code = 242; throw 'mismatch' }",
-    "    $rows = @(Get-CimInstance Win32_Process | Select-Object ProcessId, ParentProcessId, CreationDate, CommandLine)",
+    "    $rows = @(Get-CimInstance Win32_Process | Select-Object ProcessId, ParentProcessId, CreationDate)",
     "    $tree = @($root)",
     "    $starts = @{ $target = (Micro $root.StartTime) }",
     "    $seen = @{ $target = $true }",
@@ -488,10 +492,9 @@ export function terminateScript(pid, fileTime, excludePids, deadlineFileTime) {
     "        $cid = [int]$r.ProcessId",
     "        if ([int]$r.ParentProcessId -ne $pp -or $seen.ContainsKey($cid)) { continue }",
     "        $seen[$cid] = $true",
-    "        if ($exclude -contains $cid) { continue }",
-    "        if ($r.CommandLine -and $r.CommandLine.Contains('app-server-broker.mjs')) { continue }",
     "        try { $h = Pin $cid } catch [System.ArgumentException] { continue }   # already gone: proven",
     "        $live = Micro $h.StartTime",
+    "        if ($exclude.ContainsKey($cid) -and $exclude[$cid] -eq $h.StartTime.ToFileTimeUtc().ToString()) { continue }",
     "        if ($live -ne (Micro $r.CreationDate)) { continue }                  # a stranger holding a reused pid",
     "        if ($live -lt $starts[$pp]) { continue }                             # stale ParentProcessId",
     "        $starts[$cid] = $live",
@@ -499,7 +502,7 @@ export function terminateScript(pid, fileTime, excludePids, deadlineFileTime) {
     "        $queue += $cid",
     "      }",
     "    }",
-    "    if ((Remaining) -lt 250) { $code = 244; throw 'budget' }",
+    "    if ((Remaining) -lt 250) { $code = 245; throw 'budget' }",
     "  } catch { exit $code }",
     "  Write-Output 'KILL'",
     "  $survivors = @()",
@@ -529,14 +532,14 @@ export function terminateScript(pid, fileTime, excludePids, deadlineFileTime) {
     .join("\n")
     .replace("<pid>", String(pid))
     .replace("<fileTime>", fileTime)
-    .replace("<excludePids or nothing>", excludePids.join(","))
+    .replace("@{<exclude>}", `@{${exclude.map((e) => ` ${e.pid} = '${e.fileTime}'`).join(";")}${exclude.length ? " " : ""}}`)
     .replace("<deadlineFileTime>", deadlineFileTime);
 }
 
 // One PowerShell run pins the recorded process (GetProcessById + .Handle), proves
 // its start time, builds the tree from a CIM snapshot admitting only children
 // whose pinned start time equals the snapshot's at microsecond precision and
-// follows their parent's, skips the shared broker, kills children-first through
+// follows their parent's, skips the verified excluded processes (the shared broker), kills children-first through
 // the pinned objects and waits for each until an absolute deadline. Every answer
 // is an exit code plus protocol lines; an exit that could not be confirmed is a
 // survivor, and a corrupted answer after KILL is an unverified attempt.
@@ -547,9 +550,11 @@ function terminateWindowsRecordedProcess(pid, identity, options) {
   if (!fileTime || !isWin32Pid(pid) || !(Number.isFinite(timeoutMs) && timeoutMs >= KILL_MIN_BUDGET_MS)) {
     return refused("identity-unavailable");
   }
-  const excludePids = (options.excludePids ?? []).filter(isWin32Pid);
+  const exclude = (options.exclude ?? [])
+    .map((e) => ({ pid: e?.pid, fileTime: typeof e?.identity === "string" ? /^win32:(\d+)$/.exec(e.identity)?.[1] : null }))
+    .filter((e) => isWin32Pid(e.pid) && e.fileTime);
   const deadline = fileTimeAt((options.clock ?? Date.now)() + timeoutMs - KILL_DEADLINE_MARGIN_MS);
-  const run = runPowerShell(terminateScript(pid, fileTime, excludePids, deadline), { ...options, timeoutMs });
+  const run = runPowerShell(terminateScript(pid, fileTime, exclude, deadline), { ...options, timeoutMs, tripOnTimeout: false });
   // An exact KILL line anywhere proves the destructive phase began; a clean
   // sequence is required for anything stronger than "attempted".
   // `rawLines` are exact lines (no trim): "KILL" must be the whole line.
@@ -575,12 +580,13 @@ function terminateWindowsRecordedProcess(pid, identity, options) {
       }
       return killStarted ? unverified() : refused("identity-unavailable");
     case WINDOWS_PROCESS_MISSING_EXIT:
-      return { attempted: false, delivered: false, method: "handle", reason: "process-missing" };
+      return run.stdout !== "" ? refused("identity-unavailable") : { attempted: false, delivered: false, method: "handle", reason: "process-missing" };
     case WINDOWS_IDENTITY_MISMATCH_EXIT:
-      return { attempted: false, delivered: false, method: "handle", reason: "identity-mismatch" };
+      return run.stdout !== "" ? refused("identity-unavailable") : { attempted: false, delivered: false, method: "handle", reason: "identity-mismatch" };
     case WINDOWS_TERMINATION_FAILED_EXIT:
       // A 243 without at least one SURVIVOR row is not the script's answer.
-      return clean && protocol.length >= 2 && protocol[0] === "KILL" && survivorRows.every(Boolean)
+      return clean && protocol.length >= 2 && protocol[0] === "KILL" && survivorRows.every(Boolean) &&
+        survivorRows.every((row) => isWin32Pid(Number(row[1]))) && new Set(survivorRows.map((row) => row[1])).size === survivorRows.length
         ? failed({ survivors: survivorRows.map((row) => ({ pid: Number(row[1]), identity: row[2] === "0" ? null : `win32:${row[2]}` })) })
         : unverified();
     default:
@@ -606,9 +612,6 @@ export function terminateRecordedProcess(pid, options = {}) {
     if (identity) {
       const actual = getProcessIdentity(pid, options);
       return !actual ? "identity-unavailable" : actual !== identity ? "identity-mismatch" : null;
-    }
-    if (platform === "win32") {
-      return "identity-unavailable";
     }
     const commandLine = processCommandLine(pid, options);
     const match = options.commandLineMatch;
