@@ -405,7 +405,7 @@ test("a terminal write releases the job's private request payload", async () => 
 test("reapDeadJobs fails a running job whose pid was recycled by another process", () => {
   const workspace = makeTempDir();
   seedJob(workspace, { id: "job-recycled", status: "running", phase: "delegating", pid: process.pid, pidIdentity: "linux:not-this-process", logFile: null });
-  const reaped = reapDeadJobs(workspace, listJobs(workspace), { getProcessIdentityImpl: () => "linux:something-else" });
+  const reaped = reapDeadJobs(workspace, listJobs(workspace), { platform: "linux", getProcessIdentityImpl: () => "linux:something-else" });
   assert.equal(reaped[0].status, "failed");
   assert.match(reaped[0].errorMessage, /pid reused/);
   assert.equal(reaped[0].pidIdentity, null);
@@ -414,14 +414,14 @@ test("reapDeadJobs fails a running job whose pid was recycled by another process
 test("reapDeadJobs leaves a running job alone when the identity probe fails", () => {
   const workspace = makeTempDir();
   seedJob(workspace, { id: "job-probe-fails", status: "running", phase: "delegating", pid: process.pid, pidIdentity: "linux:x", logFile: null });
-  const reaped = reapDeadJobs(workspace, listJobs(workspace), { getProcessIdentityImpl: () => { throw new Error("ps unavailable"); } });
+  const reaped = reapDeadJobs(workspace, listJobs(workspace), { platform: "linux", getProcessIdentityImpl: () => { throw new Error("ps unavailable"); } });
   assert.equal(reaped[0].status, "running");
 });
 
 test("reapDeadJobs keeps a running job whose identity still matches", () => {
   const workspace = makeTempDir();
   seedJob(workspace, { id: "job-same", status: "running", phase: "delegating", pid: process.pid, pidIdentity: "linux:same", logFile: null });
-  const reaped = reapDeadJobs(workspace, listJobs(workspace), { getProcessIdentityImpl: () => "linux:same" });
+  const reaped = reapDeadJobs(workspace, listJobs(workspace), { platform: "linux", getProcessIdentityImpl: () => "linux:same" });
   assert.equal(reaped[0].status, "running");
 });
 
@@ -496,4 +496,65 @@ test("runTrackedJob records the worker identity and clears it with the pid", asy
   assert.deepEqual([done.pid, done.pidIdentity], [null, null]);
   const indexed = listJobs(workspace).find((entry) => entry.id === "job-identity");
   assert.deepEqual([indexed.pid, indexed.pidIdentity], [null, null]);
+});
+
+test("reapDeadJobs on win32 probes the live identities in one batch after the cheap checks and fails only the reused pid", () => {
+  const workspace = makeTempDir();
+  const child = spawn(process.execPath, ["-e", "setTimeout(()=>{}, 20000)"], { stdio: "ignore" });
+  try {
+    const jobs = [
+      { id: "job-a", status: "running", pid: process.pid, pidIdentity: "win32:1" },
+      { id: "job-b", status: "running", pid: child.pid, pidIdentity: "win32:2" },
+      { id: "job-c", status: "completed", pid: 1, pidIdentity: "win32:9" }
+    ];
+    for (const job of jobs) seedJob(workspace, job);
+    const probes = [];
+    const reaped = reapDeadJobs(workspace, jobs, {
+      platform: "win32",
+      getProcessIdentitiesImpl: (pids) => { probes.push([...pids].sort((a, b) => a - b)); return new Map(pids.map((pid) => [pid, pid === process.pid ? "win32:1" : "win32:other"])); }
+    });
+    assert.deepEqual(probes, [[process.pid, child.pid].sort((a, b) => a - b)], "one probe, only for records that passed the terminal/liveness checks");
+    assert.equal(reaped.find((j) => j.id === "job-a").status, "running");
+    assert.equal(reaped.find((j) => j.id === "job-b").status, "failed");
+    assert.match(reaped.find((j) => j.id === "job-b").errorMessage, /pid reused/);
+  } finally {
+    child.kill("SIGKILL");
+  }
+});
+
+test("reapDeadJobs on win32 leaves every job alone when the batch answers nothing", () => {
+  const workspace = makeTempDir();
+  const jobs = [{ id: "job-x", status: "running", pid: process.pid, pidIdentity: "win32:1" }];
+  seedJob(workspace, jobs[0]);
+  const reaped = reapDeadJobs(workspace, jobs, { platform: "win32", getProcessIdentitiesImpl: () => new Map() });
+  assert.equal(reaped[0].status, "running");
+});
+
+test("reapDeadJobs on posix keeps its per-pid probe and per-pid budget", () => {
+  const seen = [];
+  let clock = 0;
+  const workspace = makeTempDir();
+  const job = { id: "j", status: "running", pid: process.pid, pidIdentity: "x:1" };
+  seedJob(workspace, job);
+  reapDeadJobs(workspace, [job], {
+    platform: "linux",
+    remainingMs: () => 1500 - clock,
+    getProcessIdentityImpl: (pid, opts) => { seen.push(opts.timeoutMs); clock += 700; return "x:1"; },
+    getProcessIdentitiesImpl: () => assert.fail("posix must not batch")
+  });
+  assert.deepEqual(seen, [1500]);
+});
+
+// A 2 s budget is shorter than a cold PowerShell start (up to 3 s): the probe
+// times out, the launcher's breaker opens for a minute, and the cancel that
+// follows is refused as identity-unavailable without ever running.
+test("reapDeadJobs on win32 gives the batch probe a cold-start budget bounded by the deadline", () => {
+  const seen = [];
+  const impl = (pids, opts) => { seen.push(opts.timeoutMs); return new Map(pids.map((p) => [p, null])); };
+  const workspace = makeTempDir();
+  const jobs = [{ id: "j", status: "running", pid: process.pid, pidIdentity: "win32:1" }];
+  seedJob(workspace, jobs[0]);
+  reapDeadJobs(workspace, jobs, { platform: "win32", getProcessIdentitiesImpl: impl });
+  reapDeadJobs(workspace, jobs, { platform: "win32", getProcessIdentitiesImpl: impl, remainingMs: () => 1500 });
+  assert.deepEqual(seen, [6000, 1500]);
 });

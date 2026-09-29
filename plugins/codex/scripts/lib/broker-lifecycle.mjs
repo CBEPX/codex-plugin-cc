@@ -342,12 +342,26 @@ export function ownsBrokerProcess(pid, endpoint, timeoutMs, commandLine = proces
 // `identity-unavailable` (refused), `process-missing` (Windows: provably gone
 // before anything was signalled), `kill-failed` (the probe or kill threw, or a
 // Windows kill left survivors).
-export function teardownBrokerSession({ endpoint = null, pidFile, logFile, sessionDir = null, pid = null, pidIdentity = null, killProcess = null, timeoutMs = undefined, ownsProcess = ownsBrokerProcess }) {
+export function teardownBrokerSession({
+  endpoint = null,
+  pidFile,
+  logFile,
+  sessionDir = null,
+  pid = null,
+  pidIdentity = null,
+  killProcess = null,
+  timeoutMs = undefined,
+  ownsProcess = ownsBrokerProcess,
+  platform = process.platform,
+  keepOnUnknown = false,
+  terminateRecordedProcessImpl = terminateRecordedProcess
+}) {
   let signalled = false;
   let reason = "no-pid";
+  let outcome = null;
   if (Number.isFinite(pid) && killProcess) {
     try {
-      const outcome = terminateRecordedProcess(pid, {
+      outcome = terminateRecordedProcessImpl(pid, {
         identity: pidIdentity,
         commandLineMatch: (commandLine) => ownsProcess(pid, endpoint, timeoutMs, commandLine),
         timeoutMs,
@@ -359,6 +373,19 @@ export function teardownBrokerSession({ endpoint = null, pidFile, logFile, sessi
       // Ignore missing or already-exited broker processes.
       reason = "kill-failed";
     }
+  }
+
+  // win32 only: an outcome that proves nothing about the broker — no probe, a
+  // kill that did not verify, survivors — keeps every record when the caller
+  // asks (SessionEnd), so the next SessionEnd can try again. A missing or
+  // foreign process is a settled answer and is cleaned up as before; a dead
+  // root does not settle an unknown outcome.
+  const unknown =
+    platform === "win32" &&
+    (["identity-unavailable", "kill-failed"].includes(reason) || outcome?.unverified === true || (outcome?.survivors?.length ?? 0) > 0);
+  const kept = keepOnUnknown && !signalled && unknown;
+  if (kept) {
+    return { signalled, reason, kept };
   }
 
   // Best-effort: a self-cleaning broker or a locked file must not fail the hook.
@@ -401,5 +428,5 @@ export function teardownBrokerSession({ endpoint = null, pidFile, logFile, sessi
     }
   }
 
-  return { signalled, reason };
+  return { signalled, reason, kept: false };
 }

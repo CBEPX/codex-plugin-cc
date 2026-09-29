@@ -21,6 +21,7 @@ import {
     runAppServerReview,
     runAppServerTurn
   } from "./lib/codex.mjs";
+import { loadBrokerSession } from "./lib/broker-lifecycle.mjs";
 import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
 import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
@@ -45,7 +46,10 @@ import {
 } from "./lib/state.mjs";
 import {
   buildSingleJobSnapshot,
+  brokerExclusion,
   buildStatusSnapshot,
+  cancelDecision,
+  emitCancelPending,
   readStoredJob,
   resolveCancelableJob,
   resolveResultJob,
@@ -1339,20 +1343,20 @@ async function handleCancel(argv) {
 
   // Only a pid that is provably still this job's worker is signalled (#743).
   const { pid, identity } = resolveJobPid(workspaceRoot, job);
-  const kill = terminateRecordedProcess(pid, { identity, commandLineMatch: workerCommandLine(job.id) });
+  const broker = process.platform === "win32" ? loadBrokerSession(workspaceRoot) : null;
+  const exclude = brokerExclusion(broker);
+  // A broker record without a win32 identity cannot be excluded safely: refuse
+  // rather than risk killing the shared broker under the worker (spec §3.4 rev. 12).
+  const kill = broker && exclude === null
+    ? { attempted: false, delivered: false, reason: "identity-unavailable" }
+    : terminateRecordedProcess(pid, { identity, commandLineMatch: workerCommandLine(job.id), exclude: exclude ?? [] });
   // A worker we may not signal, or whose signal reached nothing, but that is
   // still alive is not cancelled: the job stays running, and the sidecar stays
   // so a later cancel or the reaper can still find it.
-  if (pid && (!kill.attempted || !kill.delivered) && isPidAlive(pid) === true) {
-    const reason = kill.attempted ? "not-delivered" : kill.reason;
-    const pending = `cancellation not confirmed: worker pid ${pid} left running (${reason})`;
-    appendLogLine(job.logFile, pending);
+  const decision = cancelDecision({ pid, kill, alive: isPidAlive(pid) });
+  if (decision.pending) {
+    emitCancelPending(decision, pid, job.id, { json: options.json, appendLog: (line) => appendLogLine(job.logFile, line) });
     process.exitCode = 1;
-    outputCommandResult(
-      { jobId: job.id, status: "running", cancellationPending: true, reason },
-      `${pending}\nThe turn interrupt was sent; the job stays running until the worker exits. Re-run cancel or wait for result.\n`,
-      options.json
-    );
     return;
   }
   const leftRunning = pid && !kill.attempted ? `worker pid ${pid} left running: ${kill.reason}` : null;

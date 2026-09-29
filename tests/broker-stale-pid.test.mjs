@@ -1362,7 +1362,7 @@ test("teardownBrokerSession tolerates a pidFile, logFile, and sessionDir the bro
   fs.rmdirSync(sessionDir);
 
   const result = teardownBrokerSession({ pidFile, logFile, sessionDir });
-  assert.deepEqual(result, { signalled: false, reason: "no-pid" });
+  assert.deepEqual(result, { signalled: false, reason: "no-pid", kept: false });
 });
 
 // The pidFile/logFile unlinks are best-effort cleanup, not a contract the hook can
@@ -1378,5 +1378,32 @@ test("teardownBrokerSession swallows unlink failures on pidFile and logFile as b
   const logFile = path.join(regularFile, "broker.log");
 
   const result = teardownBrokerSession({ pidFile, logFile, sessionDir: null });
-  assert.deepEqual(result, { signalled: false, reason: "no-pid" });
+  assert.deepEqual(result, { signalled: false, reason: "no-pid", kept: false });
+});
+
+test("teardownBrokerSession keeps the records on Windows when the outcome is unknown and asked to", () => {
+  const cases = [
+    ["win32", true, { attempted: false, delivered: false, reason: "identity-unavailable" }, true],
+    ["win32", true, { attempted: true, delivered: false, method: "handle", reason: "kill-failed", survivors: [{ pid: 7, identity: "win32:9" }] }, true],
+    ["win32", true, { attempted: true, delivered: false, method: "handle", reason: "kill-failed", survivors: [], unverified: true }, true],
+    ["win32", true, { attempted: false, delivered: false, method: "handle", reason: "process-missing" }, false],
+    ["win32", true, { attempted: false, delivered: false, method: "handle", reason: "identity-mismatch" }, false],
+    ["win32", false, { attempted: false, delivered: false, reason: "identity-unavailable" }, false],
+    ["linux", true, { attempted: false, delivered: false, reason: "identity-unavailable" }, false]
+  ];
+  for (const [platform, keepOnUnknown, outcome, keptExpected] of cases) {
+    const sessionDir = makeTempDir();
+    const pidFile = path.join(sessionDir, "broker.pid");
+    const logFile = path.join(sessionDir, "broker.log");
+    fs.writeFileSync(pidFile, "999999");
+    fs.writeFileSync(logFile, "");
+    const result = teardownBrokerSession({ pidFile, logFile, sessionDir, pid: 999999, pidIdentity: "win32:1", killProcess: () => {}, timeoutMs: 1000, platform, keepOnUnknown, terminateRecordedProcessImpl: () => outcome });
+    assert.equal(result.kept, keptExpected, `${platform} keepOnUnknown=${keepOnUnknown} ${JSON.stringify(outcome)}`);
+    assert.equal(result.reason, outcome.reason);
+    assert.equal(fs.existsSync(pidFile), keptExpected, "records survive exactly when kept");
+    assert.equal(fs.existsSync(logFile), keptExpected);
+  }
+  // No pid at all is settled: nothing to keep.
+  const sessionDir = makeTempDir();
+  assert.deepEqual(teardownBrokerSession({ pidFile: null, logFile: null, sessionDir, pid: null, killProcess: () => {}, platform: "win32", keepOnUnknown: true }), { signalled: false, reason: "no-pid", kept: false });
 });

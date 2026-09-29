@@ -310,6 +310,13 @@ async function main() {
             send(socket, { id: message.id, result: { busy: true } });
             continue;
           }
+          // Test knob (Windows E2E only): acknowledge the shutdown and stay up,
+          // so SessionEnd has to go through the recorded-pid kill path.
+          if (process.platform === "win32" && process.env.CODEX_COMPANION_BROKER_HANG_ON_SHUTDOWN === "1") {
+            send(socket, { id: message.id, result: {} });
+            process.stderr.write("[broker] test knob: acknowledged shutdown, staying up\n");
+            continue;
+          }
           send(socket, { id: message.id, result: {} });
           await shutdownAndExit(server);
         }

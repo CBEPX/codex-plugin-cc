@@ -320,3 +320,60 @@ export function resolveCancelableJob(cwd, reference, options = {}) {
 
   throw new Error("No active Codex jobs to cancel.");
 }
+
+// What cancel does with a kill outcome. posix keeps its v1.4.0 answer; win32
+// treats survivors and an unverified attempt as "not cancelled": the job stays
+// running and the survivors are reported, never followed by a record (spec §1).
+export function cancelDecision({ pid, kill, alive, platform = process.platform }) {
+  if (!pid) {
+    return { pending: false, reason: null, survivors: [] };
+  }
+  const win32Unknown = platform === "win32" && kill.attempted && (kill.survivors?.length > 0 || kill.unverified === true);
+  const stillHere = (!kill.attempted || !kill.delivered) && alive === true;
+  if (!stillHere && !win32Unknown) {
+    return { pending: false, reason: null, survivors: [] };
+  }
+  const reason = kill.attempted ? (platform === "win32" ? "kill-failed" : "not-delivered") : kill.reason;
+  return { pending: true, reason, survivors: platform === "win32" ? (kill.survivors ?? []) : [] };
+}
+
+// The pairs a worker kill must skip: `[]` without a broker, one verified
+// `{ pid, identity }` pair, or `null` when a broker is recorded but cannot be
+// excluded safely (no win32 identity) — the caller then refuses the kill.
+export function brokerExclusion(broker) {
+  if (!broker) {
+    return [];
+  }
+  const identity = typeof broker.pidIdentity === "string" && /^win32:\d+$/.test(broker.pidIdentity) ? broker.pidIdentity : null;
+  return Number.isInteger(broker.pid) && broker.pid >= 1 && identity ? [{ pid: broker.pid, identity }] : null;
+}
+
+// Pending cancel, rendered once for the three sinks. On posix `survivors` is
+// always [] and `reason` is v1.4.0's, so json/text/logLine are byte-identical
+// to v1.4.0 there; only win32 adds a survivors suffix and a stderr diagnostic.
+export function renderCancelPending(decision, pid, jobId) {
+  const survivors = decision.survivors ?? [];
+  const pending = `cancellation not confirmed: worker pid ${pid} left running (${decision.reason})`;
+  const survivorText = survivors.map((s) => `${s.pid}:${s.identity ?? "unknown"}`).join(" ");
+  const suffix = survivors.length > 0
+    ? ` worker tree survivors: ${survivorText}`
+    : decision.reason === "kill-failed" ? " (unverified)" : "";
+  return {
+    json: { jobId, status: "running", cancellationPending: true, reason: decision.reason, ...(survivors.length > 0 ? { survivors } : {}) },
+    text: `${pending}\nThe turn interrupt was sent; the job stays running until the worker exits. Re-run cancel or wait for result.\n`,
+    logLine: `${pending}${suffix}`,
+    diagnostic: survivors.length > 0 ? `[codex] worker tree survivors: ${survivorText}\n` : null,
+  };
+}
+
+// The caller's side of a pending cancel: one JSON document or the text on
+// stdout, the diagnostic (if any) on stderr, one line in the job log.
+export function emitCancelPending(decision, pid, jobId, { json, appendLog, stdout = process.stdout, stderr = process.stderr }) {
+  const rendered = renderCancelPending(decision, pid, jobId);
+  appendLog(rendered.logLine);
+  if (rendered.diagnostic) {
+    stderr.write(rendered.diagnostic);
+  }
+  stdout.write(json ? `${JSON.stringify(rendered.json, null, 2)}\n` : rendered.text);
+  return rendered;
+}

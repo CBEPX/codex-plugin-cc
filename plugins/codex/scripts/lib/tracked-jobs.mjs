@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import process from "node:process";
 
-import { getProcessIdentity, isPidAlive, processCommandLine } from "./process.mjs";
+import { getProcessIdentities, getProcessIdentity, isPidAlive, processCommandLine } from "./process.mjs";
 
 import {
   readJobFile,
@@ -369,9 +369,10 @@ function isQueuedWithoutWorker(job, pid) {
 // Below this there is no point starting another lock wait.
 const REAP_MIN_STEP_MS = 100;
 const IDENTITY_PROBE_MS = 2000;
+const WIN32_BATCH_PROBE_MS = 6000; // one cold PowerShell start (<=3 s) with margin
 
 /**
- * @param {{ lockWaitMs?: number, remainingMs?: () => number, getProcessIdentityImpl?: typeof getProcessIdentity, processCommandLineImpl?: typeof processCommandLine, platform?: string }} [options] Bounds the
+ * @param {{ lockWaitMs?: number, remainingMs?: () => number, getProcessIdentityImpl?: typeof getProcessIdentity, getProcessIdentitiesImpl?: typeof getProcessIdentities, processCommandLineImpl?: typeof processCommandLine, platform?: string }} [options] Bounds the
  * reaper's own state-lock waits. Each dead job costs one acquisition, so a caller
  * working to a deadline passes `remainingMs` and every wait is clamped to what is
  * left of it; once that is spent the remaining jobs are left for the next run
@@ -382,6 +383,7 @@ export function reapDeadJobs(workspaceRoot, jobs, options = {}) {
     lockWaitMs,
     remainingMs,
     getProcessIdentityImpl = getProcessIdentity,
+    getProcessIdentitiesImpl = getProcessIdentities,
     processCommandLineImpl = processCommandLine,
     platform = process.platform
   } = options;
@@ -392,6 +394,43 @@ export function reapDeadJobs(workspaceRoot, jobs, options = {}) {
     const left = Math.max(0, remainingMs());
     return lockWaitMs === undefined ? left : Math.min(lockWaitMs, left);
   };
+  const probeMs = () => (remainingMs ? Math.min(IDENTITY_PROBE_MS, remainingMs()) : IDENTITY_PROBE_MS);
+  // One PowerShell for the whole batch may start cold (up to 3 s on a slow
+  // runner); a budget under that trips the launcher's breaker and blocks the
+  // next minute of kills. Still bounded by the caller's deadline.
+  const batchProbeMs = () => (remainingMs ? Math.min(WIN32_BATCH_PROBE_MS, remainingMs()) : WIN32_BATCH_PROBE_MS);
+  // The jobs the identity probe can judge: still running by the index and on
+  // disk, with a live pid that carries an identity — the same tests the loop
+  // below applies, so the batch never probes a pid the loop would not.
+  const liveIdentityCandidate = (job) => {
+    if (job.status !== "running" && job.status !== "queued") {
+      return null;
+    }
+    const stored = readStoredJobOrNull(workspaceRoot, job.id);
+    if (stored && stored.status !== "running" && stored.status !== "queued") {
+      return null;
+    }
+    const { pid, identity } = resolveJobPid(workspaceRoot, job);
+    if (!pid || !identity || isPidAlive(pid) === false || isQueuedWithoutWorker(job, pid)) {
+      return null;
+    }
+    return { pid, identity };
+  };
+  // win32: one PowerShell for every candidate instead of one per job — a cold
+  // start costs up to 3 s against a 12 s SessionEnd. posix probes stay per job
+  // (a /proc read or one ps). A batch that fails judges nothing.
+  // ponytail: each win32 candidate's job file is read twice (here and in the loop).
+  let batch = new Map();
+  if (platform === "win32") {
+    const candidatePids = [...new Set(jobs.map(liveIdentityCandidate).filter(Boolean).map((candidate) => candidate.pid))];
+    if (candidatePids.length > 0 && !(remainingMs && remainingMs() < REAP_MIN_STEP_MS)) {
+      try {
+        batch = getProcessIdentitiesImpl(candidatePids, { platform, timeoutMs: batchProbeMs() });
+      } catch {
+        batch = new Map();
+      }
+    }
+  }
   const deferred = [];
   const reaped = jobs.map((job) => {
     if (remainingMs && remainingMs() < REAP_MIN_STEP_MS) {
@@ -419,10 +458,14 @@ export function reapDeadJobs(workspaceRoot, jobs, options = {}) {
     // A probe that fails or times out proves nothing, so the job is left alone.
     if (pid && identity) {
       let actual = null;
-      try {
-        actual = getProcessIdentityImpl(pid, { timeoutMs: remainingMs ? Math.min(IDENTITY_PROBE_MS, remainingMs()) : IDENTITY_PROBE_MS });
-      } catch {
-        actual = null;
+      if (platform === "win32") {
+        actual = batch.get(pid) ?? null;
+      } else {
+        try {
+          actual = getProcessIdentityImpl(pid, { timeoutMs: probeMs() });
+        } catch {
+          actual = null;
+        }
       }
       if (actual && actual !== identity) {
         return markJobDead(workspaceRoot, job, `${DEAD_WORKER_MESSAGE} (pid reused: ${pid} now belongs to another process)`, waitFor());
@@ -432,7 +475,7 @@ export function reapDeadJobs(workspaceRoot, jobs, options = {}) {
       // not a companion is proof enough to stop waiting on it. Nothing is signalled.
       let commandLine = null;
       try {
-        commandLine = processCommandLineImpl(pid, { timeoutMs: remainingMs ? Math.min(IDENTITY_PROBE_MS, remainingMs()) : IDENTITY_PROBE_MS });
+        commandLine = processCommandLineImpl(pid, { timeoutMs: probeMs() });
       } catch {
         commandLine = null;
       }
