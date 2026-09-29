@@ -21,8 +21,8 @@ test("SessionEnd keeps a job whose tree left survivors and drops one whose kill 
     ["win32", { attempted: true, delivered: true, method: "handle", reason: "identity-match" }, false, null],
     ["win32", { attempted: false, delivered: false, reason: "no-pid" }, false, null],
     // Never examined the tree (refused, or the kill threw): a dead root proves nothing — the broker teardown's rule.
-    ["win32", { attempted: false, delivered: false, reason: "identity-unavailable" }, true, /left job-1 running: identity-unavailable/],
-    ["win32", () => { throw new Error("powershell crashed"); }, true, /left job-1 running: kill-failed/],
+    ["win32", { attempted: false, delivered: false, reason: "identity-unavailable" }, true, /job-1 tree survivors: unknown\n[\s\S]*left job-1 running: identity-unavailable/],
+    ["win32", () => { throw new Error("powershell crashed"); }, true, /job-1 tree survivors: unknown\n[\s\S]*left job-1 running: kill-failed/],
     // Proven not ours, or gone without orphans: a stale record, the reaper's domain.
     ["win32", { attempted: false, delivered: false, method: "handle", reason: "identity-mismatch" }, false, null],
     ["win32", { attempted: false, delivered: false, method: "handle", reason: "process-missing" }, false, null]

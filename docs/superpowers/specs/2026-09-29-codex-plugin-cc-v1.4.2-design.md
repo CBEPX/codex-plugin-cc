@@ -1,6 +1,6 @@
 # codex-plugin-cc v1.4.2 — cancel waits for the turn, close reports the exit
 
-Date: 2026-09-29 (rev. 2, 2026-09-29)
+Date: 2026-09-29 (rev. 3, 2026-09-30)
 
 ## Goal
 
@@ -16,7 +16,7 @@ Success: a brokered cancel whose interrupt is ignored answers `cancellationPendi
 ## Trust boundary
 
 - No spawn path changes; `docs/agent/windows-threat-model.md` does not apply. Cancel spawns less: no interrupt client for a direct job (the v1.4.1 `reuseExistingBroker` connect started a `codex app-server` of its own when no broker was recorded).
-- The two new record fields are written by the job's own worker into the private per-user state directory — the trust of `workerClosed`. A forged `transport: "direct"` only selects the kill path, which still verifies identity (#743); a forged `appServerExited` reaches exactly as far as a forged `workerClosed`.
+- The two new record fields are written by the job's own worker into the private per-user state directory — the trust of `workerClosed`. A forged `transport: "direct"` only selects the kill path, which still verifies identity (#743); a forged `appServerExited` reaches exactly as far as a forged `workerClosed`. The cancel trusts `transport: direct` only when the job file and the index agree; a disagreement takes the brokered path.
 - Fail-closed defaults: a recorded turn without `transport` is treated as brokered (no kill without the turn's end); a runner that does not report its close outcome records `appServerExited: false`; the read side tolerates only a missing field (pre-1.4.2 records).
 
 ## Design
@@ -36,7 +36,7 @@ Brokered wait: only when a turn is recorded (`turnId`) and the transport is not 
 |---|---|---|---|---|---|---|
 | 1 | any | no (queued, pre-turn) | not sent (no ids) | not waited | v1.4.1 | v1.4.1 |
 | 2 | `direct` | yes | skipped, `turnInterruptAttempted: false` | not waited | v1.4.1: posix group signal, win32 verified tree kill | delivered → `cancelled`; posix not delivered, root alive → pending `not-delivered`; win32 survivors/unverified → pending `kill-failed`; win32 241 → `cancelled` only with no orphans and `isWorkerProvedRecord` (3.3), else pending `process-missing` |
-| 3 | `broker` or missing | yes | not acknowledged | record already terminal → row 5/6 outcome; otherwise not waited | none | pending `turn-not-interrupted`, exit 1 |
+| 3 | `broker` or missing | yes | not acknowledged | record already terminal → row 6 outcome: the stored status is kept (an unacknowledged interrupt never causes a `cancelled`); otherwise not waited | none | pending `turn-not-interrupted`, exit 1 |
 | 4 | `broker` or missing | yes | acknowledged | none within 10 s | none | pending `turn-not-interrupted`, exit 1 |
 | 5 | `broker` or missing | yes | acknowledged | the worker's own (`workerClosed: true`) | none | `cancelled` (record overwritten, v1.4.0 rule), exit 0 |
 | 6 | `broker` or missing | yes | acknowledged | terminal without the marker (crash guard, reaper) | none | stored status kept and reported, exit 0 |
@@ -45,7 +45,7 @@ Rows 3–4 answer `{ jobId, status: "running", cancellationPending: true, reason
 
 ### 3.3 Vanished root on win32
 
-`isWorkerProvedRecord(stored) = isWorkerTerminalRecord(stored) && stored.appServerExited !== false` (`lib/job-control.mjs`) replaces `isWorkerTerminalRecord` in the companion's `workerProved` (L1376). A direct close that hit its deadline with the child alive now leaves the cancel pending (`process-missing`) for the reaper.
+`isWorkerProvedRecord(stored) = isWorkerTerminalRecord(stored) && stored.appServerExited !== false` (`lib/job-control.mjs`) replaces `isWorkerTerminalRecord` in the companion's `workerProved` (L1426). A direct close that hit its deadline with the child alive now leaves the cancel pending (`process-missing`) for the reaper.
 
 ### 3.4 SessionEnd (win32)
 
@@ -89,3 +89,4 @@ Rows 3–4 answer `{ jobId, status: "running", cancellationPending: true, reason
 |---|---|---|---|
 | 1 | 2026-09-29 | v1.4.1 adversarial pass 13 parked limits; controller rulings 1–5 | initial |
 | 2 | 2026-09-29 | T4 review + implementation observations | transport kept on the final record; row 3 reads the record first; pending text without pid |
+| 3 | 2026-09-30 | adversarial pass 1 + whole-branch review | transport must agree between file and index; causation needs the acknowledged interrupt |

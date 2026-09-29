@@ -1340,7 +1340,10 @@ async function handleCancel(argv) {
   const turnId = existing.turnId ?? job.turnId ?? null;
   // A direct worker owns its app-server: a second client cannot reach it (it
   // would start a codex of its own), and the kill below takes it down.
-  const direct = (existing.transport ?? job.transport ?? null) === "direct";
+  // Defense in depth: the updater writes both in one patch; a file that says
+  // direct while the index does not is forged or torn, and the brokered path
+  // (no kill without the turn's end) is the safe one.
+  const direct = existing.transport === "direct" && job.transport === "direct";
 
   const interrupt = direct
     ? { attempted: false, interrupted: false, transport: "direct", detail: "direct transport: the kill stops the worker's own app-server" }
@@ -1370,10 +1373,11 @@ async function handleCancel(argv) {
       process.exitCode = 1;
       return;
     }
-    // Caused by this cancel only when the worker itself wrote it; a crash-guard
-    // or reaper record is kept by commitCancel. Either way the worker is done
-    // with the job: nothing is killed.
-    turnEnded = isWorkerTerminalRecord(stored);
+    // Caused by this cancel only when our acknowledged interrupt met the worker's
+    // own record; a record found terminal without an acknowledged interrupt, a
+    // crash-guard or a reaper record is kept by commitCancel. Either way the
+    // worker is done with the job: nothing is killed.
+    turnEnded = interrupt.interrupted && isWorkerTerminalRecord(stored);
     pid = null;
     identity = null;
   }
@@ -1441,8 +1445,8 @@ function finishCancel({ workspaceRoot, job, existing, interrupt, pid, identity, 
     completedAt,
     errorMessage: "Cancelled by user."
   };
-  // A brokered cancel caused the finish only when the worker's own record ended
-  // the wait; an acknowledged interrupt alone proves nothing.
+  // A brokered cancel caused the finish only when its acknowledged interrupt met
+  // the worker's own record; neither alone proves it.
   const kept = commitCancel(workspaceRoot, job, nextJob, existing, { leftRunning, causedByCancel: turnEnded || (kill.attempted === true && kill.delivered === true), log: (line) => appendLogLine(job.logFile, line) });
   const common = {
     jobId: job.id,

@@ -2233,6 +2233,34 @@ test("a brokered cancel whose interrupt is ignored stays pending and kills nothi
   await waitFor(() => !isAlive(running.pid));
 });
 
+// The direct path is trusted only when the job file and the index agree: both
+// are written in one patch, so a file that says direct while the index says
+// broker is forged or torn, and the kill (no turn end) would strand the turn.
+test("a job file forged to transport direct does not take the direct kill path while the index says broker", { skip: IS_WIN, timeout: 90_000 }, async (t) => {
+  const repo = seededRepo();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
+  const env = buildEnv(binDir, { FAKE_CODEX_TURN_DELAY_MS: "60000", FAKE_CODEX_IGNORE_FIRST_INTERRUPTS: "1" });
+  const launched = run(process.execPath, [SCRIPT, "task", "--background", "--json", "hold"], { cwd: repo, env });
+  assert.equal(launched.status, 0, launched.stderr);
+  const { jobId } = JSON.parse(launched.stdout);
+  const running = await waitFor(() => { const job = readPersistedJob(repo, jobId); return job.status === "running" && job.pid && job.turnId && job.transport === "broker" ? job : null; });
+  t.after(() => { try { process.kill(-running.pid, "SIGKILL"); } catch {} });
+  t.after(() => run(process.execPath, [SESSION_HOOK, "SessionEnd"], { cwd: repo, env, input: JSON.stringify({ hook_event_name: "SessionEnd", cwd: repo }) }));
+
+  // Only the job file is rewritten; the index keeps `broker`.
+  writeJobFile(repo, jobId, { ...readJobFile(resolveJobFile(repo, jobId)), transport: "direct" });
+  assert.equal(readPersistedJob(repo, jobId).transport, "direct", jobDiagnostics(repo, jobId));
+
+  const cancel = run(process.execPath, [SCRIPT, "cancel", jobId, "--json"], { cwd: repo, env });
+  assert.equal(cancel.status, 1, `cancel said: ${cancel.stdout.trim()}\n${jobDiagnostics(repo, jobId)}`);
+  assert.deepEqual(JSON.parse(cancel.stdout), { jobId, status: "running", cancellationPending: true, reason: "turn-not-interrupted" }, jobDiagnostics(repo, jobId));
+  assert.equal(isAlive(running.pid), true, `no kill on a disagreeing transport\n${jobDiagnostics(repo, jobId)}`);
+  const fakeState = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
+  assert.ok(fakeState.lastInterrupt, `the interrupt was sent (brokered path)\n${jobDiagnostics(repo, jobId)}`);
+});
+
 // A cancel that lands after the spawn but before the worker takes the record
 // over writes `cancelled`; the worker that starts afterwards must not run it.
 test("a worker started against a cancelled job exits without running the turn", () => {
