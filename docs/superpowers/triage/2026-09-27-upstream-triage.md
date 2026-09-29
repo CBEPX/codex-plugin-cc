@@ -101,7 +101,7 @@
 | #715 | pr | +289/-23 | fix(setup): fall back when broker auth is busy | verify | — |
 | #718 | issue | — | Windows: every command leaks an orphaned broker, and a live app-server makes the workspace directory undeletable | fixed-in v1.4.1 | orphaned broker cleanup from stored records needs process identity (v1.4.1) |
 | #741 | issue | — | `npm test` leaves a detached broker and a fake app-server behind for every test workspace | verify | — |
-| #743 | issue | — | SessionEnd kills whatever pid `broker.json` names, without checking it is still a broker (pid reuse → SIGTERM to an unrelated process group) | fixed-in v1.4.1 | posix-only; Windows kill-from-record refusal now targeted v1.4.1, not v1.4.0; win32 half fixed-in v1.4.1 |
+| #743 | issue | — | SessionEnd kills whatever pid `broker.json` names, without checking it is still a broker (pid reuse → SIGTERM to an unrelated process group) | fixed-in v1.4.1 | posix half in 1.3.0, win32 half in 1.4.1 |
 | #749 | pr | +72/-7 | fix(broker): do not signal stale persisted pids | fixed-in v1.3.0 | cherry-pick candidate |
 | #753 | issue | — | ensureBrokerSession() deletes a live broker's state without killing it — the only production caller passes no killProcess | fixed-in v1.3.0 | see #762 |
 | #762 | pr | +5/-3 | fix: terminate broker process when ensureBrokerSession tears down (fixes #753) | fixed-in v1.3.0 | fixes #753 |
@@ -134,7 +134,7 @@ Windows-специфика: taskkill, spawn/PATHEXT, PowerShell, EPERM/ENOENT н
 | # | type | size | title | status | note |
 |---|---|---|---|---|---|
 | #57 | issue | — | Review mode blocks all commands on Windows: sandbox policy rejects PowerShell | planned v1.5.0 | sandbox/profile surface (--sandbox/--profile sugar) |
-| #70 | issue | — | spawnSync with shell:true fails on Windows network drives (UNC paths) | planned v1.4.1 | shell:true is gone in v1.4.0, but cmd.exe (used for .cmd shims) still refuses a UNC cwd; verify on a UNC checkout |
+| #70 | issue | — | spawnSync with shell:true fails on Windows network drives (UNC paths) | verify | shell:true is gone in v1.4.0, but cmd.exe (used for .cmd shims) still refuses a UNC cwd; verify on a UNC checkout |
 | #113 | issue | — | Plugin install fails on Windows with corrupted error message | verify | install-time error text; not reproduced |
 | #219 | issue | — | Fix taskkill cancellation on Windows Git Bash (MSYS path mangling +   non-English locale) | verify | — |
 | #250 | issue | — | /codex:review hangs indefinitely on xcode/XcodeListWindows MCP call | verify | — |
@@ -829,13 +829,9 @@ Issue (не PR) со статусом `fixed-in`/`planned`, сгруппиров
 
 #336, #416, #423, #487, #577, #718, #743 (win32)
 
-### planned v1.4.1
-
-#70
-
 ### verify (Windows, needs a reporter retest after v1.4.0)
 
-#113, #236, #285, #295, #310
+#70, #113, #236, #285, #295, #310
 
 ### planned v1.5.0
 
