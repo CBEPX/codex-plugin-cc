@@ -2016,6 +2016,10 @@ test("a background worker's pid sidecar carries its identity and cancel signals 
     assert.ok(Number.isInteger(sidecar.pid));
     assert.equal(sidecar.identity, getProcessIdentity(sidecar.pid));
     assert.match(sidecar.identity, /^(linux|darwin|win32):/);
+    // v1.4.1 refuses kills while the broker record has no identity (Windows start window).
+    if (IS_WIN) {
+      await waitFor(() => (/^win32:\d+$/.test(loadBrokerSession(repo)?.pidIdentity ?? "") ? "ready" : null));
+    }
     const cancel = run(process.execPath, [SCRIPT, "cancel", jobId], { cwd: repo, env });
     assert.equal(cancel.status, 0, cancel.stderr);
     assert.doesNotMatch(cancel.stdout, /left running/);
@@ -3858,6 +3862,10 @@ test("cancelling an awaited job ends the await with exit 1 and leaves a readable
     return job && job.status === "running" && job.pid ? job.id : null;
   }, { timeoutMs: 15000 });
 
+  // v1.4.1 refuses kills while the broker record has no identity (Windows start window).
+  if (IS_WIN) {
+    await waitFor(() => (/^win32:\d+$/.test(loadBrokerSession(repo)?.pidIdentity ?? "") ? "ready" : null));
+  }
   const cancelled = run(process.execPath, [SCRIPT, "cancel", jobId], { cwd: repo, env });
   assert.equal(cancelled.status, 0, cancelled.stderr);
   assert.match(cancelled.stdout, /cancelled/i);
