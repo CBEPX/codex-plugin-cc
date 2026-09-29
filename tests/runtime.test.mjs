@@ -3915,7 +3915,17 @@ test("an acknowledged cancellation survives a worker that finishes after it", { 
 
   const cancelled = run(process.execPath, [SCRIPT, "cancel", jobId, "--json"], { cwd: repo, env });
   assert.equal(cancelled.status, 0, cancelled.stderr);
-  assert.equal(JSON.parse(cancelled.stdout).status, "cancelled");
+  // Read only on failure: which record the cancel found, and who wrote it.
+  const jobDiagnostics = () => {
+    try {
+      const record = JSON.parse(fs.readFileSync(path.join(resolveStateDir(repo), "jobs", `${jobId}.json`), "utf8"));
+      const log = fs.readFileSync(record.logFile, "utf8").split("\n").slice(-20).join("\n");
+      return `record: ${JSON.stringify({ status: record.status, phase: record.phase, workerClosed: record.workerClosed, errorMessage: record.errorMessage })}\njob log tail:\n${log}`;
+    } catch (error) {
+      return `(job record unreadable: ${error.message})`;
+    }
+  };
+  assert.equal(JSON.parse(cancelled.stdout).status, "cancelled", `cancel said: ${cancelled.stdout.trim()}\n${jobDiagnostics()}`);
 
   const workerAlive = () => {
     try {
