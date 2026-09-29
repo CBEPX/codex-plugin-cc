@@ -187,7 +187,9 @@ export function cleanupSessionJobs(cwd, sessionId, lockWaitMs, remainingMs, deps
         if (unresolved) {
           reason = reason ?? "kill-failed";
           process.stderr.write(
-            `[codex] SessionEnd left ${job.id} tree survivors: ${(outcome.survivors ?? []).map((s) => `${s.pid}:${s.identity ?? "unknown"}`).join(" ") || "unverified"}\n`
+            refused
+              ? `[codex] SessionEnd left ${job.id} tree: refused (broker record without identity)\n`
+              : `[codex] SessionEnd left ${job.id} tree survivors: ${(outcome?.survivors ?? []).map((s) => `${s.pid}:${s.identity ?? "unknown"}`).join(" ") || "unverified"}\n`
           );
         }
       }
@@ -237,8 +239,11 @@ async function handleSessionEnd(input) {
   const budgetEndsAt = Date.now() + resolveSessionEndBudgetMs();
   const remainingMs = () => budgetEndsAt - Date.now();
   const stepBudget = (bound) => Math.min(bound, Math.max(0, remainingMs()));
+  // Only a loaded record can be excluded from a worker kill; the env fallback
+  // below is a placeholder without a pid.
+  const recordedBroker = loadBrokerSession(cwd);
   const brokerSession =
-    loadBrokerSession(cwd) ??
+    recordedBroker ??
     (process.env[BROKER_ENDPOINT_ENV]
       ? {
           endpoint: process.env[BROKER_ENDPOINT_ENV],
@@ -256,7 +261,7 @@ async function handleSessionEnd(input) {
   let activeJobs;
   try {
     cleanupSessionJobs(cwd, input.session_id || process.env[SESSION_ID_ENV], stepBudget(STATE_LOCK_STEP_MS), remainingMs, {
-      broker: process.platform === "win32" ? brokerSession : null
+      broker: process.platform === "win32" ? recordedBroker : null
     });
     activeJobs = activeWorkspaceJobs(cwd, stepBudget(STATE_LOCK_STEP_MS), remainingMs);
   } catch (error) {
