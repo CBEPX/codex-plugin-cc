@@ -766,7 +766,8 @@ export function writeJobFile(cwd, jobId, payload) {
 }
 
 export function readJobFile(jobFile) {
-  const record = JSON.parse(fs.readFileSync(jobFile, "utf8"));
+  // The worker's rename-over can race an unlocked reader (the cancel poll) on Windows.
+  const record = JSON.parse(retryOnWindows(() => fs.readFileSync(jobFile, "utf8"), ["EPERM", "EBUSY"]));
   if (!hasStoredConfigValues(record)) {
     return record;
   }

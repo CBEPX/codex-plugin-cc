@@ -10,11 +10,14 @@
 
 ### Changed
 - `status --json` / `result --json` job records carry `transport` (`broker`/`direct`, set when the turn starts) and, on the worker's own final record, `appServerExited`.
+- A brokered `/codex:cancel` can take up to about 10 s longer than in 1.4.1 (it waits for the turn's own final record).
 
 ### Known limitations
 - A brokered turn that never ends after `turn/interrupt` keeps the job `running`: `/codex:cancel` answers `turn-not-interrupted` until the turn ends on its own or the shared broker is shut down (`SessionEnd`); a turn that ends on its own during the 10 s wait is recorded `cancelled` (spec §Limits)
 - Jobs started before 1.4.2 have no `transport` and are treated as brokered: a pre-1.4.2 direct job cannot be cancelled until its turn ends (spec §Limits)
 - Windows: on the direct transport the observed app-server child is `cmd.exe` running the `codex.cmd` shim; its exit is evidence, not proof, that the shim's descendants exited (spec §Limits)
+- A worker whose `--turn-timeout-ms` fired and whose interrupt the broker never acknowledged records `failed` (`workerClosed: true`); a cancel whose own acknowledged interrupt then finds that record records `cancelled` although the turn may still run in the broker (spec §Limits)
+- The pending text says "The turn interrupt was sent;" also when no interrupt was attempted (a direct kill that failed; Codex unavailable on a brokered job); the JSON `reason` is exact (spec §Limits)
 
 ## 1.4.1 — 2026-09-29
 

@@ -72,7 +72,8 @@ Rows 3–4 answer `{ jobId, status: "running", cancellationPending: true, reason
 - Records without `transport` (jobs started before 1.4.2) are treated as brokered: a pre-1.4.2 direct job (cold `--resume-last`) still running after the upgrade answers `turn-not-interrupted` until its turn ends.
 - win32 direct transport: the child that `close()` observes is `cmd.exe` running the `codex.cmd` shim; its exit is evidence, not proof, that the shim's `node`/`codex` descendants exited.
 - A direct close that returned early because `exitPromise` settled on a spawn error or a JSONL parse error records `appServerExited: false` without escalating to SIGTERM/SIGKILL (pre-existing close behaviour); a vanished-root cancel of such a job stays pending for the reaper.
-- The pending text keeps "The turn interrupt was sent;" also for a direct job whose kill failed, where none was sent (text only; the JSON is exact; posix text stays byte-identical to v1.4.1).
+- A worker whose `--turn-timeout-ms` fired and whose interrupt the broker never acknowledged writes `failed` with `workerClosed: true` ("interrupt not acknowledged — the turn may still be running in the shared runtime"; the warning is in the job log). A cancel whose own acknowledged interrupt then finds that record records `cancelled` (row 5) although the turn may still run in the broker: the hung-turn case.
+- The pending text keeps "The turn interrupt was sent;" also when no interrupt was attempted (a direct job whose kill failed; a brokered job while Codex is unavailable) (text only; the JSON `reason` is exact; posix text stays byte-identical to v1.4.1).
 - A brokered cancel can take up to about 10 s longer than in v1.4.1.
 - Everything v1.4.1 spec §5 parks (orphan tracking, Job Objects, Constrained Language Mode) is unchanged.
 
