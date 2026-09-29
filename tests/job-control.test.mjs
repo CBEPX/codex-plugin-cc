@@ -8,7 +8,7 @@ import { saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle
 import { DEAD_WORKER_MESSAGE } from "../plugins/codex/scripts/lib/tracked-jobs.mjs";
 import assert from "node:assert/strict";
 
-import { brokerExclusion, brokerPresence, cancelDecision, commitCancel, emitCancelPending, renderCancelPending } from "../plugins/codex/scripts/lib/job-control.mjs";
+import { brokerExclusion, brokerPresence, cancelDecision, commitCancel, emitCancelPending, isWorkerTerminalRecord, renderCancelPending } from "../plugins/codex/scripts/lib/job-control.mjs";
 
 const SURVIVORS = [{ pid: 4301, identity: "win32:7" }];
 
@@ -140,6 +140,16 @@ test("emitCancelPending never puts the diagnostic on stdout", () => {
   }
 });
 
+test("isWorkerTerminalRecord requires the workerClosed marker on a terminal record", () => {
+  const done = { status: "completed", phase: "done" };
+  assert.equal(isWorkerTerminalRecord({ ...done, workerClosed: true }), true);
+  assert.equal(isWorkerTerminalRecord({ status: "failed", errorMessage: "worker uncaughtException: boom" }), false, "crash guard");
+  assert.equal(isWorkerTerminalRecord({ status: "failed", errorMessage: DEAD_WORKER_MESSAGE }), false, "reaper");
+  assert.equal(isWorkerTerminalRecord(done), false, "legacy v1.4.0 record");
+  assert.equal(isWorkerTerminalRecord({ status: "running", workerClosed: true }), false);
+  assert.equal(isWorkerTerminalRecord(null), false);
+});
+
 test("commitCancel writes cancelled over an active record and keeps a terminal one", () => {
   const workspace = makeTempDir();
   const job = { id: "task-1", status: "running", title: "T" };
@@ -154,7 +164,7 @@ test("commitCancel writes cancelled over an active record and keeps a terminal o
   assert.deepEqual(log, ["Cancelled by user."]);
 
   // The worker (or the reaper) already finished it: kept, reported, not overwritten.
-  const finished = { ...job, status: "failed", phase: "failed", errorMessage: "Turn interrupted." };
+  const finished = { ...job, status: "failed", phase: "failed", errorMessage: "Turn interrupted.", workerClosed: true };
   writeJobFile(workspace, "task-1", finished);
   log.length = 0;
   assert.deepEqual(commitCancel(workspace, job, next, {}, { leftRunning: "worker pid 5 left running: identity-mismatch", log: (line) => log.push(line) }), finished);
@@ -171,20 +181,22 @@ test("commitCancel writes cancelled over an active record and keeps a terminal o
 test("commitCancel keeps a reaper-written failure even when this cancel's interrupt was acknowledged", () => {
   const job = { id: "task-1", status: "running", title: "T" };
   const next = { ...job, status: "cancelled", phase: "cancelled", pid: null, pidIdentity: null, requestFile: null, completedAt: "2026-09-29T00:00:00.000Z", errorMessage: "Cancelled by user." };
-  // [stored errorMessage, causedByCancel, kept]
+  // [stored errorMessage, workerClosed, causedByCancel, kept]
   const cases = [
-    [DEAD_WORKER_MESSAGE, true, true],
-    [DEAD_WORKER_MESSAGE, false, true],
-    [`${DEAD_WORKER_MESSAGE} (pid reused: 5 now belongs to another process)`, true, true],
-    ["Turn interrupted.", true, false],
-    ["Turn interrupted.", false, true]
+    [DEAD_WORKER_MESSAGE, undefined, true, true],
+    [DEAD_WORKER_MESSAGE, undefined, false, true],
+    [`${DEAD_WORKER_MESSAGE} (pid reused: 5 now belongs to another process)`, undefined, true, true],
+    ["worker uncaughtException: boom", undefined, true, true],
+    ["Turn interrupted.", undefined, true, true],
+    ["Turn interrupted.", true, true, false],
+    ["Turn interrupted.", true, false, true]
   ];
-  for (const [errorMessage, causedByCancel, kept] of cases) {
+  for (const [errorMessage, workerClosed, causedByCancel, kept] of cases) {
     const workspace = makeTempDir();
-    const stored = { ...job, status: "failed", phase: "failed", errorMessage };
+    const stored = { ...job, status: "failed", phase: "failed", errorMessage, ...(workerClosed ? { workerClosed } : {}) };
     writeJobFile(workspace, "task-1", stored);
     const result = commitCancel(workspace, job, next, {}, { leftRunning: null, causedByCancel, log: () => {} });
-    const label = `${errorMessage} causedByCancel=${causedByCancel}`;
+    const label = `${errorMessage} workerClosed=${workerClosed} causedByCancel=${causedByCancel}`;
     assert.deepEqual(result, kept ? stored : null, label);
     assert.equal(readJobFile(resolveJobFile(workspace, "task-1")).status, kept ? "failed" : "cancelled", label);
   }

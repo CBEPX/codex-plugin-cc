@@ -4,7 +4,7 @@ import { BROKER_ENDPOINT_ENV } from "./app-server.mjs";
 import { loadBrokerSession, resolveBrokerStateFile } from "./broker-lifecycle.mjs";
 import { getSessionRuntimeStatus } from "./codex.mjs";
 import { getConfig, listJobs, readJobFile, removeJobPidFile, removeJobRequestFile, resolveJobFile, upsertJob, withStateLock, writeJobFile } from "./state.mjs";
-import { DEAD_WORKER_MESSAGE, reapDeadJobs, SESSION_ID_ENV } from "./tracked-jobs.mjs";
+import { reapDeadJobs, SESSION_ID_ENV } from "./tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
 export const DEFAULT_MAX_STATUS_JOBS = 8;
@@ -327,12 +327,11 @@ function isTerminalRecord(stored) {
   return Boolean(stored) && stored.status !== "queued" && stored.status !== "running";
 }
 
-// A terminal record the worker wrote itself, not the reaper's dead-worker
-// failure (its variants all start with DEAD_WORKER_MESSAGE, "… (pid reused: …)").
-// The worker writes it only after closing its app-server client, so it proves a
-// cooperative exit.
+// A terminal record carrying the worker's own `workerClosed` marker, set only by
+// its cooperative terminal write after the turn and after its app-server client
+// closed. The crash guard, the reaper and v1.4.0 records never carry it.
 export function isWorkerTerminalRecord(stored) {
-  return isTerminalRecord(stored) && !(typeof stored.errorMessage === "string" && stored.errorMessage.startsWith(DEAD_WORKER_MESSAGE));
+  return isTerminalRecord(stored) && stored.workerClosed === true;
 }
 
 // The cancel's terminal write, one locked step: another process's `saveState`

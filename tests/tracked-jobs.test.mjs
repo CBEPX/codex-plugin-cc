@@ -127,6 +127,7 @@ test("registerWorkerCrashGuard marks the job failed when the worker dies on an u
   assert.equal(stored.status, "failed");
   assert.match(stored.errorMessage, /unhandledRejection/);
   assert.match(stored.errorMessage, /boom/);
+  assert.equal(stored.workerClosed, undefined, "the crash guard never proves a closed worker");
 });
 
 test("registerWorkerCrashGuard does not rewrite a cancelled job when the worker is SIGTERMed", async () => {
@@ -401,6 +402,28 @@ test("a terminal write releases the job's private request payload", async () => 
     /boom/
   );
   assert.equal(fs.existsSync(resolveJobRequestFile(workspace, "job-thrown")), false, "a failed job must not keep its payload");
+});
+
+test("runTrackedJob sets workerClosed only on its cooperative terminal write, after the runner returned", async () => {
+  const workspace = makeTempDir();
+  const job = { id: "job-marker", status: "queued", workspaceRoot: workspace, logFile: null };
+  seedJob(workspace, job);
+  const seen = [];
+  await runTrackedJob(job, async () => {
+    // Still inside the runner (the app-server client is not closed yet): no marker.
+    seen.push(readJobFile(resolveJobFile(workspace, job.id)));
+    return { exitStatus: 0, payload: {}, rendered: "ok\n", summary: "ok" };
+  });
+  assert.equal(seen[0].status, "running");
+  assert.equal(seen[0].workerClosed, undefined);
+  assert.equal(readJobFile(resolveJobFile(workspace, job.id)).workerClosed, true);
+  assert.equal(listJobs(workspace).find((entry) => entry.id === job.id).workerClosed, true);
+
+  // A thrown runner (client state unknown) never claims it.
+  const thrown = { id: "job-marker-thrown", status: "queued", workspaceRoot: workspace, logFile: null };
+  seedJob(workspace, thrown);
+  await assert.rejects(runTrackedJob(thrown, async () => { throw new Error("boom"); }), /boom/);
+  assert.equal(readJobFile(resolveJobFile(workspace, thrown.id)).workerClosed, undefined);
 });
 
 // A live pid is not proof of a live worker: the OS may have handed the number to
