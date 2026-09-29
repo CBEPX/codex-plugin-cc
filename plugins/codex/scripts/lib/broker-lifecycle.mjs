@@ -344,12 +344,19 @@ async function ensureBrokerSessionLocked(cwd, options, attempt) {
 
   // A broker whose endpoint answers is used; a starting (or, past its grace, a
   // replacing) one is first promoted to ready with its identity, so no live
-  // broker stays starting for life. The identity probe (a PowerShell run on
-  // win32) runs outside the lock; the promotion is claim-guarded under it, and a
-  // recycled pid fails the claim anyway (the identity is fixed per pid). win32
-  // needs the identity to exclude the broker from worker kills: without one it
-  // is kept as is and this request takes the direct transport.
-  const adoptOrRetry = async (record) => {
+  // broker stays starting for life. A pid-bearing record without an identity
+  // is bound to the answering instance: the pid is probed before the readiness
+  // check (`pre`) and again after it, outside the lock (a PowerShell run each
+  // on win32), and the record is promoted only when both probes are equal and
+  // non-null, i.e. the process at that pid lived across the answering window (a
+  // replacement broker would have registered another pid and fails the claim).
+  // Otherwise the record is kept as is and this request takes the direct
+  // transport. The promotion itself is claim-guarded under the lock.
+  const probeBefore = (record) =>
+    (record?.state === "starting" || record?.state === "replacing") && record.pid != null && !record.pidIdentity
+      ? { pid: record.pid, identity: getProcessIdentityImpl(record.pid) }
+      : null;
+  const adoptOrRetry = async (record, pre) => {
     if (record.state !== "starting" && record.state !== "replacing") {
       return record;
     }
@@ -364,13 +371,24 @@ async function ensureBrokerSessionLocked(cwd, options, attempt) {
       process.stderr.write(`[codex] broker ${current.endpoint} is being replaced; this request uses the direct transport.\n`);
       return null;
     }
-    const identity = current.pid == null ? null : (current.pidIdentity ?? getProcessIdentityImpl(current.pid));
-    if (!identity && platform === "win32") {
-      process.stderr.write(`[codex] broker pid ${current.pid ?? "none"} answers but has no identity; its record is kept and this request uses the direct transport.\n`);
-      return null;
-    }
     if (current.pid == null) {
+      if (platform === "win32") {
+        process.stderr.write(`[codex] broker pid none answers but has no identity; its record is kept and this request uses the direct transport.\n`);
+        return null;
+      }
       return current;
+    }
+    let identity = current.pidIdentity ?? null;
+    if (!identity) {
+      if (pre?.pid !== current.pid) {
+        return await retryClaim("the broker record kept changing");
+      }
+      const post = getProcessIdentityImpl(current.pid);
+      if (!pre.identity || pre.identity !== post) {
+        process.stderr.write(`[codex] broker pid ${current.pid} answers but its identity could not be confirmed across the probe (${pre.identity ?? "none"} then ${post ?? "none"}); its record is kept and this request uses the direct transport.\n`);
+        return null;
+      }
+      identity = post;
     }
     const { replacer, replacingAt, ...rest } = current;
     const promoted = { ...rest, state: "ready", pidIdentity: identity };
@@ -404,8 +422,9 @@ async function ensureBrokerSessionLocked(cwd, options, attempt) {
   };
 
   const existing = loadBrokerSession(cwd);
+  const pre = probeBefore(existing);
   if (existing && (await isBrokerEndpointReady(existing.endpoint))) {
-    return await adoptOrRetry(existing);
+    return await adoptOrRetry(existing, pre);
   }
 
   if (existing) {
@@ -419,7 +438,7 @@ async function ensureBrokerSessionLocked(cwd, options, attempt) {
     if ((!replacing || !withinGrace(existing.replacingAt, now)) && (liveOwned || existing.state === "starting" || replacing)) {
       const ready = await waitForBrokerEndpoint(existing.endpoint, options.retryTimeoutMs ?? STALE_BROKER_RETRY_MS).catch(() => false);
       if (ready) {
-        return await adoptOrRetry(loadBrokerSession(cwd) ?? existing);
+        return await adoptOrRetry(loadBrokerSession(cwd) ?? existing, pre);
       }
     }
     // No pid to verify (a start still spawning, or one whose pid save failed) or

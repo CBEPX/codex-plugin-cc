@@ -8,7 +8,7 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
-import { IS_WIN, makeTempDir, run } from "./helpers.mjs";
+import { IS_WIN, makeTempDir, run, waitFor } from "./helpers.mjs";
 import { createBrokerEndpoint, parseBrokerEndpoint } from "../plugins/codex/scripts/lib/broker-endpoint.mjs";
 import {
   clearBrokerSession,
@@ -48,19 +48,6 @@ function waitForExit(child, { timeoutMs = 10000 } = {}) {
     }
     child.once("exit", onExit);
   });
-}
-
-// 30 s: hosted Windows VMs have been seen 2-3x slower for hours.
-async function waitFor(predicate, { timeoutMs = 30000, intervalMs = 50 } = {}) {
-  const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
-    const value = await predicate();
-    if (value) {
-      return value;
-    }
-    await new Promise((resolve) => setTimeout(resolve, intervalMs));
-  }
-  throw new Error("Timed out waiting for condition.");
 }
 
 function isAlive(pid) {
@@ -1759,8 +1746,8 @@ test("ensureBrokerSession retries a failed ready-record save once, then tears th
         env: buildEnv(binDir),
         // Counted saves: 1 pid, 2 identity, 3 ready, 4 ready retry.
         saveBrokerSessionImpl: (cwd, record) => saves.impl(cwd, record),
-        // The real probe: the broker registers the same identity itself, so the
-        // failed start's reservation finds its own claim unchanged.
+        // The real probe: the broker registers only its pid and the starter saves
+        // the identity, so the failed start's reservation finds its own claim unchanged.
         spawnBrokerProcessImpl: (args) => { const child = spawnBrokerProcess(args); spawned.push(child.pid); return child; },
         terminateRecordedProcessImpl: (pid) => { terminated.push(pid); process.kill(pid, "SIGKILL"); return { attempted: true, delivered: true, reason: "identity-match" }; }
       });
@@ -2300,4 +2287,42 @@ test("ensureBrokerSession probes an adopted broker's identity outside the state 
   assert.equal(session?.state, "ready");
   assert.equal(loadBrokerSession(workspace)?.pidIdentity, "x:adopted");
   clearBrokerSession(workspace);
+});
+
+// Wave 11 (B1): adoption binds the identity to the answering instance (two probes around the readiness check).
+async function adoptWithProbes(t, probes) {
+  const workspace = makeTempDir();
+  const sessionDir = makeTempDir("cxc-");
+  const endpoint = createBrokerEndpoint(sessionDir);
+  const starting = { endpoint, pidFile: null, logFile: null, sessionDir, state: "starting", startedAt: Date.now(), pid: process.pid, pidIdentity: null };
+  saveBrokerSession(workspace, starting);
+  const server = await listenStub(endpoint, (socket) => socket.end());
+  t.after(() => { server.close(); clearBrokerSession(workspace); });
+  const calls = [];
+  const session = await ensureBrokerSession(workspace, {
+    spawnBrokerProcessImpl: () => assert.fail("no spawn"),
+    getProcessIdentityImpl: (pid) => { calls.push(pid); return probes[Math.min(calls.length, probes.length) - 1]; }
+  });
+  return { session, calls, workspace, starting };
+}
+
+test("adoption promotes a starting broker when both identity probes agree", async (t) => {
+  const { session, calls, workspace } = await adoptWithProbes(t, ["x:same", "x:same"]);
+  assert.equal(session?.state, "ready");
+  assert.equal(session.pidIdentity, "x:same");
+  assert.equal(loadBrokerSession(workspace)?.pidIdentity, "x:same");
+  assert.deepEqual(calls, [process.pid, process.pid], "one probe before and one after the readiness check");
+});
+
+test("adoption does not promote when the pid was recycled across the answering window", async (t) => {
+  const { session, workspace, starting } = await adoptWithProbes(t, ["x:one", "x:two"]);
+  assert.equal(session, null, "direct transport");
+  assert.deepEqual(loadBrokerSession(workspace), starting, "the record is unchanged");
+});
+
+test("adoption does not promote when the first probe returns null", async (t) => {
+  // The second probe still runs (it is cheap to reason about); the result is null either way.
+  const { session, workspace, starting } = await adoptWithProbes(t, [null, "x:late"]);
+  assert.equal(session, null);
+  assert.deepEqual(loadBrokerSession(workspace), starting);
 });

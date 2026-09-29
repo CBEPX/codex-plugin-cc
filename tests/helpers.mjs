@@ -64,3 +64,17 @@ export function cimTree(rootPid, env = process.env) {
     return { pid: Number(row[2]), name: row[1] === "NODE" ? "node.exe" : row[1] === "CMD" ? "cmd.exe" : "other" };
   });
 }
+
+// 30 s: hosted Windows VMs have been seen 2-3x slower for hours; a detached
+// worker can take >10 s just to reach `running` there.
+export async function waitFor(predicate, { timeoutMs = 30000, intervalMs = 50 } = {}) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const value = await predicate();
+    if (value) {
+      return value;
+    }
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+  throw new Error("Timed out waiting for condition.");
+}

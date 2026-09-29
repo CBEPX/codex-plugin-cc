@@ -6,7 +6,7 @@ import { spawn } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
-import { cimTree, homeEnv, initGitRepo, IS_WIN, makeTempDir, run } from "./helpers.mjs";
+import { cimTree, homeEnv, initGitRepo, IS_WIN, makeTempDir, run, waitFor } from "./helpers.mjs";
 import { loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
 import { getProcessIdentity, isPidAlive } from "../plugins/codex/scripts/lib/process.mjs";
 import { resolveClaudeSessionPath, resolveClaudeProjectsDir } from "../plugins/codex/scripts/lib/claude-session-transfer.mjs";
@@ -37,20 +37,6 @@ const FAKE_RESOLVED_SETTINGS = {
     networkAccess: false
   }
 };
-
-// 30 s: hosted Windows VMs have been seen 2-3x slower for hours; a detached
-// worker can take >10 s just to reach `running` there.
-async function waitFor(predicate, { timeoutMs = 30000, intervalMs = 50 } = {}) {
-  const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
-    const value = await predicate();
-    if (value) {
-      return value;
-    }
-    await new Promise((resolve) => setTimeout(resolve, intervalMs));
-  }
-  throw new Error("Timed out waiting for condition.");
-}
 
 const isAlive = (pid) => isPidAlive(pid) === true;
 
