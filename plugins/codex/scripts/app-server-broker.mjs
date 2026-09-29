@@ -8,7 +8,7 @@ import process from "node:process";
 import { parseArgs } from "./lib/args.mjs";
 import { BROKER_BUSY_RPC_CODE, CodexAppServerClient } from "./lib/app-server.mjs";
 import { parseBrokerEndpoint } from "./lib/broker-endpoint.mjs";
-import { clearBrokerSession, loadBrokerSession } from "./lib/broker-lifecycle.mjs";
+import { clearBrokerSessionIfEndpoint } from "./lib/broker-lifecycle.mjs";
 
 const STREAMING_METHODS = new Set(["turn/start", "review/start", "thread/compact/start"]);
 
@@ -174,9 +174,7 @@ async function main() {
   // exactly as it did in the process that spawned us.
   function clearOwnSessionRecord() {
     try {
-      if (loadBrokerSession(cwd)?.endpoint === endpoint) {
-        clearBrokerSession(cwd);
-      }
+      clearBrokerSessionIfEndpoint(cwd, endpoint);
     } catch {
       // Best-effort: never block shutdown on state-file cleanup.
     }

@@ -161,6 +161,10 @@ function describeBrokerRecordProblem(record) {
   if (record.pidIdentity != null && typeof record.pidIdentity !== "string") {
     return "pidIdentity is not a string";
   }
+  // Legacy records carry no state and count as ready.
+  if (record.state != null && !BROKER_STATES.includes(record.state)) {
+    return "state is not starting or ready";
+  }
   for (const key of ["pidFile", "logFile", "sessionDir"]) {
     if (record[key] != null && !(typeof record[key] === "string" && path.isAbsolute(record[key]))) {
       return `${key} is not an absolute path`;
@@ -168,6 +172,8 @@ function describeBrokerRecordProblem(record) {
   }
   return null;
 }
+
+const BROKER_STATES = ["starting", "ready"];
 
 export function loadBrokerSession(cwd) {
   const stateFile = resolveBrokerStateFile(cwd);
@@ -214,6 +220,19 @@ export function clearBrokerSession(cwd) {
   }
 }
 
+// The one conditional delete: compare the record's endpoint and clear it inside
+// a single state-lock section, so a replacement written by another start after
+// the caller decided cannot be deleted. `loadBrokerSessionImpl` is a test seam.
+export function clearBrokerSessionIfEndpoint(cwd, endpoint, { loadBrokerSessionImpl = loadBrokerSession } = {}) {
+  return withStateLock(cwd, () => {
+    if (loadBrokerSessionImpl(cwd)?.endpoint !== endpoint) {
+      return false;
+    }
+    clearBrokerSession(cwd);
+    return true;
+  });
+}
+
 async function isBrokerEndpointReady(endpoint) {
   if (!endpoint) {
     return false;
@@ -238,6 +257,18 @@ const CLAIM_ATTEMPTS = 3;
 const READY_SAVE_RETRY_MS = 250;
 
 export async function ensureBrokerSession(cwd, options = {}, attempt = 1) {
+  try {
+    return await ensureBrokerSessionLocked(cwd, options, attempt);
+  } catch (error) {
+    if (error?.code !== STATE_LOCK_TIMEOUT_CODE) {
+      throw error;
+    }
+    process.stderr.write(`[codex] broker start gave up: ${error.message}\n`);
+    return null;
+  }
+}
+
+async function ensureBrokerSessionLocked(cwd, options, attempt) {
   const killProcess = options.killProcess ?? terminateProcessTree;
   const isAliveImpl = options.isAliveImpl ?? isPidAlive;
   const ownsProcessImpl = options.ownsProcessImpl ?? ownsBrokerProcess;
@@ -251,9 +282,10 @@ export async function ensureBrokerSession(cwd, options = {}, attempt = 1) {
     const pid = Number.isFinite(existing.pid) ? existing.pid : null;
     const liveOwned = pid !== null && isAliveImpl(pid) === true && ownsProcessImpl(pid, existing.endpoint ?? null, options.timeoutMs);
     // A live broker that missed the 150 ms probe is not a dead one (#768), and a
-    // starting record (no pid yet) belongs to a start in progress: give either the
-    // full window before deciding it is wedged. A starting record has nothing to kill.
-    if (liveOwned || pid === null) {
+    // starting record belongs to a start in progress: give either the full window
+    // before deciding it is wedged. On exhaustion a starting record goes through
+    // the same settled/unverified teardown below as any other.
+    if (liveOwned || existing.state === "starting") {
       const ready = await waitForBrokerEndpoint(existing.endpoint, options.retryTimeoutMs ?? STALE_BROKER_RETRY_MS).catch(() => false);
       if (ready) {
         return loadBrokerSession(cwd) ?? existing;
@@ -292,10 +324,7 @@ export async function ensureBrokerSession(cwd, options = {}, attempt = 1) {
         process.stderr.write(`[codex] stale broker pid ${pid} could not be verified stopped (${outcome.reason}); its record is kept and this request uses the direct transport.\n`);
         return null;
       }
-      // Compare before delete: a concurrent caller may already have replaced it.
-      if (loadBrokerSession(cwd)?.endpoint === existing.endpoint) {
-        clearBrokerSession(cwd);
-      }
+      clearBrokerSessionIfEndpoint(cwd, existing.endpoint);
     }
   }
 
@@ -312,25 +341,31 @@ export async function ensureBrokerSession(cwd, options = {}, attempt = 1) {
   // before the broker does, and the spawn plus the pid save happen under the
   // state lock a win32 cancel holds from its broker read through its kill. A
   // record without a win32 identity refuses kills (fail closed) until the
-  // identity is saved below. The claim is made inside the lock: a record found
+  // identity is saved below; `state: "starting"` marks it until the ready save. The claim is made inside the lock: a record found
   // there (another start's, starting or ready) means this call spawns nothing.
   const base = { endpoint, pidFile, logFile, sessionDir };
+  const starting = { ...base, state: "starting" };
+  let pidSaveFailed = false;
   const child = withStateLock(cwd, () => {
     if (loadBrokerSession(cwd)) {
       return null;
     }
-    saveBrokerSession(cwd, { ...base, pid: null, pidIdentity: null });
+    saveBrokerSession(cwd, { ...starting, pid: null, pidIdentity: null });
     let spawned;
     try {
       spawned = (options.spawnBrokerProcessImpl ?? spawnBrokerProcess)({ scriptPath, cwd, endpoint, pidFile, logFile, env: options.env ?? process.env });
     } catch (error) {
-      if (loadBrokerSession(cwd)?.endpoint === endpoint) {
-        clearBrokerSession(cwd);
-      }
+      clearBrokerSessionIfEndpoint(cwd, endpoint);
       throw error;
     }
     if (Number.isInteger(spawned.pid) && spawned.pid > 0) {
-      saveBrokerSession(cwd, { ...base, pid: spawned.pid, pidIdentity: null });
+      try {
+        (options.saveBrokerSessionImpl ?? saveBrokerSession)(cwd, { ...starting, pid: spawned.pid, pidIdentity: null });
+      } catch (error) {
+        // The child is running behind a pid-null record: it is torn down below.
+        process.stderr.write(`[codex] broker pid ${spawned.pid} could not be recorded: ${error.message}\n`);
+        pidSaveFailed = true;
+      }
     }
     return spawned;
   });
@@ -372,8 +407,8 @@ export async function ensureBrokerSession(cwd, options = {}, attempt = 1) {
 
   // Recorded for later teardowns, which only trust a stored pid by identity.
   let pidIdentity = getProcessIdentityImpl(child.pid ?? Number.NaN);
-  if (pidIdentity && Number.isInteger(child.pid) && child.pid > 0) {
-    saveClaimed({ ...base, pid: child.pid, pidIdentity }, "identity");
+  if (!pidSaveFailed && pidIdentity && Number.isInteger(child.pid) && child.pid > 0) {
+    saveClaimed({ ...starting, pid: child.pid, pidIdentity }, "identity");
   }
 
   const abandonStart = async () => {
@@ -403,24 +438,24 @@ export async function ensureBrokerSession(cwd, options = {}, attempt = 1) {
     }
     if (exited()) {
       teardownBrokerSession({ ...base });
-      withStateLock(cwd, () => {
-        if (loadBrokerSession(cwd)?.endpoint === endpoint) {
-          clearBrokerSession(cwd);
-        }
-      });
+      clearBrokerSessionIfEndpoint(cwd, endpoint);
       return null;
     }
     // Kept, files and record, with an identity when one can still be read, so
     // SessionEnd or the next start can kill it verifiably.
     if (!pidIdentity) {
       pidIdentity = getProcessIdentityImpl(child.pid);
-      if (pidIdentity) {
-        saveClaimed({ ...base, pid: child.pid, pidIdentity }, "identity");
+      if (pidIdentity && !pidSaveFailed) {
+        saveClaimed({ ...starting, pid: child.pid, pidIdentity }, "identity");
       }
     }
     process.stderr.write(`[codex] broker pid ${child.pid} was not stopped after the failed start; its record and files are kept.\n`);
     return null;
   };
+
+  if (pidSaveFailed) {
+    return await abandonStart();
+  }
 
   const ready = await waitForBrokerEndpoint(endpoint, options.timeoutMs ?? 2000);
   if (!ready) {
@@ -428,10 +463,8 @@ export async function ensureBrokerSession(cwd, options = {}, attempt = 1) {
   }
 
   const session = {
-    endpoint,
-    pidFile,
-    logFile,
-    sessionDir,
+    ...base,
+    state: "ready",
     pid: child.pid ?? null,
     pidIdentity
   };
@@ -472,8 +505,8 @@ export function ownsBrokerProcess(pid, endpoint, timeoutMs, commandLine = proces
 // `command-line-match` (proven ours, signal attempted), `identity-mismatch`,
 // `identity-unavailable` (refused), `process-missing` (Windows: provably gone
 // before anything was signalled), `kill-failed` (the probe or kill threw, or a
-// Windows kill left survivors), `starting` (a starting record, no pid yet: its
-// broker is being spawned; kept with its files on every platform).
+// Windows kill left survivors), `starting` (`state: "starting"`, pid or not: its
+// broker is being started; kept with its files on every platform).
 export function teardownBrokerSession({
   endpoint = null,
   pidFile,
@@ -487,10 +520,10 @@ export function teardownBrokerSession({
   platform = process.platform,
   keepOnUnknown = false,
   keepOnUnknownAnyPlatform = false,
-  starting = false,
+  state = undefined,
   terminateRecordedProcessImpl = terminateRecordedProcess
 }) {
-  if (starting) {
+  if (state === "starting") {
     return { signalled: false, reason: "starting", kept: true };
   }
   let signalled = false;
@@ -512,9 +545,10 @@ export function teardownBrokerSession({
     }
   }
 
-  // win32 only: an outcome that proves nothing about the broker — no probe, a
-  // kill that did not verify, survivors — keeps every record when the caller
-  // asks (SessionEnd), so the next SessionEnd can try again. A missing or
+  // An outcome that proves nothing about the broker — no probe, a kill that did
+  // not verify, survivors — keeps every record when the caller asks (SessionEnd
+  // on win32 by default, any platform with `keepOnUnknownAnyPlatform`), so the
+  // next SessionEnd can try again. A missing or
   // foreign process is a settled answer and is cleaned up as before; a dead
   // root does not settle an unknown outcome.
   const unknown =

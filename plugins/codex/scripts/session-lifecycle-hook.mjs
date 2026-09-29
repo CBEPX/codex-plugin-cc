@@ -7,7 +7,7 @@ import { pathToFileURL } from "node:url";
 import { isPidAlive, terminateProcessTree, terminateRecordedProcess, workerCommandLine } from "./lib/process.mjs";
 import { BROKER_ENDPOINT_ENV } from "./lib/app-server.mjs";
 import {
-  clearBrokerSession,
+  clearBrokerSessionIfEndpoint,
   LOG_FILE_ENV,
   loadBrokerSession,
   PID_FILE_ENV,
@@ -350,7 +350,7 @@ async function handleSessionEnd(input) {
   // its pid and identity meanwhile. Only a record for the endpoint that answered
   // the handshake counts (another endpoint is a replacement broker); a record the
   // broker already cleared falls back to the snapshot (the kill is verified). A
-  // record without a pid is a start in progress and is kept.
+  // record in the starting state is a start in progress and is kept.
   const current = recordedBroker ? loadBrokerSession(cwd) : null;
   const record = current?.endpoint === brokerEndpoint ? current : recordedBroker;
   const pid = record?.pid ?? null;
@@ -362,7 +362,7 @@ async function handleSessionEnd(input) {
     sessionDir,
     pid,
     pidIdentity,
-    starting: Boolean(record) && pid === null,
+    state: record?.state,
     killProcess: terminateProcessTree,
     // posix halved: a broker gone from its group is re-proved with a second
     // probe. win32: one PowerShell run does verify and kill, hence the kill step.
@@ -381,8 +381,12 @@ async function handleSessionEnd(input) {
   // ownership record, which is exactly what the broker's own endpoint-guarded
   // `clearOwnSessionRecord` avoids on its side. A kept record is kept here too.
   // An unreadable record (recordedBroker null) is left for whoever can read it.
-  if (recordedBroker && !teardown.kept && loadBrokerSession(cwd)?.endpoint === brokerEndpoint) {
-    clearBrokerSession(cwd);
+  if (recordedBroker && !teardown.kept) {
+    try {
+      clearBrokerSessionIfEndpoint(cwd, brokerEndpoint);
+    } catch (error) {
+      process.stderr.write(`[codex] Broker record not cleared: ${error.message}\n`);
+    }
   }
 }
 
