@@ -4,6 +4,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
 
+import { leakCount } from "../scripts/check-leaks.mjs";
+
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PLUGIN_ROOT = path.join(ROOT, "plugins", "codex");
 
@@ -484,4 +486,12 @@ test("the SessionEnd hook timeout stays above the hook's own budget", () => {
     timeoutSeconds * 1000 > budgetMs + readMs,
     `hooks.json SessionEnd timeout (${timeoutSeconds}s) must exceed the stdin read (${readMs}ms) plus the budget (${budgetMs}ms)`
   );
+});
+
+test("leakCount accepts only LEAK* COUNT with a matching count", () => {
+  assert.equal(leakCount(["COUNT 0"]), 0);
+  assert.equal(leakCount(["LEAK 4242 7", "LEAK 4243 7", "COUNT 2"]), 2);
+  for (const junk of [[], ["LEAK garbage\tjunk", "COUNT 0"], ["COUNT 3", "COUNT 0"], ["COUNT 0", "JUNK"], ["LEAK 4242 7", "COUNT 0"], ["LEAK 4242 7"], ["COUNT 1"]]) {
+    assert.equal(leakCount(junk), null, JSON.stringify(junk));
+  }
 });

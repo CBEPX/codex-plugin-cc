@@ -25,19 +25,19 @@ import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
 import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
 import { loadModelCatalog, resolveModelAlias, supportedEfforts } from "./lib/model-catalog.mjs";
-import { binaryAvailable, getProcessIdentity, isPidAlive, terminateRecordedProcess, workerCommandLine } from "./lib/process.mjs";
+import { binaryAvailable, isPidAlive, terminateRecordedProcess, workerCommandLine } from "./lib/process.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import {
   consumeJobRequestFile,
   generateJobId,
   getConfig,
   listJobs,
+  recordWorkerPid,
   removeJobPidFile,
   redactConfigValues,
   removeJobRequestFile,
   resolveJobPid,
   setConfig,
-  updateJobPid,
   upsertJob,
   withStateLock,
   writeJobFile,
@@ -45,7 +45,13 @@ import {
 } from "./lib/state.mjs";
 import {
   buildSingleJobSnapshot,
+  brokerExclusion,
+  brokerPresence,
   buildStatusSnapshot,
+  cancelDecision,
+  commitCancel,
+  emitCancelPending,
+  isWorkerTerminalRecord,
   readStoredJob,
   resolveCancelableJob,
   resolveResultJob,
@@ -951,11 +957,12 @@ function enqueueBackgroundTask(cwd, job, request) {
   }
 
   // The record was written before the spawn, so this is the first moment the
-  // worker's pid exists. `updateJobPid` never touches the job file — the worker
-  // owns it — it writes an atomic `jobs/<id>.pid` sidecar plus a pid-only index
-  // patch. Without it a `cancel` inside the queued window signals nothing and
-  // the reaper cannot tell a dead queued worker from a live one.
-  updateJobPid(job.workspaceRoot, job.id, child.pid, getProcessIdentity(child.pid));
+  // worker's pid exists. `recordWorkerPid` never touches the job file — the
+  // worker owns it — it writes an atomic `jobs/<id>.pid` sidecar plus a pid-only
+  // index patch, the pid first and the identity once probed. Without it a
+  // `cancel` inside the queued window signals nothing and the reaper cannot tell
+  // a dead queued worker from a live one.
+  recordWorkerPid(job.workspaceRoot, job.id, child.pid);
 
   return {
     payload: {
@@ -1339,27 +1346,43 @@ async function handleCancel(argv) {
 
   // Only a pid that is provably still this job's worker is signalled (#743).
   const { pid, identity } = resolveJobPid(workspaceRoot, job);
-  const kill = terminateRecordedProcess(pid, { identity, commandLineMatch: workerCommandLine(job.id) });
+  // win32: the broker read, the kill and the record write share one state lock.
+  // A broker saves its starting record under the same lock before it spawns, so
+  // none can start between this read and the kill script's snapshot. The kill
+  // is bounded like SessionEnd's win32 step, under the other takers' lock wait.
+  if (process.platform === "win32") {
+    withStateLock(workspaceRoot, () => finishCancel({ workspaceRoot, job, existing, interrupt, pid, identity, options }));
+  } else {
+    finishCancel({ workspaceRoot, job, existing, interrupt, pid, identity, options });
+  }
+}
+
+const WIN32_CANCEL_KILL_MS = 4000;
+
+function finishCancel({ workspaceRoot, job, existing, interrupt, pid, identity, options }) {
+  const win32 = process.platform === "win32";
+  const broker = win32 ? brokerPresence(workspaceRoot) : null;
+  const exclude = brokerExclusion(broker);
+  // A broker record without a win32 identity (a starting one included) cannot be
+  // excluded safely: refuse rather than risk killing the shared broker under the worker.
+  const kill = broker && exclude === null
+    ? { attempted: false, delivered: false, reason: "identity-unavailable" }
+    : terminateRecordedProcess(pid, { identity, commandLineMatch: workerCommandLine(job.id), exclude: exclude ?? [], ...(win32 ? { timeoutMs: WIN32_CANCEL_KILL_MS } : {}) });
   // A worker we may not signal, or whose signal reached nothing, but that is
   // still alive is not cancelled: the job stays running, and the sidecar stays
   // so a later cancel or the reaper can still find it.
-  if (pid && (!kill.attempted || !kill.delivered) && isPidAlive(pid) === true) {
-    const reason = kill.attempted ? "not-delivered" : kill.reason;
-    const pending = `cancellation not confirmed: worker pid ${pid} left running (${reason})`;
-    appendLogLine(job.logFile, pending);
+  // win32, the root was gone before the kill (241): only the worker's own terminal
+  // record, read under the kill's lock, proves its tree closed.
+  const workerProved = win32 && kill.reason === "process-missing" && isWorkerTerminalRecord(readStoredJob(workspaceRoot, job.id));
+  const decision = cancelDecision({ pid, kill, alive: isPidAlive(pid), workerProved });
+  if (decision.pending) {
+    emitCancelPending(decision, pid, job.id, { json: options.json, appendLog: (line) => appendLogLine(job.logFile, line) });
     process.exitCode = 1;
-    outputCommandResult(
-      { jobId: job.id, status: "running", cancellationPending: true, reason },
-      `${pending}\nThe turn interrupt was sent; the job stays running until the worker exits. Re-run cancel or wait for result.\n`,
-      options.json
-    );
     return;
   }
-  const leftRunning = pid && !kill.attempted ? `worker pid ${pid} left running: ${kill.reason}` : null;
-  if (leftRunning) {
-    appendLogLine(job.logFile, leftRunning);
-  }
-  appendLogLine(job.logFile, "Cancelled by user.");
+  // win32: a root proven gone with no orphans was not left running.
+  const goneClean = win32 && kill.reason === "process-missing";
+  const leftRunning = pid && !kill.attempted && !goneClean ? `worker pid ${pid} left running: ${kill.reason}` : null;
 
   const completedAt = nowIso();
   const nextJob = {
@@ -1372,34 +1395,19 @@ async function handleCancel(argv) {
     completedAt,
     errorMessage: "Cancelled by user."
   };
-
-  // Deleting the artifacts and writing the terminal record is one step: another
-  // process's `saveState` prune works off a diff of the index, so a cancel split
-  // across that write can have the record it just wrote pruned away — or the
-  // payload it just deleted counted as still owned.
-  withStateLock(workspaceRoot, () => {
-    // A worker cancelled inside the queued window may never have consumed its
-    // private payload, and a cancelled job is terminal — the reaper will never
-    // look at it again — so the 0600 file (possibly holding `--config` secrets)
-    // has to be released here.
-    removeJobRequestFile(workspaceRoot, job.id);
-    removeJobPidFile(workspaceRoot, job.id);
-    writeJobFile(workspaceRoot, job.id, {
-      ...(readStoredJob(workspaceRoot, job.id) ?? existing),
-      ...nextJob,
-      cancelledAt: completedAt
-    });
-    upsertJob(workspaceRoot, {
-      id: job.id,
-      status: "cancelled",
-      phase: "cancelled",
-      pid: null,
-      pidIdentity: null,
-      requestFile: null,
-      errorMessage: "Cancelled by user.",
-      completedAt
-    });
-  });
+  const kept = commitCancel(workspaceRoot, job, nextJob, existing, { leftRunning, causedByCancel: interrupt.interrupted === true || (kill.attempted === true && kill.delivered === true), log: (line) => appendLogLine(job.logFile, line) });
+  const common = {
+    jobId: job.id,
+    title: job.title,
+    turnInterruptAttempted: interrupt.attempted,
+    turnInterrupted: interrupt.interrupted
+  };
+  if (kept) {
+    // Finished before this cancel could write: the stored outcome stands.
+    const text = `Job ${job.id} already ${kept.status}; its record is kept.\n`;
+    outputCommandResult({ ...common, status: kept.status, cancellationPending: false }, text, options.json);
+    return;
+  }
 
   const payload = {
     jobId: job.id,

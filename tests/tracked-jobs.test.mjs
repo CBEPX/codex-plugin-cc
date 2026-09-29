@@ -7,10 +7,11 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { makeTempDir, run } from "./helpers.mjs";
 import { getProcessIdentity } from "../plugins/codex/scripts/lib/process.mjs";
-import { reapDeadJobs, runTrackedJob } from "../plugins/codex/scripts/lib/tracked-jobs.mjs";
+import { reapDeadJobs, resetWin32ProbeMemo, runTrackedJob } from "../plugins/codex/scripts/lib/tracked-jobs.mjs";
 import {
   listJobs,
   readJobFile,
+  recordWorkerPid,
   resolveJobFile,
   resolveJobPid,
   resolveJobPidFile,
@@ -38,6 +39,8 @@ function spawnDeadPid() {
   assert.equal(result.status, 0);
   return result.pid;
 }
+
+test.beforeEach(() => resetWin32ProbeMemo());
 
 test("reapDeadJobs marks a running job with a dead pid as failed", () => {
   const workspace = makeTempDir();
@@ -124,6 +127,7 @@ test("registerWorkerCrashGuard marks the job failed when the worker dies on an u
   assert.equal(stored.status, "failed");
   assert.match(stored.errorMessage, /unhandledRejection/);
   assert.match(stored.errorMessage, /boom/);
+  assert.equal(stored.workerClosed, undefined, "the crash guard never proves a closed worker");
 });
 
 test("registerWorkerCrashGuard does not rewrite a cancelled job when the worker is SIGTERMed", async () => {
@@ -400,12 +404,34 @@ test("a terminal write releases the job's private request payload", async () => 
   assert.equal(fs.existsSync(resolveJobRequestFile(workspace, "job-thrown")), false, "a failed job must not keep its payload");
 });
 
+test("runTrackedJob sets workerClosed only on its cooperative terminal write, after the runner returned", async () => {
+  const workspace = makeTempDir();
+  const job = { id: "job-marker", status: "queued", workspaceRoot: workspace, logFile: null };
+  seedJob(workspace, job);
+  const seen = [];
+  await runTrackedJob(job, async () => {
+    // Still inside the runner (the app-server client is not closed yet): no marker.
+    seen.push(readJobFile(resolveJobFile(workspace, job.id)));
+    return { exitStatus: 0, payload: {}, rendered: "ok\n", summary: "ok" };
+  });
+  assert.equal(seen[0].status, "running");
+  assert.equal(seen[0].workerClosed, undefined);
+  assert.equal(readJobFile(resolveJobFile(workspace, job.id)).workerClosed, true);
+  assert.equal(listJobs(workspace).find((entry) => entry.id === job.id).workerClosed, true);
+
+  // A thrown runner (client state unknown) never claims it.
+  const thrown = { id: "job-marker-thrown", status: "queued", workspaceRoot: workspace, logFile: null };
+  seedJob(workspace, thrown);
+  await assert.rejects(runTrackedJob(thrown, async () => { throw new Error("boom"); }), /boom/);
+  assert.equal(readJobFile(resolveJobFile(workspace, thrown.id)).workerClosed, undefined);
+});
+
 // A live pid is not proof of a live worker: the OS may have handed the number to
 // something else (#743). The recorded identity tells them apart.
 test("reapDeadJobs fails a running job whose pid was recycled by another process", () => {
   const workspace = makeTempDir();
   seedJob(workspace, { id: "job-recycled", status: "running", phase: "delegating", pid: process.pid, pidIdentity: "linux:not-this-process", logFile: null });
-  const reaped = reapDeadJobs(workspace, listJobs(workspace), { getProcessIdentityImpl: () => "linux:something-else" });
+  const reaped = reapDeadJobs(workspace, listJobs(workspace), { platform: "linux", getProcessIdentityImpl: () => "linux:something-else" });
   assert.equal(reaped[0].status, "failed");
   assert.match(reaped[0].errorMessage, /pid reused/);
   assert.equal(reaped[0].pidIdentity, null);
@@ -414,14 +440,14 @@ test("reapDeadJobs fails a running job whose pid was recycled by another process
 test("reapDeadJobs leaves a running job alone when the identity probe fails", () => {
   const workspace = makeTempDir();
   seedJob(workspace, { id: "job-probe-fails", status: "running", phase: "delegating", pid: process.pid, pidIdentity: "linux:x", logFile: null });
-  const reaped = reapDeadJobs(workspace, listJobs(workspace), { getProcessIdentityImpl: () => { throw new Error("ps unavailable"); } });
+  const reaped = reapDeadJobs(workspace, listJobs(workspace), { platform: "linux", getProcessIdentityImpl: () => { throw new Error("ps unavailable"); } });
   assert.equal(reaped[0].status, "running");
 });
 
 test("reapDeadJobs keeps a running job whose identity still matches", () => {
   const workspace = makeTempDir();
   seedJob(workspace, { id: "job-same", status: "running", phase: "delegating", pid: process.pid, pidIdentity: "linux:same", logFile: null });
-  const reaped = reapDeadJobs(workspace, listJobs(workspace), { getProcessIdentityImpl: () => "linux:same" });
+  const reaped = reapDeadJobs(workspace, listJobs(workspace), { platform: "linux", getProcessIdentityImpl: () => "linux:same" });
   assert.equal(reaped[0].status, "running");
 });
 
@@ -487,9 +513,166 @@ test("runTrackedJob records the worker identity and clears it with the pid", asy
     return { exitStatus: 0, payload: {}, rendered: "", summary: "" };
   });
   assert.equal(running.pid, process.pid);
-  assert.equal(running.pidIdentity, process.platform === "win32" ? null : getProcessIdentity(process.pid));
+  const ownIdentity = getProcessIdentity(process.pid);
+  assert.equal(running.pidIdentity, ownIdentity);
+  if (process.platform === "win32") {
+    assert.match(String(running.pidIdentity), /^win32:\d+$/, "a Windows worker records its start-time identity");
+  }
   const done = readJobFile(resolveJobFile(workspace, "job-identity"));
   assert.deepEqual([done.pid, done.pidIdentity], [null, null]);
   const indexed = listJobs(workspace).find((entry) => entry.id === "job-identity");
   assert.deepEqual([indexed.pid, indexed.pidIdentity], [null, null]);
+});
+
+test("reapDeadJobs on win32 probes the live identities in one batch after the cheap checks and fails only the reused pid", () => {
+  const workspace = makeTempDir();
+  const child = spawn(process.execPath, ["-e", "setTimeout(()=>{}, 20000)"], { stdio: "ignore" });
+  try {
+    const jobs = [
+      { id: "job-a", status: "running", pid: process.pid, pidIdentity: "win32:1" },
+      { id: "job-b", status: "running", pid: child.pid, pidIdentity: "win32:2" },
+      { id: "job-c", status: "completed", pid: 1, pidIdentity: "win32:9" }
+    ];
+    for (const job of jobs) seedJob(workspace, job);
+    const probes = [];
+    const reaped = reapDeadJobs(workspace, jobs, {
+      platform: "win32",
+      getProcessIdentitiesImpl: (pids) => { probes.push([...pids].sort((a, b) => a - b)); return new Map(pids.map((pid) => [pid, pid === process.pid ? "win32:1" : "win32:other"])); }
+    });
+    assert.deepEqual(probes, [[process.pid, child.pid].sort((a, b) => a - b)], "one probe, only for records that passed the terminal/liveness checks");
+    assert.equal(reaped.find((j) => j.id === "job-a").status, "running");
+    assert.equal(reaped.find((j) => j.id === "job-b").status, "failed");
+    assert.match(reaped.find((j) => j.id === "job-b").errorMessage, /pid reused/);
+  } finally {
+    child.kill("SIGKILL");
+  }
+});
+
+test("reapDeadJobs on win32 memoises a matching probe for 2 s and never reuses a null", () => {
+  const workspace = makeTempDir();
+  const jobs = [{ id: "j", status: "running", pid: process.pid, pidIdentity: "win32:1" }];
+  seedJob(workspace, jobs[0]);
+  for (const answer of ["win32:1", null]) {
+    resetWin32ProbeMemo();
+    let clock = 1000;
+    let calls = 0;
+    const options = { platform: "win32", now: () => clock, getProcessIdentitiesImpl: (pids) => { calls += 1; return new Map(pids.map((pid) => [pid, answer])); } };
+    reapDeadJobs(workspace, jobs, options);
+    clock += 1999;
+    reapDeadJobs(workspace, jobs, options);
+    assert.equal(calls, answer === null ? 2 : 1, `within the TTL (${answer}) only a match is served from the memo`);
+    clock += 2;
+    reapDeadJobs(workspace, jobs, options);
+    assert.equal(calls, answer === null ? 3 : 2, `after the TTL (${answer}) it probes again`);
+  }
+});
+
+test("reapDeadJobs on win32 reuses a memo only for a cached match; a different recorded identity is probed fresh", () => {
+  const workspace = makeTempDir();
+  resetWin32ProbeMemo();
+  let clock = 1000;
+  let calls = 0;
+  const options = { platform: "win32", now: () => clock, getProcessIdentitiesImpl: (pids) => { calls += 1; return new Map(pids.map((pid) => [pid, "win32:A"])); } };
+  const a = { id: "j-a", status: "running", pid: process.pid, pidIdentity: "win32:A" };
+  seedJob(workspace, a);
+  reapDeadJobs(workspace, [a], options);
+  reapDeadJobs(workspace, [a], options);
+  assert.equal(calls, 1, "a cached match skips the probe");
+  const b = { id: "j-b", status: "running", pid: process.pid, pidIdentity: "win32:B" };
+  seedJob(workspace, b);
+  clock += 100;
+  const reaped = reapDeadJobs(workspace, [b], options);
+  assert.equal(calls, 2, "the cached identity differs from the record: probe fresh");
+  assert.equal(reaped[0].status, "failed", "the fresh probe (not the cache) judges the reused pid");
+  // A cached mismatch never changes job state on its own.
+  resetWin32ProbeMemo();
+  calls = 0;
+  const mismatch = { platform: "win32", now: () => clock, getProcessIdentitiesImpl: (pids) => { calls += 1; return new Map(pids.map((pid) => [pid, calls === 1 ? "win32:X" : "win32:B"])); } };
+  const c = { id: "j-c", status: "running", pid: process.pid, pidIdentity: "win32:B" };
+  seedJob(workspace, c);
+  reapDeadJobs(workspace, [c], mismatch);
+  const d = { id: "j-d", status: "running", pid: process.pid, pidIdentity: "win32:B" };
+  seedJob(workspace, d);
+  const again = reapDeadJobs(workspace, [d], mismatch);
+  assert.equal(calls, 2);
+  assert.equal(again[0].status, "running", "the second probe matched; the earlier mismatch was not trusted");
+});
+
+test("reapDeadJobs on win32 leaves every job alone when the batch answers nothing", () => {
+  const workspace = makeTempDir();
+  const jobs = [{ id: "job-x", status: "running", pid: process.pid, pidIdentity: "win32:1" }];
+  seedJob(workspace, jobs[0]);
+  const reaped = reapDeadJobs(workspace, jobs, { platform: "win32", getProcessIdentitiesImpl: () => new Map() });
+  assert.equal(reaped[0].status, "running");
+});
+
+test("reapDeadJobs on posix keeps its per-pid probe and per-pid budget", () => {
+  const seen = [];
+  let clock = 0;
+  const workspace = makeTempDir();
+  const job = { id: "j", status: "running", pid: process.pid, pidIdentity: "x:1" };
+  seedJob(workspace, job);
+  reapDeadJobs(workspace, [job], {
+    platform: "linux",
+    remainingMs: () => 1500 - clock,
+    getProcessIdentityImpl: (pid, opts) => { seen.push(opts.timeoutMs); clock += 700; return "x:1"; },
+    getProcessIdentitiesImpl: () => assert.fail("posix must not batch")
+  });
+  assert.deepEqual(seen, [1500]);
+});
+
+// A 2 s budget is shorter than a cold PowerShell start (up to 3 s): the probe
+// times out, the launcher's breaker opens for a minute, and the cancel that
+// follows is refused as identity-unavailable without ever running.
+test("reapDeadJobs on win32 gives the batch probe a cold-start budget bounded by the deadline", () => {
+  const seen = [];
+  const impl = (pids, opts) => { seen.push(opts.timeoutMs); return new Map(pids.map((p) => [p, null])); };
+  const workspace = makeTempDir();
+  const jobs = [{ id: "j", status: "running", pid: process.pid, pidIdentity: "win32:1" }];
+  seedJob(workspace, jobs[0]);
+  reapDeadJobs(workspace, jobs, { platform: "win32", getProcessIdentitiesImpl: impl });
+  resetWin32ProbeMemo();
+  reapDeadJobs(workspace, jobs, { platform: "win32", getProcessIdentitiesImpl: impl, remainingMs: () => 1500 });
+  assert.deepEqual(seen, [6000, 1500]);
+});
+
+// A cancel between the spawn and a slow (win32 PowerShell) identity probe must
+// already find the worker's pid: the sidecar is written first, the identity after.
+test("recordWorkerPid writes the pid sidecar before the identity probe runs", () => {
+  const workspace = makeTempDir();
+  seedJob(workspace, { id: "job-spawned", status: "queued", pid: null, logFile: null });
+  let seenDuringProbe = null;
+  recordWorkerPid(workspace, "job-spawned", 4242, {
+    getProcessIdentityImpl: (pid) => {
+      seenDuringProbe = resolveJobPid(workspace, { id: "job-spawned", status: "queued", pid: null });
+      return `win32:${pid}`;
+    }
+  });
+  assert.deepEqual(seenDuringProbe, { pid: 4242, identity: null }, "the pid must be recorded before the probe returns");
+  assert.deepEqual(resolveJobPid(workspace, { id: "job-spawned", status: "queued", pid: null }), { pid: 4242, identity: "win32:4242" });
+  const indexed = listJobs(workspace).find((entry) => entry.id === "job-spawned");
+  assert.deepEqual([indexed.pid, indexed.pidIdentity], [4242, "win32:4242"]);
+});
+
+// A cancel that landed between the spawn and the worker's start already wrote
+// the terminal record: the worker must not take it over and run the turn.
+test("runTrackedJob refuses a job that is already cancelled and leaves its record alone", async () => {
+  const workspace = makeTempDir();
+  const cancelled = { id: "job-cancelled", workspaceRoot: workspace, status: "cancelled", phase: "cancelled", pid: null, errorMessage: "Cancelled by user.", logFile: null };
+  seedJob(workspace, cancelled);
+  writeJobPidFile(workspace, "job-cancelled", 4243, null);
+  writeJobRequestFile(workspace, "job-cancelled", { prompt: "x" });
+  let ran = false;
+  const execution = await runTrackedJob(cancelled, async () => {
+    ran = true;
+    return { exitStatus: 0, payload: {}, rendered: "", summary: "" };
+  });
+  assert.equal(ran, false, "the turn must not run");
+  assert.equal(execution, null);
+  const stored = readJobFile(resolveJobFile(workspace, "job-cancelled"));
+  assert.equal(stored.status, "cancelled");
+  assert.equal(stored.startedAt, undefined, "no running record was written");
+  assert.equal(listJobs(workspace).find((entry) => entry.id === "job-cancelled").status, "cancelled");
+  assert.equal(fs.existsSync(resolveJobPidFile(workspace, "job-cancelled")), false);
+  assert.equal(fs.existsSync(resolveJobRequestFile(workspace, "job-cancelled")), false);
 });

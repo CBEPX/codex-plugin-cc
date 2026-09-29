@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import process from "node:process";
 
-import { getProcessIdentity, isPidAlive, processCommandLine } from "./process.mjs";
+import { getProcessIdentities, getProcessIdentity, isPidAlive, processCommandLine } from "./process.mjs";
 
 import {
   readJobFile,
@@ -152,6 +152,10 @@ export function createProgressReporter({ stderr = false, logFile = null, onEvent
   };
 }
 
+function isActiveStatus(status) {
+  return status === "queued" || status === "running";
+}
+
 function readStoredJobOrNull(workspaceRoot, jobId) {
   const jobFile = resolveJobFile(workspaceRoot, jobId);
   if (!fs.existsSync(jobFile)) {
@@ -174,17 +178,35 @@ function writeTerminalUnlessCancelled(workspaceRoot, jobId, logFile, write) {
 }
 
 export async function runTrackedJob(job, runner, options = {}) {
+  // Probed outside the lock: on win32 it is a PowerShell start.
+  const pidIdentity = getProcessIdentity(process.pid);
   const runningRecord = {
     ...job,
     status: "running",
     startedAt: nowIso(),
     phase: "starting",
     pid: process.pid,
-    pidIdentity: getProcessIdentity(process.pid),
+    pidIdentity,
     logFile: options.logFile ?? job.logFile ?? null
   };
-  writeJobFile(job.workspaceRoot, job.id, runningRecord);
-  upsertJob(job.workspaceRoot, runningRecord);
+  // A cancel between the spawn and here already wrote a terminal record: the
+  // check and the takeover share the lock so none can land in between, and a
+  // job that is no longer queued or running is never run.
+  const refused = withStateLock(job.workspaceRoot, () => {
+    const stored = readStoredJobOrNull(job.workspaceRoot, job.id);
+    if (stored && !isActiveStatus(stored.status)) {
+      appendLogLine(runningRecord.logFile, `Worker started after the job was ${stored.status}; the turn was not run.`);
+      removeJobPidFile(job.workspaceRoot, job.id);
+      removeJobRequestFile(job.workspaceRoot, job.id);
+      return true;
+    }
+    writeJobFile(job.workspaceRoot, job.id, runningRecord);
+    upsertJob(job.workspaceRoot, runningRecord);
+    return false;
+  });
+  if (refused) {
+    return null;
+  }
 
   try {
     const execution = await runner();
@@ -206,6 +228,10 @@ export async function runTrackedJob(job, runner, options = {}) {
         pidIdentity: null,
         phase: completionStatus === "completed" ? "done" : "failed",
         completedAt,
+        // `runner()` resolved, so withAppServer already awaited client.close():
+        // the direct child is gone or the broker socket released. Only this
+        // cooperative write proves it (crash guard and reaper never set it).
+        workerClosed: true,
         result: execution.payload,
         rendered: execution.rendered
       });
@@ -220,6 +246,7 @@ export async function runTrackedJob(job, runner, options = {}) {
         phase: completionStatus === "completed" ? "done" : "failed",
         pid: null,
         pidIdentity: null,
+        workerClosed: true,
         completedAt
       });
       removeJobPidFile(job.workspaceRoot, job.id);
@@ -335,7 +362,7 @@ function markJobDeadLocked(workspaceRoot, jobSummary, errorMessage) {
   return record;
 }
 
-const DEAD_WORKER_MESSAGE = "worker exited before completing";
+export const DEAD_WORKER_MESSAGE = "worker exited before completing";
 
 // How long a queued job may sit without a recorded pid before it counts as dead.
 // `enqueueBackgroundTask` patches the pid in immediately after the spawn, so the
@@ -369,9 +396,19 @@ function isQueuedWithoutWorker(job, pid) {
 // Below this there is no point starting another lock wait.
 const REAP_MIN_STEP_MS = 100;
 const IDENTITY_PROBE_MS = 2000;
+const WIN32_BATCH_PROBE_MS = 6000; // one cold PowerShell start (<=3 s) with margin
+// win32 polls (`status`, `--await`) reap on every tick; a live pid's identity
+// does not change, so a fresh answer (a null too) is reused for this long.
+// Only the reaper reads it: a kill re-verifies in its own script.
+const WIN32_PROBE_MEMO_MS = 2000;
+const win32ProbeMemo = new Map();
+
+export function resetWin32ProbeMemo() {
+  win32ProbeMemo.clear();
+}
 
 /**
- * @param {{ lockWaitMs?: number, remainingMs?: () => number, getProcessIdentityImpl?: typeof getProcessIdentity, processCommandLineImpl?: typeof processCommandLine, platform?: string }} [options] Bounds the
+ * @param {{ lockWaitMs?: number, remainingMs?: () => number, getProcessIdentityImpl?: typeof getProcessIdentity, getProcessIdentitiesImpl?: typeof getProcessIdentities, processCommandLineImpl?: typeof processCommandLine, platform?: string, now?: () => number }} [options] Bounds the
  * reaper's own state-lock waits. Each dead job costs one acquisition, so a caller
  * working to a deadline passes `remainingMs` and every wait is clamped to what is
  * left of it; once that is spent the remaining jobs are left for the next run
@@ -382,8 +419,10 @@ export function reapDeadJobs(workspaceRoot, jobs, options = {}) {
     lockWaitMs,
     remainingMs,
     getProcessIdentityImpl = getProcessIdentity,
+    getProcessIdentitiesImpl = getProcessIdentities,
     processCommandLineImpl = processCommandLine,
-    platform = process.platform
+    platform = process.platform,
+    now = () => performance.now()
   } = options;
   const waitFor = () => {
     if (!remainingMs) {
@@ -392,6 +431,64 @@ export function reapDeadJobs(workspaceRoot, jobs, options = {}) {
     const left = Math.max(0, remainingMs());
     return lockWaitMs === undefined ? left : Math.min(lockWaitMs, left);
   };
+  const probeMs = () => (remainingMs ? Math.min(IDENTITY_PROBE_MS, remainingMs()) : IDENTITY_PROBE_MS);
+  // One PowerShell for the whole batch may start cold (up to 3 s on a slow
+  // runner); a budget under that trips the launcher's breaker and blocks the
+  // next minute of kills. Still bounded by the caller's deadline.
+  const batchProbeMs = () => (remainingMs ? Math.min(WIN32_BATCH_PROBE_MS, remainingMs()) : WIN32_BATCH_PROBE_MS);
+  // The jobs the identity probe can judge: still running by the index and on
+  // disk, with a live pid that carries an identity — the same tests the loop
+  // below applies, so the batch never probes a pid the loop would not.
+  const liveIdentityCandidate = (job) => {
+    if (job.status !== "running" && job.status !== "queued") {
+      return null;
+    }
+    const stored = readStoredJobOrNull(workspaceRoot, job.id);
+    if (stored && stored.status !== "running" && stored.status !== "queued") {
+      return null;
+    }
+    const { pid, identity } = resolveJobPid(workspaceRoot, job);
+    if (!pid || !identity || isPidAlive(pid) === false || isQueuedWithoutWorker(job, pid)) {
+      return null;
+    }
+    return { pid, identity };
+  };
+  // win32: one PowerShell for every candidate instead of one per job — a cold
+  // start costs up to 3 s against a 12 s SessionEnd. posix probes stay per job
+  // (a /proc read or one ps). A batch that fails judges nothing.
+  // ponytail: each win32 candidate's job file is read twice (here and in the loop).
+  let batch = new Map();
+  if (platform === "win32") {
+    const candidates = jobs.map(liveIdentityCandidate).filter(Boolean);
+    const identityByPid = new Map(candidates.map((candidate) => [candidate.pid, candidate.identity]));
+    const allPids = [...identityByPid.keys()];
+    const at = now();
+    const candidatePids = [];
+    for (const pid of allPids) {
+      const memo = win32ProbeMemo.get(pid);
+      // Only a cached match is reused: a cached mismatch (or a `null`, "not
+      // judged") may belong to another process that had this pid, so it is probed fresh.
+      if (memo && at - memo.at < WIN32_PROBE_MEMO_MS && memo.identity === identityByPid.get(pid)) {
+        batch.set(pid, memo.identity);
+      } else {
+        candidatePids.push(pid);
+      }
+    }
+    if (candidatePids.length > 0 && !(remainingMs && remainingMs() < REAP_MIN_STEP_MS)) {
+      try {
+        const fresh = getProcessIdentitiesImpl(candidatePids, { platform, timeoutMs: batchProbeMs() });
+        const stamp = now();
+        for (const pid of candidatePids) {
+          const identity = fresh.get(pid) ?? null;
+          batch.set(pid, identity);
+          win32ProbeMemo.set(pid, { identity, at: stamp });
+        }
+      } catch {
+        // A failed launcher yields an empty Map, which memoises `null` ("not
+        // judged"); a `null` memo is never reused, so it judges nothing later either.
+      }
+    }
+  }
   const deferred = [];
   const reaped = jobs.map((job) => {
     if (remainingMs && remainingMs() < REAP_MIN_STEP_MS) {
@@ -419,10 +516,14 @@ export function reapDeadJobs(workspaceRoot, jobs, options = {}) {
     // A probe that fails or times out proves nothing, so the job is left alone.
     if (pid && identity) {
       let actual = null;
-      try {
-        actual = getProcessIdentityImpl(pid, { timeoutMs: remainingMs ? Math.min(IDENTITY_PROBE_MS, remainingMs()) : IDENTITY_PROBE_MS });
-      } catch {
-        actual = null;
+      if (platform === "win32") {
+        actual = batch.get(pid) ?? null;
+      } else {
+        try {
+          actual = getProcessIdentityImpl(pid, { timeoutMs: probeMs() });
+        } catch {
+          actual = null;
+        }
       }
       if (actual && actual !== identity) {
         return markJobDead(workspaceRoot, job, `${DEAD_WORKER_MESSAGE} (pid reused: ${pid} now belongs to another process)`, waitFor());
@@ -432,7 +533,7 @@ export function reapDeadJobs(workspaceRoot, jobs, options = {}) {
       // not a companion is proof enough to stop waiting on it. Nothing is signalled.
       let commandLine = null;
       try {
-        commandLine = processCommandLineImpl(pid, { timeoutMs: remainingMs ? Math.min(IDENTITY_PROBE_MS, remainingMs()) : IDENTITY_PROBE_MS });
+        commandLine = processCommandLineImpl(pid, { timeoutMs: probeMs() });
       } catch {
         commandLine = null;
       }

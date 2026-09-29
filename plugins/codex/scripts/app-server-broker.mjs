@@ -8,7 +8,7 @@ import process from "node:process";
 import { parseArgs } from "./lib/args.mjs";
 import { BROKER_BUSY_RPC_CODE, CodexAppServerClient } from "./lib/app-server.mjs";
 import { parseBrokerEndpoint } from "./lib/broker-endpoint.mjs";
-import { clearBrokerSession, loadBrokerSession } from "./lib/broker-lifecycle.mjs";
+import { clearBrokerSessionIfEndpoint, registerBrokerProcess } from "./lib/broker-lifecycle.mjs";
 
 const STREAMING_METHODS = new Set(["turn/start", "review/start", "thread/compact/start"]);
 
@@ -27,6 +27,8 @@ const STREAMING_METHODS = new Set(["turn/start", "review/start", "thread/compact
 // been processed yet — leaves the connection open. Anything still open after this
 // is closed outright.
 const SHUTDOWN_SOCKET_GRACE_MS = 1000;
+// The broker's own record writes (registration once bound, clear at shutdown) wait at most this long for the state lock.
+const OWN_RECORD_CLEAR_WAIT_MS = 1500;
 
 const IDLE_TIMEOUT_ENV = "CODEX_COMPANION_BROKER_IDLE_TIMEOUT_MS";
 const DEFAULT_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
@@ -172,13 +174,25 @@ async function main() {
   // record that still points at this broker — a newer broker may have replaced
   // us in it. The state dir derives from --cwd plus the inherited environment,
   // exactly as it did in the process that spawned us.
+  // Best-effort and bounded: never block shutdown for long on state-file cleanup.
   function clearOwnSessionRecord() {
     try {
-      if (loadBrokerSession(cwd)?.endpoint === endpoint) {
-        clearBrokerSession(cwd);
-      }
-    } catch {
-      // Best-effort: never block shutdown on state-file cleanup.
+      clearBrokerSessionIfEndpoint(cwd, endpoint, { waitMs: OWN_RECORD_CLEAR_WAIT_MS });
+    } catch (error) {
+      process.stderr.write(`[codex] broker record not cleared: ${error instanceof Error ? error.message : String(error)}\n`);
+    }
+  }
+
+  // Once bound, the broker writes its own pid into its record (state untouched):
+  // a broker that answers is never behind a pid-less record, whatever happened
+  // to its starter's saves. No identity probe here — on win32 it would block the
+  // event loop for seconds right after bind. Best-effort and bounded like the
+  // clear above.
+  function registerOwnSessionRecord() {
+    try {
+      registerBrokerProcess(cwd, endpoint, process.pid, { waitMs: OWN_RECORD_CLEAR_WAIT_MS });
+    } catch (error) {
+      process.stderr.write(`[codex] broker pid not registered: ${error instanceof Error ? error.message : String(error)}\n`);
     }
   }
 
@@ -310,6 +324,13 @@ async function main() {
             send(socket, { id: message.id, result: { busy: true } });
             continue;
           }
+          // Test knob (Windows E2E only): acknowledge the shutdown and stay up,
+          // so SessionEnd has to go through the recorded-pid kill path.
+          if (process.platform === "win32" && process.env.CODEX_COMPANION_BROKER_HANG_ON_SHUTDOWN === "1") {
+            send(socket, { id: message.id, result: {} });
+            process.stderr.write("[broker] test knob: acknowledged shutdown, staying up\n");
+            continue;
+          }
           send(socket, { id: message.id, result: {} });
           await shutdownAndExit(server);
         }
@@ -412,6 +433,7 @@ async function main() {
     // receives a client (or whose only client connects briefly during the
     // readiness probe) must still self-terminate instead of lingering.
     armIdleTimer();
+    registerOwnSessionRecord();
   });
 }
 

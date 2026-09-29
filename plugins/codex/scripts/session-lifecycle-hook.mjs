@@ -2,11 +2,12 @@
 
 import fs from "node:fs";
 import process from "node:process";
+import { pathToFileURL } from "node:url";
 
 import { isPidAlive, terminateProcessTree, terminateRecordedProcess, workerCommandLine } from "./lib/process.mjs";
 import { BROKER_ENDPOINT_ENV } from "./lib/app-server.mjs";
 import {
-  clearBrokerSession,
+  clearBrokerSessionIfEndpoint,
   LOG_FILE_ENV,
   loadBrokerSession,
   PID_FILE_ENV,
@@ -14,6 +15,7 @@ import {
   teardownBrokerSession
 } from "./lib/broker-lifecycle.mjs";
 import { loadState, resolveJobPid, resolveStateFile, saveState, STATE_LOCK_TIMEOUT_CODE, withStateLock } from "./lib/state.mjs";
+import { brokerExclusion, brokerPresence } from "./lib/job-control.mjs";
 import { reapDeadJobs } from "./lib/tracked-jobs.mjs";
 import { TRANSCRIPT_PATH_ENV } from "./lib/claude-session-transfer.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
@@ -43,6 +45,12 @@ const BROKER_HANDSHAKE_STEP_MS = 5000;
 const MIN_STEP_MS = 100;
 // Upper bound on one process-identity probe (`ps` on darwin).
 const IDENTITY_PROBE_MS = 2000;
+
+// Kill budget per job: a Windows kill is one PowerShell run (pin, verify, kill
+// the tree, wait) and needs more than a posix signal plus probe.
+export function killStepMs(platform = process.platform) {
+  return platform === "win32" ? 4000 : IDENTITY_PROBE_MS;
+}
 
 // The override may only ever SHORTEN the budget. `hooks.json`'s timeout is a fixed
 // number that cannot be raised from the environment, so an override above the
@@ -95,7 +103,10 @@ function appendEnvVar(name, value) {
   );
 }
 
-function cleanupSessionJobs(cwd, sessionId, lockWaitMs, remainingMs) {
+export function cleanupSessionJobs(cwd, sessionId, lockWaitMs, remainingMs, deps = {}) {
+  const { platform = process.platform, terminateRecordedProcessImpl = terminateRecordedProcess } = deps;
+  // Read under the lock below: a broker cannot start between this read and the kills.
+  const loadBroker = deps.loadBroker ?? (() => deps.broker ?? null);
   if (!cwd || !sessionId) {
     return;
   }
@@ -116,6 +127,8 @@ function cleanupSessionJobs(cwd, sessionId, lockWaitMs, remainingMs) {
     if (sessionJobs.length === 0) {
       return;
     }
+    const broker = loadBroker();
+    const exclude = brokerExclusion(broker);
 
     // A record is only dropped once its worker is stopped or provably gone; one
     // this hook refused to signal, failed to signal or never reached stays, so
@@ -132,23 +145,58 @@ function cleanupSessionJobs(cwd, sessionId, lockWaitMs, remainingMs) {
       if (!stillRunning) {
         continue;
       }
-      // Only a pid still provably this job's process is signalled (#743), and
-      // proving it costs up to two probes (a worker that leads no process group
-      // is re-proved before its own pid is signalled) the budget has to cover.
-      const probeMs = Math.floor(Math.min(IDENTITY_PROBE_MS, remainingMs() / 2));
+      // Only a pid still provably this job's process is signalled (#743). posix
+      // proves it with up to two probes; win32 pins, verifies and kills the tree
+      // in one PowerShell run, so its step is longer (killStepMs).
+      const probeMs = Math.floor(Math.min(killStepMs(platform), remainingMs() / 2));
       let reason = "budget-exhausted";
+      let outcome = null;
       if (probeMs >= MIN_STEP_MS) {
         let pid;
+        // Presumed refused until a pid proves there is nothing to kill.
+        let refused = platform === "win32" && Boolean(broker) && exclude === null;
         try {
           const recorded = resolveJobPid(workspaceRoot, job);
           pid = recorded.pid;
-          const outcome = terminateRecordedProcess(pid, { identity: recorded.identity, commandLineMatch: workerCommandLine(job.id), timeoutMs: probeMs });
-          reason = outcome.reason === "no-pid" || (outcome.attempted && outcome.delivered) ? null : outcome.attempted ? "not-delivered" : outcome.reason;
+          // The shared broker can be this worker's child on Windows: never in its
+          // tree — and only a broker with a verified identity can be excluded.
+          // Only a pid there is to kill can be refused; a pid-less job is `no-pid` as ever.
+          refused = refused && Boolean(pid);
+          outcome = refused
+            ? { attempted: false, delivered: false, reason: "identity-unavailable" }
+            : terminateRecordedProcessImpl(pid, {
+                identity: recorded.identity,
+                commandLineMatch: workerCommandLine(job.id),
+                timeoutMs: probeMs,
+                exclude: exclude ?? []
+              });
+          reason =
+            outcome.reason === "no-pid" || (outcome.attempted && outcome.delivered)
+              ? null
+              : outcome.attempted
+                ? platform === "win32"
+                  ? outcome.reason
+                  : "not-delivered"
+                : outcome.reason;
         } catch {
           reason = "kill-failed";
         }
-        if (reason && isPidAlive(pid) === false) {
+        // A dead root settles it on posix. On win32 a tree with survivors, or a
+        // kill whose outcome is unknown, keeps the record whatever the root did:
+        // the next SessionEnd judges it again (no survivor records — spec §1).
+        // A refused kill (broker not excludable) is unresolved too: the worker's
+        // tree was never looked at, so a dead root proves nothing about it.
+        const unresolved = platform === "win32" && (refused || (outcome?.survivors?.length ?? 0) > 0 || outcome?.unverified === true);
+        if (reason && isPidAlive(pid) === false && !unresolved) {
           reason = null;
+        }
+        if (unresolved) {
+          reason = reason ?? "kill-failed";
+          process.stderr.write(
+            refused
+              ? `[codex] SessionEnd left ${job.id} tree: refused (broker record unreadable or without identity)\n`
+              : `[codex] SessionEnd left ${job.id} tree survivors: ${(outcome?.survivors ?? []).map((s) => `${s.pid}:${s.identity ?? "unknown"}`).join(" ") || "unverified"}\n`
+          );
         }
       }
       if (reason) {
@@ -197,8 +245,11 @@ async function handleSessionEnd(input) {
   const budgetEndsAt = Date.now() + resolveSessionEndBudgetMs();
   const remainingMs = () => budgetEndsAt - Date.now();
   const stepBudget = (bound) => Math.min(bound, Math.max(0, remainingMs()));
+  // Only a loaded record can be excluded from a worker kill; the env fallback
+  // below is a placeholder without a pid.
+  const recordedBroker = loadBrokerSession(cwd);
   const brokerSession =
-    loadBrokerSession(cwd) ??
+    recordedBroker ??
     (process.env[BROKER_ENDPOINT_ENV]
       ? {
           endpoint: process.env[BROKER_ENDPOINT_ENV],
@@ -210,12 +261,12 @@ async function handleSessionEnd(input) {
   const pidFile = brokerSession?.pidFile ?? null;
   const logFile = brokerSession?.logFile ?? null;
   const sessionDir = brokerSession?.sessionDir ?? null;
-  const pid = brokerSession?.pid ?? null;
-  const pidIdentity = brokerSession?.pidIdentity ?? null;
 
   let activeJobs;
   try {
-    cleanupSessionJobs(cwd, input.session_id || process.env[SESSION_ID_ENV], stepBudget(STATE_LOCK_STEP_MS), remainingMs);
+    cleanupSessionJobs(cwd, input.session_id || process.env[SESSION_ID_ENV], stepBudget(STATE_LOCK_STEP_MS), remainingMs, {
+      loadBroker: () => (process.platform === "win32" ? brokerPresence(cwd, process.env) : null)
+    });
     activeJobs = activeWorkspaceJobs(cwd, stepBudget(STATE_LOCK_STEP_MS), remainingMs);
   } catch (error) {
     // A lock this hook could not take says nothing about the broker, and a
@@ -295,6 +346,15 @@ async function handleSessionEnd(input) {
     return;
   }
 
+  // Re-read now, not the snapshot from the top: a starting record may have gained
+  // its pid and identity meanwhile. Only a record for the endpoint that answered
+  // the handshake counts (another endpoint is a replacement broker); a record the
+  // broker already cleared falls back to the snapshot (the kill is verified). A
+  // record in the starting state is a start in progress and is kept.
+  const current = recordedBroker ? loadBrokerSession(cwd) : null;
+  const record = current?.endpoint === brokerEndpoint ? current : recordedBroker;
+  const pid = record?.pid ?? null;
+  const pidIdentity = record?.pidIdentity ?? null;
   const teardown = teardownBrokerSession({
     endpoint: brokerEndpoint,
     pidFile,
@@ -302,22 +362,34 @@ async function handleSessionEnd(input) {
     sessionDir,
     pid,
     pidIdentity,
+    state: record?.state,
     killProcess: terminateProcessTree,
-    // Halved: a broker gone from its group is re-proved with a second probe.
-    timeoutMs: Math.floor(stepBudget(IDENTITY_PROBE_MS) / 2)
+    // posix halved: a broker gone from its group is re-proved with a second
+    // probe. win32: one PowerShell run does verify and kill, hence the kill step.
+    timeoutMs: process.platform === "win32" ? stepBudget(killStepMs()) : Math.floor(stepBudget(IDENTITY_PROBE_MS) / 2),
+    // An unknown outcome keeps the broker's records for the next SessionEnd.
+    keepOnUnknown: true
   });
   // Every branch of this hook says what it decided: when a broker outlives a
   // SessionEnd the only question worth asking is which of these four paths ran.
   process.stderr.write(
-    `[codex] Broker teardown: endpoint=${brokerEndpoint ?? "none"} pid=${pid ?? "none"} signalled=${teardown.signalled} reason=${teardown.reason} busyRetries=${busyRetries} budgetExhausted=false\n`
+    `[codex] Broker teardown: endpoint=${brokerEndpoint ?? "none"} pid=${pid ?? "none"} signalled=${teardown.signalled} reason=${teardown.reason} kept=${teardown.kept} busyRetries=${busyRetries} budgetExhausted=false\n`
   );
 
   // A replacement broker can have started — and recorded itself — while this one
   // was shutting down. Clearing unconditionally would delete the live broker's
   // ownership record, which is exactly what the broker's own endpoint-guarded
-  // `clearOwnSessionRecord` avoids on its side.
-  if (loadBrokerSession(cwd)?.endpoint === brokerEndpoint) {
-    clearBrokerSession(cwd);
+  // `clearOwnSessionRecord` avoids on its side. A kept record is kept here too.
+  // An unreadable record (recordedBroker null) is left for whoever can read it.
+  if (recordedBroker && !teardown.kept) {
+    try {
+      clearBrokerSessionIfEndpoint(cwd, brokerEndpoint, { waitMs: stepBudget(STATE_LOCK_STEP_MS) });
+    } catch (error) {
+      if (error?.code !== STATE_LOCK_TIMEOUT_CODE) {
+        throw error;
+      }
+      process.stderr.write(`[codex] Broker record not cleared: ${error.message}\n`);
+    }
   }
 }
 
@@ -344,7 +416,19 @@ async function main() {
   }
 }
 
-main().catch((error) => {
-  process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
-  process.exit(1);
-});
+// Node resolves import.meta.url through symlinks but argv[1] is as invoked, so
+// compare real paths or a symlinked plugin directory would run no hook at all.
+function isDirectRun() {
+  try {
+    return Boolean(process.argv[1]) && import.meta.url === pathToFileURL(fs.realpathSync(process.argv[1])).href;
+  } catch {
+    return false;
+  }
+}
+
+if (isDirectRun()) {
+  main().catch((error) => {
+    process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+    process.exit(1);
+  });
+}

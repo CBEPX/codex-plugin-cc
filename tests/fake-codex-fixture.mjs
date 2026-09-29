@@ -242,6 +242,11 @@ function structuredReviewPayload(prompt) {
 }
 
 function taskPayload(prompt, resume) {
+  // FAKE_CODEX_ANSWER_TEXT: the final answer verbatim, for tests about what the
+  // transport does with particular characters in a notification.
+  if (process.env.FAKE_CODEX_ANSWER_TEXT) {
+    return process.env.FAKE_CODEX_ANSWER_TEXT;
+  }
   if (prompt.includes("<task>") && prompt.includes("Only review the work from the previous Claude turn.")) {
     if (BEHAVIOR === "adversarial-clean") {
       return "ALLOW: No blocking issues found in the previous turn.";

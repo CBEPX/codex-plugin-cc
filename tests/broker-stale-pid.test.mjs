@@ -8,19 +8,24 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
-import { IS_WIN, makeTempDir, run } from "./helpers.mjs";
+import { IS_WIN, makeTempDir, run, waitFor } from "./helpers.mjs";
 import { createBrokerEndpoint, parseBrokerEndpoint } from "../plugins/codex/scripts/lib/broker-endpoint.mjs";
 import {
   clearBrokerSession,
+  clearBrokerSessionIfEndpoint,
   ensureBrokerSession,
   loadBrokerSession,
+  registerBrokerProcess,
+  resolveBrokerStateFile,
   saveBrokerSession,
   sendBrokerShutdown,
+  spawnBrokerProcess,
   teardownBrokerSession,
   waitForBrokerEndpoint
 } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
-import { terminateProcessTree } from "../plugins/codex/scripts/lib/process.mjs";
-import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
+import { getProcessIdentity, terminateProcessTree } from "../plugins/codex/scripts/lib/process.mjs";
+import { brokerExclusion } from "../plugins/codex/scripts/lib/job-control.mjs";
+import { resolveStateDir, STATE_LOCK_TIMEOUT_CODE } from "../plugins/codex/scripts/lib/state.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const BROKER_SCRIPT = path.join(ROOT, "plugins", "codex", "scripts", "app-server-broker.mjs");
@@ -357,7 +362,8 @@ test("session end keeps the broker while an owned background job runs, and the b
   const { jobId } = JSON.parse(launched.stdout);
 
   const stateFile = path.join(resolveStateDir(workspace), "state.json");
-  const broker = await waitUntil(() => loadBrokerSession(workspace));
+  // A starting record (no pid yet) comes first; wait for the spawned broker.
+  const broker = await waitUntil(() => (loadBrokerSession(workspace)?.pid ? loadBrokerSession(workspace) : null));
   assert.ok(broker, "the background worker must have started a broker");
 
   const cleanup = runSessionEndHook(workspace, { env, sessionId: "sess-current" });
@@ -466,7 +472,8 @@ test("session end reaps a SIGKILLed background worker instead of keeping its bro
     return job && job.status === "running" && job.pid ? job : null;
   }, { timeoutMs: 20000 });
   assert.ok(running, "the background worker must have taken over its record");
-  const broker = await waitUntil(() => loadBrokerSession(workspace));
+  // A starting record (no pid yet) comes first; wait for the spawned broker.
+  const broker = await waitUntil(() => (loadBrokerSession(workspace)?.pid ? loadBrokerSession(workspace) : null));
   assert.ok(broker, "the background worker must have started a broker");
 
   t.after(() => {
@@ -598,6 +605,71 @@ function listenStub(endpoint, onConnection) {
   });
 }
 
+// A starting record (no pid yet) belongs to a broker being spawned: SessionEnd
+// keeps it and its files, whatever the handshake said.
+test("session end keeps a starting broker record and its files", async () => {
+  const workspace = makeTempDir();
+  const sessionDir = makeTempDir("cxc-");
+  const endpoint = createBrokerEndpoint(sessionDir);
+  const pidFile = path.join(sessionDir, "broker.pid");
+  fs.writeFileSync(pidFile, "", "utf8");
+  saveBrokerSession(workspace, { endpoint, pidFile, logFile: path.join(sessionDir, "broker.log"), sessionDir, state: "starting", pid: null, pidIdentity: null });
+  const sockets = [];
+  const stub = await listenStub(endpoint, (socket) => {
+    sockets.push(socket);
+    socket.once("data", () => socket.write(`${JSON.stringify({ id: 1, result: {} })}\n`));
+  });
+  try {
+    const cleanup = await runSessionEndHookAsync(workspace);
+    assert.equal(cleanup.status, 0, cleanup.stderr);
+    assert.match(cleanup.stderr, /pid=none signalled=false reason=starting kept=true/);
+    assert.equal(loadBrokerSession(workspace)?.endpoint, endpoint, "the starting record is kept");
+    assert.equal(fs.existsSync(pidFile), true, "its files are kept");
+  } finally {
+    for (const socket of sockets) {
+      socket.destroy();
+    }
+    stub.close();
+    clearBrokerSession(workspace);
+  }
+});
+
+// The record read at the top of SessionEnd can be a starting one that gains its
+// pid and identity while the hook runs: teardown uses the record as it is now.
+test("session end re-reads the broker record right before teardown", async () => {
+  const workspace = makeTempDir();
+  const sessionDir = makeTempDir("cxc-");
+  const endpoint = createBrokerEndpoint(sessionDir);
+  const record = { endpoint, pidFile: path.join(sessionDir, "broker.pid"), logFile: path.join(sessionDir, "broker.log"), sessionDir };
+  const idler = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+  const identity = getProcessIdentity(idler.pid);
+  assert.ok(identity);
+  saveBrokerSession(workspace, { ...record, state: "starting", pid: null, pidIdentity: null });
+  const sockets = [];
+  const stub = await listenStub(endpoint, (socket) => {
+    sockets.push(socket);
+    socket.once("data", () => {
+      // The start completes while the hook is shutting the broker down.
+      saveBrokerSession(workspace, { ...record, state: "ready", pid: idler.pid, pidIdentity: identity });
+      socket.write(`${JSON.stringify({ id: 1, result: {} })}\n`);
+    });
+  });
+  try {
+    const cleanup = await runSessionEndHookAsync(workspace);
+    assert.equal(cleanup.status, 0, cleanup.stderr);
+    assert.match(cleanup.stderr, new RegExp(`pid=${idler.pid} signalled=true`), cleanup.stderr);
+    await waitForExit(idler, { timeoutMs: 10000 });
+    assert.equal(loadBrokerSession(workspace), null, "the stopped broker's record is cleared");
+  } finally {
+    try { idler.kill("SIGKILL"); } catch {}
+    for (const socket of sockets) {
+      socket.destroy();
+    }
+    stub.close();
+    clearBrokerSession(workspace);
+  }
+});
+
 // A socket is a byte stream, not a message stream: the reply can arrive in as
 // many chunks as the kernel feels like. Parsing each chunk on its own turned a
 // split `{"busy":true}` into a parse error — read as "not busy", which is how a
@@ -683,7 +755,8 @@ test("session end retries a busy answer that is about to clear", async () => {
   const endpoint = createBrokerEndpoint(sessionDir);
   const pidFile = path.join(sessionDir, "broker.pid");
   fs.writeFileSync(pidFile, "999999\n", "utf8");
-  saveBrokerSession(workspace, { endpoint, pidFile, logFile: path.join(sessionDir, "broker.log"), sessionDir, pid: null });
+  // A dead pid (a pid-less record is a starting broker, which SessionEnd keeps); win32 settles it by identity (241).
+  saveBrokerSession(workspace, { endpoint, pidFile, logFile: path.join(sessionDir, "broker.log"), sessionDir, pid: deadPid(), pidIdentity: IS_WIN ? "win32:1" : null });
 
   // Count the answers rather than the clock: under load the first handshake can
   // land after any wall-clock window, and then the retry path is never exercised.
@@ -1010,8 +1083,14 @@ test("ensureBrokerSession kills a live unreachable broker before replacing it (#
     // signalled (identity-unavailable until v1.4.1), so nothing is killed there.
     assert.deepEqual(killed, IS_WIN ? [] : [process.pid], "the unreachable but live broker must be signalled");
     assert.ok(probes >= 1);
-    assert.ok(session && session.endpoint !== staleEndpoint, "a fresh broker must be spawned");
-    assert.equal(loadBrokerSession(workspace)?.endpoint, session.endpoint);
+    if (IS_WIN) {
+      // The kill is refused (no identity): the record is kept and the request falls back to the direct transport.
+      assert.equal(session, null);
+      assert.equal(loadBrokerSession(workspace)?.endpoint, staleEndpoint, "the record is kept");
+    } else {
+      assert.ok(session && session.endpoint !== staleEndpoint, "a fresh broker must be spawned");
+      assert.equal(loadBrokerSession(workspace)?.endpoint, session.endpoint);
+    }
   } finally {
     if (session?.pid) { try { process.kill(session.pid, "SIGTERM"); } catch {} }
     clearBrokerSession(workspace);
@@ -1089,6 +1168,38 @@ test("ensureBrokerSession retries the readiness probe before giving up on a slow
   }
 });
 
+test("saveBrokerSession writes atomically: no temp file is left and the record loads", () => {
+  const workspace = makeTempDir();
+  const renames = [];
+  const realRename = fs.renameSync;
+  fs.renameSync = (from, to) => { renames.push([from, to]); return realRename(from, to); };
+  try {
+    saveBrokerSession(workspace, { endpoint: "unix:/tmp/x.sock", pid: null, pidFile: null, logFile: null, sessionDir: null });
+  } finally {
+    fs.renameSync = realRename;
+  }
+  assert.equal(renames.length, 1, "the record is swapped in by one rename");
+  assert.equal(renames[0][0], `${renames[0][1]}.${process.pid}.tmp`);
+  assert.deepEqual(fs.readdirSync(resolveStateDir(workspace)).filter((name) => name.endsWith(".tmp")), []);
+  assert.equal(loadBrokerSession(workspace)?.endpoint, "unix:/tmp/x.sock");
+});
+
+test("saveBrokerSession rides out a transient EPERM on the rename on win32", () => {
+  const workspace = makeTempDir();
+  let calls = 0;
+  const renameImpl = (from, to) => {
+    calls += 1;
+    if (calls === 1) {
+      throw Object.assign(new Error("locked"), { code: "EPERM" });
+    }
+    fs.renameSync(from, to);
+  };
+  saveBrokerSession(workspace, { endpoint: "unix:/tmp/x.sock", pid: null, pidFile: null, logFile: null, sessionDir: null }, { renameImpl, platform: "win32" });
+  assert.equal(calls, 2);
+  assert.equal(loadBrokerSession(workspace)?.endpoint, "unix:/tmp/x.sock");
+  assert.throws(() => saveBrokerSession(workspace, { endpoint: "unix:/tmp/y.sock" }, { renameImpl: () => { throw Object.assign(new Error("locked"), { code: "EPERM" }); }, platform: "linux" }), /locked/);
+});
+
 test("loadBrokerSession ignores a malformed record instead of trusting it", () => {
   const workspace = makeTempDir();
   const stateDir = resolveStateDir(workspace);
@@ -1161,12 +1272,13 @@ test("ensureBrokerSession kills a fresh broker that never becomes ready as a pro
   let descendant = null;
   try {
     const session = await ensureBrokerSession(workspace, { env: buildEnv(binDir), scriptPath, timeoutMs: 500, killProcess: recordingKill(killed),
-      // An identity that cannot be read (win32) must not keep the child alive.
-      getProcessIdentityImpl: (pid) => (spawned.push(pid), null)
+      // posix: the live child handle proves ownership, no identity needed. win32:
+      // the verified tree kill runs on the real identity (no posix terminator).
+      getProcessIdentityImpl: (pid) => (spawned.push(pid), IS_WIN ? getProcessIdentity(pid) : null)
     });
     assert.equal(session, null);
     assert.equal(spawned.length, 1);
-    assert.deepEqual(killed, [spawned[0]], "the live fresh child is killed as a process group");
+    assert.deepEqual(killed, IS_WIN ? [] : [spawned[0]], "the live fresh child is killed as a process group (posix)");
     assert.equal(loadBrokerSession(workspace), null);
     descendant = Number(fs.readFileSync(descendantPidFile, "utf8"));
     const deadline = Date.now() + 5000;
@@ -1177,6 +1289,91 @@ test("ensureBrokerSession kills a fresh broker that never becomes ready as a pro
     assert.equal(isAlive(descendant), false, "its app-server descendant must be gone too");
   } finally {
     for (const pid of [...spawned, descendant].filter(Boolean)) { try { process.kill(pid, "SIGKILL"); } catch {} }
+  }
+});
+
+// A failed start is torn down through the verified kill with the identity it
+// captured; the record and the files go only with a child that exited within the
+// bounded wait. A live one keeps both (with an identity, re-probed once when the
+// first probe had none), so SessionEnd or the next start can kill it verifiably.
+test("ensureBrokerSession clears a failed start only once its child exited", async () => {
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const scriptPath = path.join(makeTempDir(), "never-listens.mjs");
+  fs.writeFileSync(scriptPath, "setInterval(() => {}, 1000);\n");
+  for (const exits of [true, false]) {
+    const workspace = makeTempDir();
+    const spawned = [];
+    const calls = [];
+    let probes = 0;
+    let files = null;
+    try {
+      const session = await ensureBrokerSession(workspace, { env: buildEnv(binDir), scriptPath, timeoutMs: 300,
+        spawnBrokerProcessImpl: (args) => ((files = args), spawnBrokerProcess(args)),
+        // The alive case's first probe fails: the kept record gets the retried identity.
+        getProcessIdentityImpl: (pid) => (spawned.push(pid), (probes += 1) === 1 && !exits ? null : `win32:${pid}`),
+        terminateRecordedProcessImpl: (pid, options) => {
+          calls.push({ pid, identity: options.identity, timeoutMs: options.timeoutMs });
+          if (exits) process.kill(pid, "SIGKILL");
+          // "delivered" either way: only the child's exit settles it.
+          return { attempted: true, delivered: true, reason: "identity-match" };
+        }
+      });
+      assert.equal(session, null);
+      assert.deepEqual(calls, [{ pid: spawned[0], identity: exits ? `win32:${spawned[0]}` : null, timeoutMs: 4000 }], "one verified kill with the captured identity");
+      const record = loadBrokerSession(workspace);
+      if (exits) {
+        assert.equal(record, null, "an exited child's record is cleared");
+        assert.equal(fs.existsSync(files.logFile), false, "and its files removed");
+      } else {
+        assert.equal(record?.pid, spawned[0], "a live child's record is kept");
+        assert.equal(record.pidIdentity, `win32:${spawned[0]}`, "kept with the identity of the retried probe");
+        assert.equal(fs.existsSync(files.logFile), true, "a live child's files are kept");
+        assert.equal(probes, 2, "one identity retry while the child lives");
+      }
+    } finally {
+      for (const pid of spawned) { try { process.kill(pid, "SIGKILL"); } catch {} }
+      clearBrokerSession(workspace);
+    }
+  }
+});
+
+// Two starts: the second finds the first's record inside the state lock (it
+// appeared between its own read and the lock) and waits for that broker instead
+// of spawning a second one.
+test("ensureBrokerSession claims inside the lock: a start that finds a record there does not spawn", async () => {
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const workspace = makeTempDir();
+  const spawned = [];
+  let second = null;
+  let started = false;
+  const options = {
+    env: buildEnv(binDir),
+    spawnBrokerProcessImpl: (args) => {
+      const child = spawnBrokerProcess(args);
+      spawned.push(child.pid);
+      return child;
+    },
+    createBrokerEndpoint: (dir, platform) => {
+      if (!started) {
+        started = true;
+        // Runs to its first await: its starting record, spawn and pid are on disk before this call's lock.
+        second = ensureBrokerSession(workspace, options);
+      }
+      return createBrokerEndpoint(dir, platform);
+    }
+  };
+  const first = await ensureBrokerSession(workspace, options);
+  const other = await second;
+  try {
+    assert.equal(spawned.length, 1, "one broker");
+    assert.ok(other);
+    assert.equal(first?.endpoint, other.endpoint, "the first call waited for the second's broker");
+    assert.equal(loadBrokerSession(workspace)?.pid, spawned[0]);
+  } finally {
+    for (const pid of spawned) { try { process.kill(pid, "SIGTERM"); } catch {} }
+    clearBrokerSession(workspace);
   }
 });
 
@@ -1223,7 +1420,12 @@ test("ensureBrokerSession re-verifies a legacy broker's ownership after the read
     // before any kill-time recheck, so only the first probe happens there.
     if (!IS_WIN) assert.ok(probes >= 2, "ownership must be checked again at kill time");
     assert.deepEqual(killed, []);
-    assert.ok(session);
+    if (IS_WIN) {
+      assert.equal(session, null, "the refused kill falls back to the direct transport");
+      assert.equal(loadBrokerSession(workspace)?.pid, process.pid, "the record is kept");
+    } else {
+      assert.ok(session);
+    }
   } finally {
     if (session?.pid) { try { process.kill(session.pid, "SIGTERM"); } catch {} }
     clearBrokerSession(workspace);
@@ -1362,7 +1564,7 @@ test("teardownBrokerSession tolerates a pidFile, logFile, and sessionDir the bro
   fs.rmdirSync(sessionDir);
 
   const result = teardownBrokerSession({ pidFile, logFile, sessionDir });
-  assert.deepEqual(result, { signalled: false, reason: "no-pid" });
+  assert.deepEqual(result, { signalled: false, reason: "no-pid", kept: false });
 });
 
 // The pidFile/logFile unlinks are best-effort cleanup, not a contract the hook can
@@ -1378,5 +1580,749 @@ test("teardownBrokerSession swallows unlink failures on pidFile and logFile as b
   const logFile = path.join(regularFile, "broker.log");
 
   const result = teardownBrokerSession({ pidFile, logFile, sessionDir: null });
-  assert.deepEqual(result, { signalled: false, reason: "no-pid" });
+  assert.deepEqual(result, { signalled: false, reason: "no-pid", kept: false });
+});
+
+test("teardownBrokerSession keeps the records on Windows when the outcome is unknown and asked to", () => {
+  const cases = [
+    ["win32", true, { attempted: false, delivered: false, reason: "identity-unavailable" }, true],
+    ["win32", true, { attempted: true, delivered: false, method: "handle", reason: "kill-failed", survivors: [{ pid: 7, identity: "win32:9" }] }, true],
+    ["win32", true, { attempted: true, delivered: false, method: "handle", reason: "kill-failed", survivors: [], unverified: true }, true],
+    ["win32", true, { attempted: false, delivered: false, method: "handle", reason: "process-missing" }, false],
+    ["win32", true, { attempted: false, delivered: false, method: "handle", reason: "identity-mismatch" }, false],
+    ["win32", false, { attempted: false, delivered: false, reason: "identity-unavailable" }, false],
+    ["linux", true, { attempted: false, delivered: false, reason: "identity-unavailable" }, false]
+  ];
+  for (const [platform, keepOnUnknown, outcome, keptExpected] of cases) {
+    const sessionDir = makeTempDir();
+    const pidFile = path.join(sessionDir, "broker.pid");
+    const logFile = path.join(sessionDir, "broker.log");
+    fs.writeFileSync(pidFile, "999999");
+    fs.writeFileSync(logFile, "");
+    const result = teardownBrokerSession({ pidFile, logFile, sessionDir, pid: 999999, pidIdentity: "win32:1", killProcess: () => {}, timeoutMs: 1000, platform, keepOnUnknown, terminateRecordedProcessImpl: () => outcome });
+    assert.equal(result.kept, keptExpected, `${platform} keepOnUnknown=${keepOnUnknown} ${JSON.stringify(outcome)}`);
+    assert.equal(result.reason, outcome.reason);
+    assert.equal(fs.existsSync(pidFile), keptExpected, "records survive exactly when kept");
+    assert.equal(fs.existsSync(logFile), keptExpected);
+  }
+  // A starting record (pid or not: its broker is being started) is kept on every platform, files included.
+  for (const platform of ["win32", "linux"]) {
+    const dir = makeTempDir();
+    const pidFile = path.join(dir, "broker.pid");
+    const logFile = path.join(dir, "broker.log");
+    fs.writeFileSync(pidFile, "");
+    fs.writeFileSync(logFile, "");
+    assert.deepEqual(teardownBrokerSession({ pidFile, logFile, sessionDir: dir, pid: null, state: "starting", killProcess: () => assert.fail("nothing to kill"), platform, keepOnUnknown: true }), { signalled: false, reason: "starting", kept: true });
+    assert.equal(fs.existsSync(pidFile) && fs.existsSync(logFile), true, `${platform}: nothing unlinked`);
+  }
+  // No pid at all is settled: nothing to keep.
+  const sessionDir = makeTempDir();
+  assert.deepEqual(teardownBrokerSession({ pidFile: null, logFile: null, sessionDir, pid: null, killProcess: () => {}, platform: "win32", keepOnUnknown: true }), { signalled: false, reason: "no-pid", kept: false });
+});
+
+test("ensureBrokerSession records the broker's pid before it captures the identity (start window)", async () => {
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const workspace = makeTempDir();
+  let inWindow = null;
+  const session = await ensureBrokerSession(workspace, {
+    env: buildEnv(binDir),
+    getProcessIdentityImpl: (pid) => {
+      inWindow = loadBrokerSession(workspace);
+      return `win32:${pid}`;
+    }
+  });
+  try {
+    assert.ok(session);
+    assert.equal(inWindow?.pid, session.pid, "the provisional record carries the pid");
+    assert.equal(inWindow.pidIdentity, null);
+    assert.equal(inWindow.endpoint, session.endpoint);
+    assert.equal(brokerExclusion(inWindow), null, "a record without identity refuses kills");
+    const final = loadBrokerSession(workspace);
+    assert.equal(final.pidIdentity, `win32:${session.pid}`);
+  } finally {
+    if (session?.pid) { try { process.kill(session.pid, "SIGTERM"); } catch {} }
+    clearBrokerSession(workspace);
+  }
+});
+
+test("ensureBrokerSession writes a starting record under the state lock before it spawns", async () => {
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const workspace = makeTempDir();
+  let atSpawn = null;
+  let lockEntries = null;
+  const session = await ensureBrokerSession(workspace, {
+    env: buildEnv(binDir),
+    spawnBrokerProcessImpl: (args) => {
+      atSpawn = loadBrokerSession(workspace);
+      lockEntries = fs.readdirSync(path.join(resolveStateDir(workspace), "state.lock.d")).filter((name) => name.endsWith(".ticket"));
+      return spawnBrokerProcess(args);
+    }
+  });
+  try {
+    assert.ok(session);
+    assert.equal(typeof atSpawn?.startedAt, "number", "the starting record carries its start time");
+    assert.deepEqual(atSpawn, { endpoint: session.endpoint, pidFile: session.pidFile, logFile: session.logFile, sessionDir: session.sessionDir, state: "starting", startedAt: atSpawn.startedAt, pid: null, pidIdentity: null });
+    assert.equal(brokerExclusion(atSpawn), null, "a starting record refuses kills");
+    assert.equal(lockEntries.length, 1, "the spawn happens under the state lock");
+  } finally {
+    if (session?.pid) { try { process.kill(session.pid, "SIGTERM"); } catch {} }
+    clearBrokerSession(workspace);
+  }
+});
+
+test("ensureBrokerSession waits for a starting record's broker instead of replacing it", async (t) => {
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const workspace = makeTempDir();
+  const sessionDir = makeTempDir("cxc-");
+  const endpoint = createBrokerEndpoint(sessionDir);
+  saveBrokerSession(workspace, { endpoint, pidFile: path.join(sessionDir, "broker.pid"), logFile: path.join(sessionDir, "broker.log"), sessionDir, state: "starting", pid: null, pidIdentity: null });
+  const server = net.createServer((socket) => socket.end());
+  t.after(() => server.close());
+  setTimeout(() => server.listen(parseBrokerEndpoint(endpoint).path), 300);
+  const killed = [];
+  const session = await ensureBrokerSession(workspace, { env: buildEnv(binDir), killProcess: recordingKill(killed), retryTimeoutMs: 3000 });
+  // win32: a pid-less starting broker has no identity to exclude it by: kept, direct transport.
+  assert.equal(session?.endpoint ?? null, IS_WIN ? null : endpoint, "the starting broker is kept once it listens");
+  assert.deepEqual(killed, []);
+  assert.equal(loadBrokerSession(workspace)?.endpoint, endpoint);
+  clearBrokerSession(workspace);
+});
+
+// Wave 7 (B1): a stale path acts on the current claim, not on its snapshot.
+test("ensureBrokerSession waits on a claim that gained a pid during its wait instead of tearing it down", async (t) => {
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const workspace = makeTempDir();
+  const sessionDir = makeTempDir("cxc-");
+  const endpoint = createBrokerEndpoint(sessionDir);
+  const base = { endpoint, pidFile: path.join(sessionDir, "broker.pid"), logFile: path.join(sessionDir, "broker.log"), sessionDir };
+  saveBrokerSession(workspace, { ...base, state: "starting", pid: null, pidIdentity: null });
+  const server = net.createServer((socket) => socket.end());
+  t.after(() => server.close());
+  setTimeout(() => saveBrokerSession(workspace, { ...base, pid: process.pid, pidIdentity: `x:${process.pid}` }), 100);
+  setTimeout(() => server.listen(parseBrokerEndpoint(endpoint).path), 450);
+  const killed = [];
+  const session = await ensureBrokerSession(workspace, {
+    env: buildEnv(binDir),
+    killProcess: recordingKill(killed),
+    terminateRecordedProcessImpl: () => assert.fail("no teardown of a claim that changed"),
+    isAliveImpl: () => true,
+    ownsProcessImpl: () => true,
+    retryTimeoutMs: 300
+  });
+  assert.equal(session?.endpoint, endpoint, "the updated claim's broker is returned");
+  assert.deepEqual(killed, []);
+  assert.equal(loadBrokerSession(workspace)?.pid, process.pid, "the record survives");
+  clearBrokerSession(workspace);
+});
+
+function failingSaves(failures) {
+  let calls = 0;
+  return {
+    get calls() { return calls; },
+    impl: (cwd, record) => {
+      calls += 1;
+      if (failures.includes(calls)) {
+        throw Object.assign(new Error("lock timeout"), { code: STATE_LOCK_TIMEOUT_CODE });
+      }
+      return saveBrokerSession(cwd, record);
+    }
+  };
+}
+
+test("ensureBrokerSession retries a failed ready-record save once, then tears the start down", async () => {
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  for (const failures of [[3], [3, 4]]) {
+    const workspace = makeTempDir();
+    const saves = failingSaves(failures);
+    const spawned = [];
+    const terminated = [];
+    try {
+      const session = await ensureBrokerSession(workspace, {
+        env: buildEnv(binDir),
+        // Counted saves: 1 pid, 2 identity, 3 ready, 4 ready retry.
+        saveBrokerSessionImpl: (cwd, record) => saves.impl(cwd, record),
+        // The real probe: the broker registers only its pid and the starter saves
+        // the identity, so the failed start's reservation finds its own claim unchanged.
+        spawnBrokerProcessImpl: (args) => { const child = spawnBrokerProcess(args); spawned.push(child.pid); return child; },
+        terminateRecordedProcessImpl: (pid) => { terminated.push(pid); process.kill(pid, "SIGKILL"); return { attempted: true, delivered: true, reason: "identity-match" }; }
+      });
+      if (failures.length === 1) {
+        assert.equal(session?.pid, spawned[0], "the retry saved the record");
+        assert.equal(loadBrokerSession(workspace)?.pidIdentity, getProcessIdentity(spawned[0]));
+        assert.deepEqual(terminated, []);
+      } else {
+        assert.equal(session, null, "never a session the record does not name");
+        assert.deepEqual(terminated, [spawned[0]], "the verified failed-start teardown ran");
+        assert.equal(loadBrokerSession(workspace), null);
+      }
+    } finally {
+      for (const pid of spawned) { try { process.kill(pid, "SIGKILL"); } catch {} }
+      clearBrokerSession(workspace);
+    }
+  }
+});
+
+test("saveClaimed under a lock timeout returns false instead of throwing", async () => {
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const workspace = makeTempDir();
+  const saves = failingSaves([2]); // the identity save (1 is the pid save)
+  let child = null;
+  const session = await ensureBrokerSession(workspace, {
+    env: buildEnv(binDir),
+    saveBrokerSessionImpl: (cwd, record) => saves.impl(cwd, record),
+    getProcessIdentityImpl: (pid) => `x:${pid}`,
+    spawnBrokerProcessImpl: (args) => (child = spawnBrokerProcess(args))
+  });
+  try {
+    assert.ok(session, "the start succeeds although one save timed out");
+    assert.equal(saves.calls >= 2, true);
+  } finally {
+    if (child?.pid) { try { process.kill(child.pid, "SIGTERM"); } catch {} }
+    clearBrokerSession(workspace);
+  }
+});
+
+// Wave 7 (S1): an unverified stale kill keeps the record and files.
+test("ensureBrokerSession keeps a stale record whose kill is unverified and uses no replacement", async () => {
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  for (const reason of ["identity-unavailable", "identity-mismatch"]) {
+    const workspace = makeTempDir();
+    const sessionDir = makeTempDir("cxc-");
+    const staleEndpoint = createBrokerEndpoint(sessionDir);
+    const pidFile = path.join(sessionDir, "broker.pid");
+    fs.writeFileSync(pidFile, "");
+    saveBrokerSession(workspace, { endpoint: staleEndpoint, pidFile, logFile: path.join(sessionDir, "broker.log"), sessionDir, pid: process.pid });
+    let spawns = 0;
+    let session = null;
+    try {
+      session = await ensureBrokerSession(workspace, {
+        env: buildEnv(binDir),
+        isAliveImpl: () => true,
+        ownsProcessImpl: () => true,
+        killProcess: () => {},
+        terminateRecordedProcessImpl: () => ({ attempted: false, delivered: false, reason }),
+        spawnBrokerProcessImpl: (args) => { spawns += 1; return spawnBrokerProcess(args); },
+        retryTimeoutMs: 200
+      });
+      if (reason === "identity-unavailable") {
+        assert.equal(session, null);
+        assert.equal(spawns, 0, "no replacement");
+        assert.equal(loadBrokerSession(workspace)?.endpoint, staleEndpoint, "the record is kept");
+        assert.equal(fs.existsSync(pidFile), true, "and its files");
+      } else {
+        assert.ok(session && session.endpoint !== staleEndpoint, "a settled answer is replaced");
+        assert.equal(fs.existsSync(pidFile), false);
+      }
+    } finally {
+      if (session?.pid) { try { process.kill(session.pid, "SIGTERM"); } catch {} }
+      clearBrokerSession(workspace);
+    }
+  }
+});
+
+test("SessionEnd leaves an unreadable broker.json in place", () => {
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const workspace = makeTempDir();
+  const stateFile = resolveBrokerStateFile(workspace);
+  fs.mkdirSync(path.dirname(stateFile), { recursive: true });
+  fs.writeFileSync(stateFile, "{ not json", "utf8");
+  const result = runSessionEndHook(workspace, { env: buildEnv(binDir) });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(fs.existsSync(stateFile), true, "an unreadable record is not erased");
+});
+
+// Wave 8 (B1): the endpoint compare and the clear are one locked section.
+test("clearBrokerSessionIfEndpoint does not delete a replacement written after the caller decided", () => {
+  const workspace = makeTempDir();
+  const stale = { endpoint: "unix:/tmp/old.sock", pid: null, pidFile: null, logFile: null, sessionDir: null };
+  const replacement = { ...stale, endpoint: "unix:/tmp/new.sock" };
+  saveBrokerSession(workspace, stale);
+  let lockHeld = null;
+  const cleared = clearBrokerSessionIfEndpoint(workspace, stale.endpoint, {
+    // The replacement lands between the caller's decision and the delete.
+    loadBrokerSessionImpl: (cwd) => {
+      lockHeld = fs.readdirSync(path.join(resolveStateDir(cwd), "state.lock.d")).some((name) => name.endsWith(".ticket"));
+      saveBrokerSession(cwd, replacement);
+      return loadBrokerSession(cwd);
+    }
+  });
+  assert.equal(cleared, false);
+  assert.equal(lockHeld, true, "the re-load runs under the state lock");
+  assert.equal(loadBrokerSession(workspace)?.endpoint, replacement.endpoint, "the replacement survives");
+  assert.equal(clearBrokerSessionIfEndpoint(workspace, replacement.endpoint), true);
+  assert.equal(loadBrokerSession(workspace), null);
+});
+
+// Wave 8 (B2): a child running behind a pid-null record is torn down, not stranded.
+test("ensureBrokerSession tears the child down when the pid save fails", async () => {
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const scriptPath = path.join(makeTempDir(), "never-listens.mjs");
+  fs.writeFileSync(scriptPath, "setInterval(() => {}, 1000);\n");
+  const workspace = makeTempDir();
+  const spawned = [];
+  const killed = [];
+  try {
+    const session = await ensureBrokerSession(workspace, {
+      env: buildEnv(binDir),
+      scriptPath,
+      timeoutMs: 300,
+      spawnBrokerProcessImpl: (args) => {
+        const child = spawnBrokerProcess(args);
+        spawned.push(child.pid);
+        return child;
+      },
+      saveBrokerSessionImpl: () => {
+        throw new Error("disk full");
+      },
+      terminateRecordedProcessImpl: (pid) => {
+        killed.push(pid);
+        process.kill(pid, "SIGKILL");
+        return { attempted: true, delivered: true, reason: "identity-match" };
+      }
+    });
+    assert.equal(session, null, "direct fallback");
+    assert.deepEqual(killed, spawned, "the child is killed through the verified kill");
+    assert.equal(loadBrokerSession(workspace), null, "no pid-null record is left behind");
+  } finally {
+    for (const pid of spawned) { try { process.kill(pid, "SIGKILL"); } catch {} }
+    clearBrokerSession(workspace);
+  }
+});
+
+// Wave 8 (B3): the starting state, not a missing pid, is what SessionEnd keeps.
+test("session end keeps a starting record that already has a pid and identity", async () => {
+  const workspace = makeTempDir();
+  const sessionDir = makeTempDir("cxc-");
+  const endpoint = createBrokerEndpoint(sessionDir);
+  const pidFile = path.join(sessionDir, "broker.pid");
+  fs.writeFileSync(pidFile, "", "utf8");
+  const idler = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+  const identity = getProcessIdentity(idler.pid);
+  assert.ok(identity);
+  saveBrokerSession(workspace, { endpoint, pidFile, logFile: path.join(sessionDir, "broker.log"), sessionDir, state: "starting", pid: idler.pid, pidIdentity: identity });
+  const sockets = [];
+  const stub = await listenStub(endpoint, (socket) => {
+    sockets.push(socket);
+    socket.once("data", () => socket.write(`${JSON.stringify({ id: 1, result: {} })}\n`));
+  });
+  try {
+    const cleanup = await runSessionEndHookAsync(workspace);
+    assert.equal(cleanup.status, 0, cleanup.stderr);
+    assert.match(cleanup.stderr, new RegExp(`pid=${idler.pid} signalled=false reason=starting kept=true`), cleanup.stderr);
+    assert.equal(loadBrokerSession(workspace)?.endpoint, endpoint, "the starting record is kept");
+    assert.equal(fs.existsSync(pidFile), true, "its files are kept");
+    assert.equal(idler.exitCode, null, "the broker is not signalled");
+  } finally {
+    for (const socket of sockets) {
+      socket.destroy();
+    }
+    stub.close();
+    idler.kill("SIGKILL");
+    clearBrokerSession(workspace);
+  }
+});
+
+test("ensureBrokerSession waits on a starting record that has a pid", async (t) => {
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const workspace = makeTempDir();
+  const sessionDir = makeTempDir("cxc-");
+  const endpoint = createBrokerEndpoint(sessionDir);
+  saveBrokerSession(workspace, { endpoint, pidFile: path.join(sessionDir, "broker.pid"), logFile: path.join(sessionDir, "broker.log"), sessionDir, state: "starting", pid: process.pid, pidIdentity: null });
+  const server = net.createServer((socket) => socket.end());
+  t.after(() => server.close());
+  setTimeout(() => server.listen(parseBrokerEndpoint(endpoint).path), 300);
+  const killed = [];
+  const session = await ensureBrokerSession(workspace, {
+    env: buildEnv(binDir),
+    killProcess: recordingKill(killed),
+    terminateRecordedProcessImpl: () => assert.fail("a starting broker that answers is not torn down"),
+    isAliveImpl: () => false,
+    retryTimeoutMs: 3000
+  });
+  assert.equal(session?.endpoint, endpoint);
+  assert.deepEqual(killed, []);
+  clearBrokerSession(workspace);
+});
+
+// Wave 9 (R1): a pid-less starting record is settled only after the grace period.
+test("ensureBrokerSession keeps a young pid-less starting record and settles an old one", async () => {
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  for (const age of [0, 120_000]) {
+    const workspace = makeTempDir();
+    const sessionDir = makeTempDir("cxc-");
+    const endpoint = createBrokerEndpoint(sessionDir); // nothing listens here
+    saveBrokerSession(workspace, { endpoint, pidFile: path.join(sessionDir, "broker.pid"), logFile: path.join(sessionDir, "broker.log"), sessionDir, state: "starting", startedAt: Date.now() - age, pid: null, pidIdentity: null });
+    let spawns = 0;
+    let session = null;
+    try {
+      session = await ensureBrokerSession(workspace, {
+        env: buildEnv(binDir),
+        spawnBrokerProcessImpl: (args) => { spawns += 1; return spawnBrokerProcess(args); },
+        retryTimeoutMs: 200
+      });
+      if (age === 0) {
+        assert.equal(session, null, "direct transport while the start may still be running");
+        assert.equal(spawns, 0);
+        assert.equal(loadBrokerSession(workspace)?.endpoint, endpoint, "the record is kept");
+      } else {
+        assert.ok(session && session.endpoint !== endpoint, "an old pid-less start is settled and replaced");
+        assert.equal(loadBrokerSession(workspace)?.endpoint, session.endpoint);
+      }
+    } finally {
+      if (session?.pid) { try { process.kill(session.pid, "SIGTERM"); } catch {} }
+      clearBrokerSession(workspace);
+    }
+  }
+});
+
+// Wave 9 (R1): a failed pid save whose child survives leaves a record naming it.
+test("ensureBrokerSession records the pid of a live child it could not stop after a failed pid save", async () => {
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const scriptPath = path.join(makeTempDir(), "never-listens.mjs");
+  fs.writeFileSync(scriptPath, "setInterval(() => {}, 1000);\n");
+  const workspace = makeTempDir();
+  const spawned = [];
+  let saves = 0;
+  try {
+    const session = await ensureBrokerSession(workspace, {
+      env: buildEnv(binDir),
+      scriptPath,
+      timeoutMs: 300,
+      spawnBrokerProcessImpl: (args) => { const child = spawnBrokerProcess(args); spawned.push(child.pid); return child; },
+      saveBrokerSessionImpl: (cwd, record) => {
+        saves += 1;
+        if (saves === 1) {
+          throw new Error("disk full");
+        }
+        return saveBrokerSession(cwd, record);
+      },
+      getProcessIdentityImpl: (pid) => `x:${pid}`,
+      terminateRecordedProcessImpl: () => ({ attempted: false, delivered: false, reason: "identity-unavailable" })
+    });
+    assert.equal(session, null);
+    const record = loadBrokerSession(workspace);
+    assert.equal(record?.pid, spawned[0], "the kept record names the live child");
+    assert.equal(record.pidIdentity, `x:${spawned[0]}`);
+    assert.equal(record.state, "starting");
+    assert.equal(typeof record.startedAt, "number");
+  } finally {
+    for (const pid of spawned) { try { process.kill(pid, "SIGKILL"); } catch {} }
+    clearBrokerSession(workspace);
+  }
+});
+
+// Wave 9 (R2): the teardown is reserved under the lock; a starter cannot promote past it.
+// Wave 10 (W2): nor kill it — the reservation is the other caller's teardown.
+test("ensureBrokerSession refuses a ready save after a replacer reserved the record", async () => {
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const workspace = makeTempDir();
+  const spawned = [];
+  const terminated = [];
+  try {
+    const session = await ensureBrokerSession(workspace, {
+      env: buildEnv(binDir),
+      spawnBrokerProcessImpl: (args) => { const child = spawnBrokerProcess(args); spawned.push(child.pid); return child; },
+      getProcessIdentityImpl: (pid) => {
+        // A stale caller reserves this claim for teardown right here.
+        saveBrokerSession(workspace, { ...loadBrokerSession(workspace), state: "replacing", replacer: "other", replacingAt: Date.now() });
+        return `x:${pid}`;
+      },
+      terminateRecordedProcessImpl: (pid) => { terminated.push(pid); process.kill(pid, "SIGKILL"); return { attempted: true, delivered: true, reason: "identity-match" }; }
+    });
+    assert.equal(session, null, "the refused starter abandons its start");
+    assert.deepEqual(terminated, [], "the reserved claim is not the starter's to kill");
+    assert.equal(loadBrokerSession(workspace)?.replacer, "other", "the other reservation is intact");
+    assert.notEqual(loadBrokerSession(workspace)?.state, "ready", "never promoted past the reservation");
+  } finally {
+    for (const pid of spawned) { try { process.kill(pid, "SIGKILL"); } catch {} }
+    clearBrokerSession(workspace);
+  }
+});
+
+test("registerBrokerProcess writes only into its own endpoint's record and keeps its state", () => {
+  const workspace = makeTempDir();
+  const record = { endpoint: "unix:/tmp/r.sock", pid: null, pidIdentity: null, pidFile: null, logFile: null, sessionDir: null, state: "replacing", replacer: "a", replacingAt: 1 };
+  saveBrokerSession(workspace, record);
+  assert.equal(registerBrokerProcess(workspace, "unix:/tmp/other.sock", 42), false);
+  assert.deepEqual(loadBrokerSession(workspace), record);
+  assert.equal(registerBrokerProcess(workspace, record.endpoint, 42), true);
+  assert.deepEqual(loadBrokerSession(workspace), { ...record, pid: 42, pidIdentity: null });
+  saveBrokerSession(workspace, { ...record, pid: 42, pidIdentity: "x:42" });
+  assert.equal(registerBrokerProcess(workspace, record.endpoint, 42), true);
+  assert.equal(loadBrokerSession(workspace)?.pidIdentity, "x:42", "the starter's identity for the same pid is kept");
+  clearBrokerSession(workspace);
+});
+
+test("ensureBrokerSession does not clear a record another claim wrote during its stale kill", async (t) => {
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const workspace = makeTempDir();
+  const staleDir = makeTempDir("cxc-");
+  const staleEndpoint = createBrokerEndpoint(staleDir);
+  saveBrokerSession(workspace, { endpoint: staleEndpoint, pidFile: null, logFile: null, sessionDir: staleDir, state: "ready", pid: process.pid, pidIdentity: `x:${process.pid}` });
+  const nextDir = makeTempDir("cxc-");
+  const nextEndpoint = createBrokerEndpoint(nextDir);
+  const server = await listenStub(nextEndpoint, (socket) => socket.end());
+  t.after(() => server.close());
+  let during = null;
+  const session = await ensureBrokerSession(workspace, {
+    env: buildEnv(binDir),
+    isAliveImpl: () => true,
+    ownsProcessImpl: () => true,
+    killProcess: () => {},
+    retryTimeoutMs: 200,
+    terminateRecordedProcessImpl: () => {
+      during = loadBrokerSession(workspace);
+      saveBrokerSession(workspace, { endpoint: nextEndpoint, pidFile: null, logFile: null, sessionDir: nextDir, state: "ready", pid: null, pidIdentity: null });
+      return { attempted: true, delivered: true, reason: "identity-match" };
+    }
+  });
+  assert.equal(during?.state, "replacing", "the kill runs behind a reservation");
+  assert.equal(typeof during.replacer, "string");
+  assert.equal(loadBrokerSession(workspace)?.endpoint, nextEndpoint, "the other claim survives");
+  assert.equal(session?.endpoint, nextEndpoint);
+  clearBrokerSession(workspace);
+});
+
+test("teardownBrokerSession keeps a replacing record like a starting one", () => {
+  assert.deepEqual(teardownBrokerSession({ pidFile: null, logFile: null, pid: 1, state: "replacing", killProcess: () => assert.fail("nothing to kill") }), { signalled: false, reason: "replacing", kept: true });
+});
+
+// Wave 9 (R3): an adopted starting broker is promoted to ready with its identity.
+test("ensureBrokerSession promotes an answering starting broker, and keeps it on win32 without an identity", async (t) => {
+  for (const platform of [process.platform, "win32"]) {
+    const workspace = makeTempDir();
+    const sessionDir = makeTempDir("cxc-");
+    const endpoint = createBrokerEndpoint(sessionDir);
+    const record = { endpoint, pidFile: null, logFile: null, sessionDir, state: "starting", startedAt: Date.now(), pid: process.pid, pidIdentity: null };
+    saveBrokerSession(workspace, record);
+    const server = await listenStub(endpoint, (socket) => socket.end());
+    t.after(() => server.close());
+    const session = await ensureBrokerSession(workspace, {
+      platform,
+      spawnBrokerProcessImpl: () => assert.fail("no spawn"),
+      getProcessIdentityImpl: () => (platform === "win32" ? null : "x:adopted")
+    });
+    if (platform === "win32") {
+      assert.equal(session, null, "direct transport");
+      assert.deepEqual(loadBrokerSession(workspace), record, "the record is kept as is");
+    } else {
+      assert.equal(session?.state, "ready");
+      assert.equal(session.pidIdentity, "x:adopted");
+      assert.deepEqual(loadBrokerSession(workspace), session, "the promotion is saved");
+    }
+    clearBrokerSession(workspace);
+  }
+});
+
+// Wave 10 (W1): a bound broker writes its own pid (no identity probe) into its record.
+test("broker registers its pid in its own record once it listens", async () => {
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const workspace = makeTempDir();
+  const sessionDir = makeTempDir("cxc-");
+  const endpoint = createBrokerEndpoint(sessionDir);
+  const startedAt = Date.now();
+  saveBrokerSession(workspace, { endpoint, pidFile: path.join(sessionDir, "broker.pid"), logFile: path.join(sessionDir, "broker.log"), sessionDir, state: "starting", startedAt, pid: null, pidIdentity: null });
+  const child = spawn(
+    process.execPath,
+    [BROKER_SCRIPT, "serve", "--endpoint", endpoint, "--cwd", workspace, "--idle-timeout", "60000"],
+    { cwd: workspace, env: buildEnv(binDir), stdio: "ignore" }
+  );
+  try {
+    const record = await waitFor(() => {
+      const current = loadBrokerSession(workspace);
+      return current?.pid === child.pid ? current : null;
+    });
+    assert.equal(record.pidIdentity, null, "the broker probes no identity");
+    assert.equal(record.state, "starting", "the state is left to the starter");
+    assert.equal(record.startedAt, startedAt);
+  } finally {
+    child.kill("SIGKILL");
+    clearBrokerSession(workspace);
+  }
+});
+
+// Wave 10 (W1): time alone never settles a record whose endpoint answers.
+test("ensureBrokerSession adopts an answering pid-less starting record past its grace instead of settling it", async (t) => {
+  const workspace = makeTempDir();
+  const sessionDir = makeTempDir("cxc-");
+  const endpoint = createBrokerEndpoint(sessionDir);
+  const record = { endpoint, pidFile: null, logFile: null, sessionDir, state: "starting", startedAt: Date.now() - 120_000, pid: null, pidIdentity: null };
+  saveBrokerSession(workspace, record);
+  const server = await listenStub(endpoint, (socket) => socket.end());
+  t.after(() => server.close());
+  await ensureBrokerSession(workspace, {
+    spawnBrokerProcessImpl: () => assert.fail("no spawn"),
+    terminateRecordedProcessImpl: () => assert.fail("no kill")
+  });
+  assert.deepEqual(loadBrokerSession(workspace), record, "the record is not settled");
+  clearBrokerSession(workspace);
+});
+
+// Wave 10 (W2): abandonStart reserves; a claim promoted meanwhile is not killed.
+test("ensureBrokerSession does not kill a failed start whose record was promoted meanwhile", async () => {
+  const workspace = makeTempDir();
+  const spawned = [];
+  const terminated = [];
+  let promoted = null;
+  try {
+    const session = await ensureBrokerSession(workspace, {
+      timeoutMs: 300,
+      spawnBrokerProcessImpl: () => {
+        const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+        spawned.push(child.pid);
+        return child;
+      },
+      saveBrokerSessionImpl: (cwd, record) => {
+        saveBrokerSession(cwd, record);
+        if (!promoted) {
+          // Another caller adopts the broker during the readiness wait.
+          promoted = setTimeout(() => saveBrokerSession(cwd, { ...loadBrokerSession(cwd), state: "ready" }), 50);
+        }
+      },
+      getProcessIdentityImpl: (pid) => `x:${pid}`,
+      terminateRecordedProcessImpl: (pid) => { terminated.push(pid); return { attempted: true, delivered: true, reason: "identity-match" }; }
+    });
+    assert.equal(session, null);
+    assert.deepEqual(terminated, [], "the promoted broker is not killed");
+    assert.equal(loadBrokerSession(workspace)?.state, "ready", "the promoted record is intact");
+    assert.equal(loadBrokerSession(workspace).pid, spawned[0]);
+  } finally {
+    for (const pid of spawned) { try { process.kill(pid, "SIGKILL"); } catch {} }
+    clearBrokerSession(workspace);
+  }
+});
+
+// Wave 10 (W3): a reservation past its grace is not the replacer's any more.
+test("ensureBrokerSession does not kill once its own reservation is older than the grace", async () => {
+  const workspace = makeTempDir();
+  const staleDir = makeTempDir("cxc-");
+  const staleEndpoint = createBrokerEndpoint(staleDir);
+  saveBrokerSession(workspace, { endpoint: staleEndpoint, pidFile: null, logFile: null, sessionDir: staleDir, state: "ready", pid: process.pid, pidIdentity: `x:${process.pid}` });
+  const terminated = [];
+  const session = await ensureBrokerSession(workspace, {
+    isAliveImpl: () => true,
+    ownsProcessImpl: () => true,
+    killProcess: () => {},
+    retryTimeoutMs: 200,
+    // The replacer is suspended past the grace right after it reserved.
+    nowImpl: () => Date.now() + (loadBrokerSession(workspace)?.state === "replacing" ? 120_000 : 0),
+    spawnBrokerProcessImpl: () => assert.fail("no spawn"),
+    terminateRecordedProcessImpl: (pid) => { terminated.push(pid); return { attempted: true, delivered: true, reason: "identity-match" }; }
+  });
+  assert.equal(session, null);
+  assert.deepEqual(terminated, [], "the kill is never launched");
+  assert.equal(loadBrokerSession(workspace)?.state, "replacing", "nothing is restored");
+  clearBrokerSession(workspace);
+});
+
+// Wave 10 (W4): a fresh win32 broker without an identity stays starting until one is read.
+test("ensureBrokerSession keeps a fresh win32 broker starting until its identity is read", async () => {
+  const workspace = makeTempDir();
+  const sessionDir = makeTempDir("cxc-");
+  const endpoint = createBrokerEndpoint(sessionDir);
+  let server = null;
+  let identity = null;
+  const options = {
+    platform: "win32",
+    createBrokerEndpoint: () => endpoint,
+    spawnBrokerProcessImpl: () => {
+      // Stands in for the broker: it answers, and never registers itself.
+      server = net.createServer((socket) => socket.end()).listen(parseBrokerEndpoint(endpoint).path);
+      return { pid: process.pid, exitCode: null, signalCode: null };
+    },
+    getProcessIdentityImpl: () => identity
+  };
+  try {
+    assert.equal(await ensureBrokerSession(workspace, options), null, "direct transport without an identity");
+    const kept = loadBrokerSession(workspace);
+    assert.equal(kept?.state, "starting");
+    assert.equal(kept.pid, process.pid);
+    assert.equal(kept.pidIdentity, null);
+    assert.equal(await ensureBrokerSession(workspace, options), null, "a later probe that fails keeps it");
+    assert.equal(loadBrokerSession(workspace)?.state, "starting");
+    identity = "win32:later";
+    const session = await ensureBrokerSession(workspace, options);
+    assert.equal(session?.state, "ready", "promoted once the probe succeeds");
+    assert.equal(session.pidIdentity, "win32:later");
+    assert.deepEqual(loadBrokerSession(workspace), session);
+  } finally {
+    server?.close();
+    clearBrokerSession(workspace);
+  }
+});
+
+// Wave 10 (W5): the adopt probe runs outside the state lock.
+test("ensureBrokerSession probes an adopted broker's identity outside the state lock", async (t) => {
+  const workspace = makeTempDir();
+  const sessionDir = makeTempDir("cxc-");
+  const endpoint = createBrokerEndpoint(sessionDir);
+  saveBrokerSession(workspace, { endpoint, pidFile: null, logFile: null, sessionDir, state: "starting", startedAt: Date.now(), pid: process.pid, pidIdentity: null });
+  const server = await listenStub(endpoint, (socket) => socket.end());
+  t.after(() => server.close());
+  const lockDir = path.join(resolveStateDir(workspace), "state.lock.d");
+  let ticketsDuringProbe = null;
+  const session = await ensureBrokerSession(workspace, {
+    spawnBrokerProcessImpl: () => assert.fail("no spawn"),
+    getProcessIdentityImpl: () => {
+      ticketsDuringProbe = fs.existsSync(lockDir) ? fs.readdirSync(lockDir).filter((name) => name.endsWith(".ticket")).length : 0;
+      return "x:adopted";
+    }
+  });
+  assert.equal(ticketsDuringProbe, 0, "no lock is held during the probe");
+  assert.equal(session?.state, "ready");
+  assert.equal(loadBrokerSession(workspace)?.pidIdentity, "x:adopted");
+  clearBrokerSession(workspace);
+});
+
+// Wave 11 (B1): adoption binds the identity to the answering instance (two probes around the readiness check).
+async function adoptWithProbes(t, probes) {
+  const workspace = makeTempDir();
+  const sessionDir = makeTempDir("cxc-");
+  const endpoint = createBrokerEndpoint(sessionDir);
+  const starting = { endpoint, pidFile: null, logFile: null, sessionDir, state: "starting", startedAt: Date.now(), pid: process.pid, pidIdentity: null };
+  saveBrokerSession(workspace, starting);
+  const server = await listenStub(endpoint, (socket) => socket.end());
+  t.after(() => { server.close(); clearBrokerSession(workspace); });
+  const calls = [];
+  const session = await ensureBrokerSession(workspace, {
+    spawnBrokerProcessImpl: () => assert.fail("no spawn"),
+    getProcessIdentityImpl: (pid) => { calls.push(pid); return probes[Math.min(calls.length, probes.length) - 1]; }
+  });
+  return { session, calls, workspace, starting };
+}
+
+test("adoption promotes a starting broker when both identity probes agree", async (t) => {
+  const { session, calls, workspace } = await adoptWithProbes(t, ["x:same", "x:same"]);
+  assert.equal(session?.state, "ready");
+  assert.equal(session.pidIdentity, "x:same");
+  assert.equal(loadBrokerSession(workspace)?.pidIdentity, "x:same");
+  assert.deepEqual(calls, [process.pid, process.pid], "one probe before and one after the readiness check");
+});
+
+test("adoption does not promote when the pid was recycled across the answering window", async (t) => {
+  const { session, workspace, starting } = await adoptWithProbes(t, ["x:one", "x:two"]);
+  assert.equal(session, null, "direct transport");
+  assert.deepEqual(loadBrokerSession(workspace), starting, "the record is unchanged");
+});
+
+test("adoption does not promote when the first probe returns null", async (t) => {
+  // The second probe still runs (it is cheap to reason about); the result is null either way.
+  const { session, workspace, starting } = await adoptWithProbes(t, [null, "x:late"]);
+  assert.equal(session, null);
+  assert.deepEqual(loadBrokerSession(workspace), starting);
 });

@@ -13,6 +13,118 @@ const LAUNCHABLE = /\.(com|exe|bat|cmd)$/i;
 export function systemExe(name, env = process.env) {
   return path.win32.join(env?.SystemRoot || env?.SYSTEMROOT || "C:\\Windows", "System32", name);
 }
+
+export const WINDOWS_PROCESS_MISSING_EXIT = 241;
+export const WINDOWS_IDENTITY_MISMATCH_EXIT = 242;
+export const WINDOWS_TERMINATION_FAILED_EXIT = 243;
+export const WINDOWS_IDENTITY_UNAVAILABLE_EXIT = 244;
+export const WINDOWS_KILL_ABORTED_EXIT = 245;
+export const WIN32_MAX_PID = 2147483647;
+export const isWin32Pid = (pid) => Number.isInteger(pid) && pid >= 1 && pid <= WIN32_MAX_PID;
+const WINDOWS_IDENTITY_CIRCUIT_MS = 60000;
+const WINDOWS_ROOT = /^[A-Za-z]:\\[^\\/]+/;
+const PROTOCOL_LINE = /^[A-Z]+( \d+)*$/;
+let windowsIdentityUnavailableAt = null;
+
+export function resetWindowsIdentityCircuit() {
+  windowsIdentityUnavailableAt = null;
+}
+
+// The Windows directory, taken from the environment like every other System32
+// path since v1.4.0, but only when it is an absolute drive path that really
+// holds the in-box PowerShell 5.1 (never `pwsh`, #336; never `.`, never UNC).
+export function systemRoot(env, options = {}) {
+  const root = env?.SystemRoot ?? env?.SYSTEMROOT;
+  if (typeof root !== "string" || !WINDOWS_ROOT.test(root)) {
+    return null;
+  }
+  return (options.existsSyncImpl ?? fs.existsSync)(systemPowerShell(root)) ? root : null;
+}
+
+export function systemPowerShell(root) {
+  return path.win32.join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+}
+
+// PowerShell never inherits the job's environment: no PSModulePath pointing at
+// a repository, no CLR profiler hooks, no PATH. Exactly what it needs to start.
+export function powerShellEnvironment(root, env = process.env) {
+  const temp = (name) => (typeof env?.[name] === "string" && path.win32.isAbsolute(env[name]) ? env[name] : path.win32.join(root, "Temp"));
+  // Data locations only, they choose no executable (PATH and PSModulePath stay
+  // pinned). Without the module-analysis cache every launch re-analyses modules:
+  // 22-33 s cold vs 0.3 s warm, measured on the Windows runner.
+  const dataDir = (name) => (typeof env?.[name] === "string" && path.win32.isAbsolute(env[name]) ? { [name]: env[name] } : {});
+  return {
+    ...dataDir("LOCALAPPDATA"),
+    ...dataDir("PSModuleAnalysisCachePath"),
+    SystemRoot: root,
+    windir: root,
+    TEMP: temp("TEMP"),
+    TMP: temp("TMP"),
+    PATH: `${path.win32.join(root, "System32")};${root}`,
+    PATHEXT: ".EXE",
+    PSModulePath: path.win32.join(root, "System32", "WindowsPowerShell", "v1.0", "Modules"),
+    NoDefaultCurrentDirectoryInExePath: "1"
+  };
+}
+
+export function encodePowerShell(script) {
+  return Buffer.from(String(script), "utf16le").toString("base64");
+}
+
+// Scripts speak a machine-only protocol: upper-case words and integers. One
+// foreign line (a localised error, a stray prompt) voids the whole answer.
+export function parseProtocolLines(stdout) {
+  // No trimming: a line is the exact text between line breaks. Only the single
+  // newline that terminates the last line is optional.
+  const lines = String(stdout ?? "").split(/\r?\n/);
+  if (lines.length > 0 && lines[lines.length - 1] === "") {
+    lines.pop();
+  }
+  return lines.every((line) => PROTOCOL_LINE.test(line)) ? lines : null;
+}
+
+// One way to run PowerShell: validated absolute path, clean environment,
+// System32 as cwd, script as -EncodedCommand. A launcher that is missing,
+// invalid, hangs or reports 244 trips a per-process breaker: for a minute
+// every caller gets `unavailable` at once instead of each waiting out its own
+// timeout.
+export function runPowerShell(script, options = {}) {
+  const now = options.now ?? (() => performance.now());
+  const unavailable = { status: null, stdout: "", timedOut: false, unavailable: true };
+  const trip = () => {
+    windowsIdentityUnavailableAt = now();
+    return unavailable;
+  };
+  if (windowsIdentityUnavailableAt !== null && now() - windowsIdentityUnavailableAt < WINDOWS_IDENTITY_CIRCUIT_MS) {
+    return unavailable;
+  }
+  if (!(Number.isFinite(options.timeoutMs) && options.timeoutMs >= 1)) {
+    return unavailable;
+  }
+  const env = options.env ?? process.env;
+  const root = systemRoot(env, options);
+  if (!root) {
+    return trip();
+  }
+  const result = (options.runCommandImpl ?? runCommand)(
+    systemPowerShell(root),
+    ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encodePowerShell(script)],
+    { cwd: path.win32.join(root, "System32"), env: powerShellEnvironment(root, env), timeoutMs: options.timeoutMs, shell: false }
+  );
+  const timedOut = result.error?.code === "ETIMEDOUT" || (!result.error && result.status === null);
+  if (result.error?.code === "ENOENT" || timedOut || result.status === WINDOWS_IDENTITY_UNAVAILABLE_EXIT) {
+    // A kill that timed out says something about the target, not the launcher.
+    if (!(timedOut && options.tripOnTimeout === false)) {
+      windowsIdentityUnavailableAt = now();
+    }
+    return { ...unavailable, stdout: String(result.stdout ?? ""), timedOut };
+  }
+  if (!result.error) {
+    windowsIdentityUnavailableAt = null;
+  }
+  return { status: result.status ?? null, stdout: String(result.stdout ?? ""), timedOut: false, unavailable: false };
+}
+
 // cmd.exe metacharacters, escaped with ^ (cross-spawn's set).
 const CMD_META = /([()\][%!^"`<>&|;, *?])/g;
 
@@ -93,9 +205,10 @@ export function notFound(command) {
 
 export function runCommand(command, args = [], options = {}) {
   const windows = (options.platform ?? process.platform) === "win32";
-  // win32: a path is used as is, a bare name goes through where.exe. Nothing
-  // found is reported as ENOENT without spawning: libuv would otherwise search
-  // the cwd (the reviewed repo) for a same-named .exe.
+  // win32: a path is used as is, a bare name is resolved by the file-based
+  // resolver (PATH/PATHEXT scan, no where.exe). Nothing found is reported as
+  // ENOENT without spawning: libuv would otherwise search the cwd (the
+  // reviewed repo) for a same-named .exe.
   const target = !windows || /[\\/]/.test(command) ? command : resolveExecutable(command, options);
   if (target === null) {
     return { command, args, status: null, signal: null, stdout: "", stderr: "", error: notFound(command) };
@@ -193,6 +306,11 @@ export function processCommandLine(pid, options = {}) {
     }
   }
 
+  // A spent budget is no probe (spawnSync would read 0 as "no timeout").
+  if (options.timeoutMs !== undefined && !(options.timeoutMs > 0)) {
+    return null;
+  }
+
   const runCommandImpl = options.runCommandImpl ?? runCommand;
   const result = runCommandImpl("ps", ["-ww", "-o", "command=", "-p", String(pid)], {
     timeoutMs: options.timeoutMs,
@@ -210,6 +328,60 @@ const ownIdentityCache = new Map();
 // executable path that may contain spaces.
 const DARWIN_PS_LINE = /^(\w{3} \w{3} [ \d]\d \d\d:\d\d:\d\d \d{4})\s+(.+)$/;
 
+const WIN32_PROBE_BATCH = 256;
+const WIN32_IDENTITY_ROW = /^ID (\d+) (\d+)$/;
+
+function identityProbeScript(pids) {
+  return [
+    "$ErrorActionPreference = 'Stop'",
+    `if ($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage') { exit ${WINDOWS_IDENTITY_UNAVAILABLE_EXIT} }`,
+    `foreach ($p in @(Get-Process -Id ${pids.join(",")} -ErrorAction SilentlyContinue)) {`,
+    "  try { $null = $p.Handle; Write-Output ('ID {0} {1}' -f $p.Id, $p.StartTime.ToFileTimeUtc()) } catch { }",
+    "}"
+  ].join("\n");
+}
+
+// Several pids, one probe. On win32 that is one PowerShell run for the whole
+// list (a cold start costs 0.5-3 s; per pid it would multiply); elsewhere the
+// per-pid probe is already cheap and is called unchanged. Unknown, missing or
+// unparseable → null; too many pids → the extra ones stay null.
+export function getProcessIdentities(pids, options = {}) {
+  const platform = options.platform ?? process.platform;
+  const wanted = [...new Set(pids.filter(isWin32Pid))];
+  const map = new Map(wanted.map((pid) => [pid, null]));
+  if (wanted.length === 0) {
+    return map;
+  }
+  if (platform !== "win32") {
+    for (const pid of wanted) {
+      map.set(pid, getProcessIdentity(pid, options));
+    }
+    return map;
+  }
+  const sent = new Set(wanted.slice(0, WIN32_PROBE_BATCH));
+  const probe = runPowerShell(identityProbeScript([...sent]), { ...options, timeoutMs: options.timeoutMs ?? 10000 });
+  const lines = probe.unavailable || probe.status !== 0 ? null : parseProtocolLines(probe.stdout);
+  // The whole answer must be ID rows, each for a pid this run actually sent,
+  // each pid at most once. A stray OK, a duplicate or a pid outside the batch
+  // voids the answer as a whole: partial trust in a script's output is how a
+  // wrong identity gets in.
+  const rows = [];
+  const seen = new Set();
+  for (const line of lines ?? []) {
+    const row = WIN32_IDENTITY_ROW.exec(line);
+    const pid = row ? Number(row[1]) : null;
+    if (!row || !sent.has(pid) || seen.has(pid)) {
+      return map;
+    }
+    seen.add(pid);
+    rows.push([pid, `win32:${row[2]}`]);
+  }
+  for (const [pid, identity] of rows) {
+    map.set(pid, identity);
+  }
+  return map;
+}
+
 // Who a PID belongs to, beyond the number the OS recycles (#743): its start time
 // (plus the executable on darwin, where `lstart` only has second resolution).
 // Two reads for the same process always agree; a process that inherited the PID
@@ -220,7 +392,17 @@ export function getProcessIdentity(pid, options = {}) {
   }
   const platform = options.platform ?? process.platform;
   if (platform === "win32") {
-    return null; // ponytail: CIM (CreationDate) identity lands in v1.4.0
+    if (!isWin32Pid(pid)) {
+      return null;
+    }
+    if (pid === process.pid && ownIdentityCache.has(platform)) {
+      return ownIdentityCache.get(platform);
+    }
+    const identity = getProcessIdentities([pid], options).get(pid) ?? null;
+    if (pid === process.pid && identity) {
+      ownIdentityCache.set(platform, identity);
+    }
+    return identity;
   }
   if (pid === process.pid && ownIdentityCache.has(platform)) {
     return ownIdentityCache.get(platform);
@@ -267,6 +449,186 @@ export function workerCommandLine(jobId) {
   return new RegExp(`task-worker.*--job-id ${escaped}(\\s|$)`);
 }
 
+const KILL_DEADLINE_MARGIN_MS = 500;
+const KILL_MIN_BUDGET_MS = 750;
+const FILETIME_EPOCH_OFFSET = 116444736000000000n;
+
+export function fileTimeAt(ms) {
+  return (BigInt(Math.floor(ms)) * 10000n + FILETIME_EPOCH_OFFSET).toString();
+}
+
+// Every substitution is digits only (validated by the caller).
+export function terminateScript(pid, fileTime, exclude, deadlineFileTime) {
+  return [
+    "$ErrorActionPreference = 'Stop'",
+    "if ($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage') { exit 244 }",
+    "$target = <pid>",
+    "$expected = '<fileTime>'",
+    "$exclude = @{<exclude>}",
+    "$deadline = [DateTime]::FromFileTimeUtc(<deadlineFileTime>)",
+    "$pinned = @()",
+    "function Pin([int]$id) {",
+    "  $h = [System.Diagnostics.Process]::GetProcessById($id)",
+    "  $null = $h.Handle",
+    "  $script:pinned += $h",
+    "  return $h",
+    "}",
+    "function Micro($dt) { $t = [long]$dt.ToUniversalTime().Ticks; return $t - ($t % 10) }",
+    "function Remaining() { return [int][Math]::Floor([Math]::Max(0, ($deadline - [DateTime]::UtcNow).TotalMilliseconds)) }",
+    "# The pinned descendants of $top (started at $topStart), from one CIM snapshot: BFS over ParentProcessId,",
+    "# each child admitted only when its pinned start equals its row's and is no earlier than its parent's.",
+    "function Walk([int]$top, [long]$topStart) {",
+    "  $rows = @(Get-CimInstance -ClassName Win32_Process -Property ProcessId,ParentProcessId,CreationDate | Select-Object ProcessId, ParentProcessId, CreationDate)",
+    "  $found = @()",
+    "  $starts = @{ $top = $topStart }",
+    "  $seen = @{ $top = $true }",
+    "  $queue = @($top)",
+    "  while ($queue.Count -gt 0) {",
+    "    $pp = $queue[0]",
+    "    $queue = @($queue | Select-Object -Skip 1)",
+    "    foreach ($r in $rows) {",
+    "      $cid = [int]$r.ProcessId",
+    "      if ([int]$r.ParentProcessId -ne $pp -or $seen.ContainsKey($cid)) { continue }",
+    "      $seen[$cid] = $true",
+    "      try { $h = Pin $cid } catch [System.ArgumentException] { continue }   # already gone: proven",
+    "      $live = Micro $h.StartTime",
+    "      if ($exclude.ContainsKey($cid) -and $exclude[$cid] -eq $h.StartTime.ToFileTimeUtc().ToString()) { continue }",
+    "      if ($live -ne (Micro $r.CreationDate)) { continue }                  # a stranger holding a reused pid",
+    "      if ($live -lt $starts[$pp]) { continue }                             # stale ParentProcessId",
+    "      $starts[$cid] = $live",
+    "      $found += $h",
+    "      $queue += $cid",
+    "    }",
+    "  }",
+    "  return $found",
+    "}",
+    "$tree = @()",
+    "$code = 245",
+    "try {",
+    "  try {",
+    "    try { $root = Pin $target } catch [System.ArgumentException] {",
+    "      # The root is gone. Its descendants still reachable through ParentProcessId (created no earlier than",
+    "      # the recorded root, the verified exclusion skipped) are reported, never killed: parent pid and time",
+    "      # order are all that tie them to it. $code stays 245 until the pass is complete, so a failed",
+    "      # enumeration is never a clean 241.",
+    "      $floor = Micro ([DateTime]::FromFileTimeUtc([long]$expected))",
+    "      $orphans = @()",
+    "      foreach ($h in @(Walk $target $floor)) { $orphans += ('SURVIVOR {0} {1}' -f $h.Id, $h.StartTime.ToFileTimeUtc().ToString()) }",
+    "      foreach ($line in $orphans) { Write-Output $line }",
+    "      $code = 241; throw 'missing'",
+    "    }",
+    "    if ($root.StartTime.ToFileTimeUtc().ToString() -ne $expected) { $code = 242; throw 'mismatch' }",
+    "    $tree = @($root) + @(Walk $target (Micro $root.StartTime))",
+    "    if ((Remaining) -lt 250) { $code = 245; throw 'budget' }",
+    "  } catch { exit $code }",
+    "  Write-Output 'KILL'",
+    "  $survivors = @()",
+    "  try {",
+    "    [array]::Reverse($tree)",
+    "    foreach ($h in $tree) { try { $h.Kill() } catch { } }",
+    "    foreach ($h in $tree) {",
+    "      $confirmed = $false",
+    "      while (-not $confirmed) {",
+    "        $left = Remaining",
+    "        if ($left -le 0) { break }",
+    "        try { if ($h.WaitForExit([Math]::Min(250, $left))) { $confirmed = $true } } catch { break }",
+    "      }",
+    "      if (-not $confirmed) { $survivors += $h }",
+    "    }",
+    "  } catch {",
+    "    $survivors = @($tree)",
+    "  }",
+    "  if ($survivors.Count -eq 0) { Write-Output 'OK'; exit 0 }",
+    "  # Identity from the still-pinned object: a later report can never be confused with a reused pid.",
+    "  foreach ($h in $survivors) { $ft = '0'; try { $ft = $h.StartTime.ToFileTimeUtc().ToString() } catch { }; Write-Output ('SURVIVOR {0} {1}' -f $h.Id, $ft) }",
+    "  exit 243",
+    "} finally {",
+    "  foreach ($h in $pinned) { try { $h.Dispose() } catch { } }",
+    "}"
+  ]
+    .join("\n")
+    .replace("<pid>", String(pid))
+    .replace("<fileTime>", fileTime)
+    .replace("@{<exclude>}", `@{${exclude.map((e) => ` ${e.pid} = '${e.fileTime}'`).join(";")}${exclude.length ? " " : ""}}`)
+    .replace("<deadlineFileTime>", deadlineFileTime);
+}
+
+// One PowerShell run pins the recorded process (GetProcessById + .Handle), proves
+// its start time, builds the tree from a CIM snapshot admitting only children
+// whose pinned start time equals the snapshot's at microsecond precision and
+// follows their parent's, skips the verified excluded processes (the shared broker), kills children-first through
+// the pinned objects and waits for each until an absolute deadline. Every answer
+// is an exit code plus protocol lines; an exit that could not be confirmed is a
+// survivor, and a corrupted answer after KILL is an unverified attempt. A root
+// already gone (241) reports the orphans it left — the same walk from the root's
+// pid with its recorded start as the floor, so transitive, time-ordered and
+// skipping the excluded broker — as SURVIVOR rows, never killed.
+function terminateWindowsRecordedProcess(pid, identity, options) {
+  const refused = (reason) => ({ attempted: false, delivered: false, reason });
+  const fileTime = typeof identity === "string" ? /^win32:(\d+)$/.exec(identity)?.[1] : null;
+  const timeoutMs = options.timeoutMs ?? 10000;
+  if (!fileTime || !isWin32Pid(pid) || !(Number.isFinite(timeoutMs) && timeoutMs >= KILL_MIN_BUDGET_MS)) {
+    return refused("identity-unavailable");
+  }
+  const exclude = (options.exclude ?? [])
+    .map((e) => ({ pid: e?.pid, fileTime: typeof e?.identity === "string" ? /^win32:(\d+)$/.exec(e.identity)?.[1] : null }))
+    .filter((e) => isWin32Pid(e.pid) && e.fileTime);
+  const deadline = fileTimeAt((options.clock ?? Date.now)() + timeoutMs - KILL_DEADLINE_MARGIN_MS);
+  const run = runPowerShell(terminateScript(pid, fileTime, exclude, deadline), { ...options, timeoutMs, tripOnTimeout: false });
+  // An exact KILL line anywhere proves the destructive phase began; a clean
+  // sequence is required for anything stronger than "attempted".
+  // `rawLines` are exact lines (no trim): "KILL" must be the whole line.
+  const rawLines = String(run.stdout ?? "").split(/\r?\n/);
+  const protocol = parseProtocolLines(run.stdout);
+  const clean = protocol !== null;
+  const killStarted = rawLines.includes("KILL");
+  const failed = (extra) => ({ attempted: true, delivered: false, method: "handle", reason: "kill-failed", ...extra });
+  const unverified = () => failed({ survivors: [], unverified: true });
+  // The exit code classifies, the protocol refines, a contradiction is unknown:
+  // a KILL line next to a pre-kill exit code cannot come from our script.
+  if (killStarted && run.status !== 0 && run.status !== WINDOWS_TERMINATION_FAILED_EXIT) {
+    return unverified();
+  }
+  if (run.unavailable) {
+    return refused("identity-unavailable");
+  }
+  switch (run.status) {
+    case 0:
+      if (clean && protocol.length === 2 && protocol[0] === "KILL" && protocol[1] === "OK") {
+        return { attempted: true, delivered: true, method: "handle", reason: "identity-match" };
+      }
+      return killStarted ? unverified() : refused("identity-unavailable");
+    case WINDOWS_PROCESS_MISSING_EXIT: {
+      // Gone before the pin. Only SURVIVOR rows (orphans it left) may follow.
+      const missing = { attempted: false, delivered: false, method: "handle", reason: "process-missing" };
+      if (run.stdout === "") {
+        return missing;
+      }
+      const survivors = clean ? survivorsOf(protocol) : null;
+      return survivors ? { ...missing, survivors } : refused("identity-unavailable");
+    }
+    case WINDOWS_IDENTITY_MISMATCH_EXIT:
+      return run.stdout !== "" ? refused("identity-unavailable") : { attempted: false, delivered: false, method: "handle", reason: "identity-mismatch" };
+    case WINDOWS_TERMINATION_FAILED_EXIT: {
+      // A 243 without at least one SURVIVOR row is not the script's answer.
+      const survivors = clean && protocol[0] === "KILL" ? survivorsOf(protocol.slice(1)) : null;
+      return survivors ? failed({ survivors }) : unverified();
+    }
+    default:
+      return refused("identity-unavailable");
+  }
+}
+
+// At least one SURVIVOR row, every line one, each a valid pid at most once;
+// anything else is null (not the script's answer).
+function survivorsOf(lines) {
+  const rows = lines.map((line) => /^SURVIVOR (\d+) (\d+)$/.exec(line));
+  if (rows.length === 0 || !rows.every((row) => row && isWin32Pid(Number(row[1]))) || new Set(rows.map((row) => row[1])).size !== rows.length) {
+    return null;
+  }
+  return rows.map((row) => ({ pid: Number(row[1]), identity: row[2] === "0" ? null : `win32:${row[2]}` }));
+}
+
 // Signals a recorded PID only once it is proven to still be the recorded
 // process: by identity when one was recorded, else (posix records from before
 // identities) by its command line. Anything unprovable is left alone and the
@@ -277,14 +639,14 @@ export function terminateRecordedProcess(pid, options = {}) {
   }
   const platform = options.platform ?? process.platform;
   const identity = options.identity ?? null;
+  if (platform === "win32") {
+    return terminateWindowsRecordedProcess(pid, identity, options);
+  }
   // null when the pid is still provably the recorded process, else why not.
   const refusal = () => {
     if (identity) {
       const actual = getProcessIdentity(pid, options);
       return !actual ? "identity-unavailable" : actual !== identity ? "identity-mismatch" : null;
-    }
-    if (platform === "win32") {
-      return "identity-unavailable";
     }
     const commandLine = processCommandLine(pid, options);
     const match = options.commandLineMatch;

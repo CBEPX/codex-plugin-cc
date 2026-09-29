@@ -6,9 +6,9 @@ import { spawn } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
-import { homeEnv, initGitRepo, IS_WIN, makeTempDir, run } from "./helpers.mjs";
+import { cimTree, homeEnv, initGitRepo, IS_WIN, makeTempDir, run, waitFor } from "./helpers.mjs";
 import { loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
-import { getProcessIdentity } from "../plugins/codex/scripts/lib/process.mjs";
+import { getProcessIdentity, isPidAlive } from "../plugins/codex/scripts/lib/process.mjs";
 import { resolveClaudeSessionPath, resolveClaudeProjectsDir } from "../plugins/codex/scripts/lib/claude-session-transfer.mjs";
 import {
   consumeJobRequestFile,
@@ -38,19 +38,7 @@ const FAKE_RESOLVED_SETTINGS = {
   }
 };
 
-// 30 s: hosted Windows VMs have been seen 2-3x slower for hours; a detached
-// worker can take >10 s just to reach `running` there.
-async function waitFor(predicate, { timeoutMs = 30000, intervalMs = 50 } = {}) {
-  const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
-    const value = await predicate();
-    if (value) {
-      return value;
-    }
-    await new Promise((resolve) => setTimeout(resolve, intervalMs));
-  }
-  throw new Error("Timed out waiting for condition.");
-}
+const isAlive = (pid) => isPidAlive(pid) === true;
 
 function readPersistedJob(workspaceRoot, jobId = null) {
   const stateDir = resolveStateDir(workspaceRoot);
@@ -2001,7 +1989,7 @@ test("cancel through the no-identity command-line fallback refuses a foreign pid
 
 // The parent records the worker's identity next to its pid, so cancel can prove
 // the pid is still that worker before signalling it.
-test("a background worker's pid sidecar carries its identity and cancel signals it", { skip: process.platform === "win32" }, async () => {
+test("a background worker's pid sidecar carries its identity and cancel signals it", async () => {
   const repo = seededRepo();
   const binDir = makeTempDir();
   installFakeCodex(binDir);
@@ -2013,7 +2001,11 @@ test("a background worker's pid sidecar carries its identity and cancel signals 
   try {
     assert.ok(Number.isInteger(sidecar.pid));
     assert.equal(sidecar.identity, getProcessIdentity(sidecar.pid));
-    assert.match(sidecar.identity, /^(linux|darwin):/);
+    assert.match(sidecar.identity, /^(linux|darwin|win32):/);
+    // v1.4.1 refuses kills while the broker record has no identity (Windows start window).
+    if (IS_WIN) {
+      await waitFor(() => (/^win32:\d+$/.test(loadBrokerSession(repo)?.pidIdentity ?? "") ? "ready" : null));
+    }
     const cancel = run(process.execPath, [SCRIPT, "cancel", jobId], { cwd: repo, env });
     assert.equal(cancel.status, 0, cancel.stderr);
     assert.doesNotMatch(cancel.stdout, /left running/);
@@ -2164,17 +2156,11 @@ test("cancel sends turn interrupt to the shared app-server before killing a brok
     env
   });
 
-  if (IS_WIN && cancelResult.status === 1) {
-    // Documented v1.3.0 refusal: the interrupt is sent, but a worker still alive
-    // is not signalled without an identity (until v1.4.1), so cancel stays pending.
-    assert.deepEqual(JSON.parse(cancelResult.stdout), { jobId, status: "running", cancellationPending: true, reason: "identity-unavailable" });
-  } else {
-    assert.equal(cancelResult.status, 0, cancelResult.stderr);
-    const cancelPayload = JSON.parse(cancelResult.stdout);
-    assert.equal(cancelPayload.status, "cancelled");
-    assert.equal(cancelPayload.turnInterruptAttempted, true);
-    assert.equal(cancelPayload.turnInterrupted, true);
-  }
+  assert.equal(cancelResult.status, 0, cancelResult.stderr);
+  const cancelPayload = JSON.parse(cancelResult.stdout);
+  assert.equal(cancelPayload.status, "cancelled");
+  assert.equal(cancelPayload.turnInterruptAttempted, true);
+  assert.equal(cancelPayload.turnInterrupted, true);
 
   await waitFor(() => {
     const fakeState = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
@@ -2196,6 +2182,27 @@ test("cancel sends turn interrupt to the shared app-server before killing a brok
     })
   });
   assert.equal(cleanup.status, 0, cleanup.stderr);
+});
+
+// A cancel that lands after the spawn but before the worker takes the record
+// over writes `cancelled`; the worker that starts afterwards must not run it.
+test("a worker started against a cancelled job exits without running the turn", () => {
+  const repo = seededRepo();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
+  const jobId = "task-cancelled-before-start";
+  const record = { id: jobId, kind: "task", jobClass: "task", title: "Codex Task", workspaceRoot: repo, status: "cancelled", phase: "cancelled", background: true, pid: null, pidIdentity: null, errorMessage: "Cancelled by user.", completedAt: new Date().toISOString(), request: { prompt: "never run" } };
+  writeJobFile(repo, jobId, record);
+  upsertJob(repo, record);
+  const worker = run(process.execPath, [SCRIPT, "task-worker", "--cwd", repo, "--job-id", jobId], { cwd: repo, env: buildEnv(binDir) });
+  assert.equal(worker.status, 0, worker.stderr);
+  const stored = readJobFile(resolveJobFile(repo, jobId));
+  assert.equal(stored.status, "cancelled");
+  assert.equal(stored.startedAt, undefined, "no running record was written");
+  assert.equal(stored.result, undefined);
+  const appServerStarts = fs.existsSync(fakeStatePath) ? JSON.parse(fs.readFileSync(fakeStatePath, "utf8")).appServerStarts : 0;
+  assert.equal(appServerStarts, 0, "no Codex turn may start for a cancelled job");
 });
 
 test("session end fully cleans up jobs for the ending session", async (t) => {
@@ -2304,19 +2311,6 @@ test("session end fully cleans up jobs for the ending session", async (t) => {
   assert.equal(result.status, 0, result.stderr);
   assert.equal(fs.existsSync(otherSessionLog), true);
   assert.equal(fs.existsSync(otherJobFile), true);
-  if (IS_WIN) {
-    // Documented v1.3.0 refusal: without a worker identity (until v1.4.1) the
-    // hook does not signal the running job and keeps its record, saying why.
-    assert.match(result.stderr, /\[codex\] SessionEnd left review-running running: identity-unavailable/);
-    const kept = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8")).jobs;
-    assert.deepEqual(kept.map((job) => job.id).sort(), ["review-other", "review-running"]);
-    assert.deepEqual(
-      (({ status, pid }) => ({ status, pid }))(kept.find((job) => job.id === "review-running")),
-      { status: "running", pid: sleeper.pid }
-    );
-    assert.equal(fs.existsSync(runningJobFile), true);
-    return;
-  }
   assert.deepEqual(
     fs.readdirSync(path.dirname(otherJobFile)).sort(),
     [path.basename(otherJobFile), path.basename(otherSessionLog)].sort()
@@ -2436,21 +2430,15 @@ test("session end preserves background jobs and their broker so workers survive 
 
   assert.equal(result.status, 0, result.stderr);
 
-  if (IS_WIN) {
-    // Documented v1.3.0 refusal: the foreground worker is not signalled without
-    // an identity (until v1.4.1); its record stays and the hook says why.
-    assert.match(result.stderr, /\[codex\] SessionEnd left review-foreground running: identity-unavailable/);
-  } else {
-    // Foreground job killed + pruned from state.
-    await waitFor(() => {
-      try {
-        process.kill(foregroundSleeper.pid, 0);
-        return false;
-      } catch (error) {
-        return error?.code === "ESRCH";
-      }
-    });
-  }
+  // Foreground job killed + pruned from state.
+  await waitFor(() => {
+    try {
+      process.kill(foregroundSleeper.pid, 0);
+      return false;
+    } catch (error) {
+      return error?.code === "ESRCH";
+    }
+  });
 
   // Background job still alive — its worker outlives the session that started it.
   assert.equal(
@@ -2469,7 +2457,7 @@ test("session end preserves background jobs and their broker so workers survive 
   const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
   assert.deepEqual(
     state.jobs.map((job) => job.id).sort(),
-    IS_WIN ? ["review-foreground", "task-background"] : ["task-background"],
+    ["task-background"],
     "background job stays in state so later sessions can poll it"
   );
   assert.equal(fs.existsSync(backgroundJobFile), true, "background job file preserved");
@@ -3881,17 +3869,11 @@ test("cancelling an awaited job ends the await with exit 1 and leaves a readable
     return job && job.status === "running" && job.pid ? job.id : null;
   }, { timeoutMs: 15000 });
 
-  // A job can be cancelled once, so POSIX keeps the rendered (text) path and
-  // win32 reads the structured cancellationPending answer.
-  const cancelled = run(process.execPath, [SCRIPT, "cancel", jobId, ...(IS_WIN ? ["--json"] : [])], { cwd: repo, env });
+  // v1.4.1 refuses kills while the broker record has no identity (Windows start window).
   if (IS_WIN) {
-    // Documented v1.3.0 refusal: win32 has no worker process identity yet (v1.4.1),
-    // so cancel does not signal the worker and reports cancellationPending + exit 1.
-    assert.equal(cancelled.status, 1, cancelled.stderr);
-    assert.deepEqual(JSON.parse(cancelled.stdout), { jobId, status: "running", cancellationPending: true, reason: "identity-unavailable" });
-    await exited;
-    return;
+    await waitFor(() => (/^win32:\d+$/.test(loadBrokerSession(repo)?.pidIdentity ?? "") ? "ready" : null));
   }
+  const cancelled = run(process.execPath, [SCRIPT, "cancel", jobId], { cwd: repo, env });
   assert.equal(cancelled.status, 0, cancelled.stderr);
   assert.match(cancelled.stdout, /cancelled/i);
   assert.equal(await exited, 1);
@@ -3933,9 +3915,19 @@ test("an acknowledged cancellation survives a worker that finishes after it", { 
 
   const cancelled = run(process.execPath, [SCRIPT, "cancel", jobId, "--json"], { cwd: repo, env });
   assert.equal(cancelled.status, 0, cancelled.stderr);
-  assert.equal(JSON.parse(cancelled.stdout).status, "cancelled");
+  // Read only on failure: which record the cancel found, and who wrote it.
+  const jobDiagnostics = () => {
+    try {
+      const record = JSON.parse(fs.readFileSync(path.join(resolveStateDir(repo), "jobs", `${jobId}.json`), "utf8"));
+      const log = fs.readFileSync(record.logFile, "utf8").split("\n").slice(-20).join("\n");
+      return `record: ${JSON.stringify({ status: record.status, phase: record.phase, workerClosed: record.workerClosed, errorMessage: record.errorMessage })}\njob log tail:\n${log}`;
+    } catch (error) {
+      return `(job record unreadable: ${error.message})`;
+    }
+  };
+  assert.equal(JSON.parse(cancelled.stdout).status, "cancelled", `cancel said: ${cancelled.stdout.trim()}\n${jobDiagnostics()}`);
 
-  const isAlive = () => {
+  const workerAlive = () => {
     try {
       process.kill(workerPid, 0);
       return true;
@@ -3943,7 +3935,7 @@ test("an acknowledged cancellation survives a worker that finishes after it", { 
       return false;
     }
   };
-  await waitFor(() => !isAlive(), { timeoutMs: 20000 });
+  await waitFor(() => !workerAlive(), { timeoutMs: 20000 });
 
   const stored = run(process.execPath, [SCRIPT, "result", jobId, "--json"], { cwd: repo, env: buildEnv(binDir) });
   assert.equal(stored.status, 0, stored.stderr);
@@ -4110,9 +4102,8 @@ test("task rejects a non-positive turn budget", () => {
 // cancelled at all) means cancel can now kill a worker *before* it consumed its
 // private one-shot payload. A cancelled job is terminal, so the reaper will
 // never look at it again — cancel has to release the file itself. The worker's
-// identity is recorded, so the kill is provable (win32 has no identity yet, and
-// there a live unprovable worker keeps the job running instead).
-test("cancel removes the private request payload of a job killed in the queued window", { skip: process.platform === "win32" }, async (t) => {
+// identity is recorded, so the kill is provable.
+test("cancel removes the private request payload of a job killed in the queued window", async (t) => {
   const repo = seededRepo();
   const stateDir = resolveStateDir(repo);
   const jobsDir = path.join(stateDir, "jobs");
@@ -4344,4 +4335,134 @@ test("status --wait reports a timeout in text output and exits 1 while the job i
   assert.match(status.stdout, /Timed out after 1s while the job was still running\./);
   const done = run(process.execPath, [SCRIPT, "result", jobId, "--wait", "--timeout-ms", "20000"], { cwd: repo, env });
   assert.equal(done.status, 0, done.stderr);
+});
+
+test("cancel on Windows kills a direct worker and the codex.cmd tree under it", { skip: !IS_WIN, timeout: 90_000 }, async (t) => {
+  const repo = seededRepo(); const binDir = makeTempDir(); installFakeCodex(binDir);
+  const seeded = run(process.execPath, [SCRIPT, "task", "initial task"], { cwd: repo, env: buildEnv(binDir) });
+  assert.equal(seeded.status, 0, seeded.stderr);
+  // A cold resume owns its own app-server, so the tree hangs under the worker, not the broker.
+  const env = buildEnv(binDir, { FAKE_CODEX_TURN_DELAY_MS: "60000", FAKE_CODEX_IGNORE_INTERRUPT: "1" });
+  const launched = run(process.execPath, [SCRIPT, "task", "--background", "--resume-last", "--json", "hold"], { cwd: repo, env });
+  assert.equal(launched.status, 0, launched.stderr);
+  const jobId = JSON.parse(launched.stdout).jobId;
+  const withPid = await waitFor(() => { const j = readPersistedJob(repo, jobId); return j.pid ? j : null; });
+  t.after(() => { try { process.kill(withPid.pid, "SIGKILL"); } catch {} });
+  const running = await waitFor(() => { const j = readPersistedJob(repo, jobId); return j.status === "running" && j.pidIdentity && j.threadId && j.turnId ? j : null; });
+  assert.match(running.pidIdentity, /^win32:\d+$/);
+  const tree = cimTree(running.pid);
+  t.after(() => { for (const { pid } of tree) { try { process.kill(pid, "SIGKILL"); } catch {} } });
+  assert.ok(tree.some((n) => /^cmd\.exe$/i.test(n.name)) && tree.filter((n) => /^node\.exe$/i.test(n.name)).length >= 2, `expected worker → cmd.exe → node.exe, got ${JSON.stringify(tree)}`);
+  const cancel = run(process.execPath, [SCRIPT, "cancel", jobId, "--json"], { cwd: repo, env });
+  assert.equal(cancel.status, 0, cancel.stderr);
+  await waitFor(() => (tree.every((n) => !isAlive(n.pid)) ? "gone" : null));
+  assert.equal(readPersistedJob(repo, jobId).status, "cancelled");
+});
+
+test("cancel on Windows leaves the shared broker and its subtree alive, and the same app-server serves the next job", { skip: !IS_WIN, timeout: 120_000 }, async (t) => {
+  const repo = seededRepo(); const binDir = makeTempDir(); installFakeCodex(binDir);
+  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
+  const env = buildEnv(binDir, { FAKE_CODEX_TURN_DELAY_MS: "60000", FAKE_CODEX_IGNORE_INTERRUPT: "1", CODEX_COMPANION_BROKER_IDLE_TIMEOUT_MS: "60000" });
+  const launched = run(process.execPath, [SCRIPT, "task", "--background", "--json", "hold A"], { cwd: repo, env });
+  const jobA = JSON.parse(launched.stdout).jobId;
+  const withPid = await waitFor(() => { const j = readPersistedJob(repo, jobA); return j.pid ? j : null; });
+  t.after(() => { try { process.kill(withPid.pid, "SIGKILL"); } catch {} });
+  await waitFor(() => { const j = readPersistedJob(repo, jobA); return j.status === "running" && j.turnId ? j : null; });
+  const broker = loadBrokerSession(repo);
+  assert.ok(broker?.pid, "worker A started the shared broker");
+  t.after(() => { try { process.kill(broker.pid, "SIGKILL"); } catch {} });
+  const brokerTree = cimTree(broker.pid);
+  t.after(() => { for (const { pid } of brokerTree) { try { process.kill(pid, "SIGKILL"); } catch {} } });
+  assert.ok(brokerTree.some((n) => /^cmd\.exe$/i.test(n.name)), `expected the app-server tree under the broker, got ${JSON.stringify(brokerTree)}`);
+  assert.equal(JSON.parse(fs.readFileSync(fakeStatePath, "utf8")).appServerStarts, 1);
+  // The broker is A's child by ParentProcessId on Windows; the kill must skip its whole subtree.
+  const cancel = run(process.execPath, [SCRIPT, "cancel", jobA, "--json"], { cwd: repo, env });
+  assert.equal(cancel.status, 0, cancel.stderr);
+  await waitFor(() => (!isAlive(withPid.pid) ? "gone" : null));
+  assert.equal(isAlive(broker.pid), true, "the shared broker survives a worker kill");
+  assert.ok(brokerTree.every((n) => isAlive(n.pid)), "the broker's subtree survives");
+  // The same app-server still serves: the fake holds every turn 60 s, so bound the next job by the turn timeout
+  // and prove it went through the existing app-server (no second start) rather than a direct fallback.
+  const next = run(process.execPath, [SCRIPT, "task", "--turn-timeout-ms", "3000", "--json", "quick C"], { cwd: repo, env, timeout: 60000 });
+  assert.equal(next.error, undefined);
+  assert.equal(next.status, 1, next.stderr);
+  // The foreground JSON carries only the payload; the stored job carries the outcome.
+  const jobC = readPersistedJob(repo);
+  assert.notEqual(jobC.id, jobA);
+  assert.match(jobC.errorMessage ?? "", /turn timed out after 3000 ms/, "the next job really ran a turn (and hit its budget)");
+  const fakeState = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
+  assert.equal(fakeState.appServerStarts, 1, "no second app-server was started for the next job");
+  assert.equal(fakeState.lastTurnStart?.prompt, "quick C", "the turn went through the existing app-server");
+  assert.equal(loadBrokerSession(repo)?.pid, broker.pid, "no replacement broker was started");
+});
+
+test("a root that died before cancel is failed by the reaper on Windows; nothing is signalled by number", { skip: !IS_WIN, timeout: 90_000 }, async (t) => {
+  const repo = seededRepo(); const binDir = makeTempDir(); installFakeCodex(binDir);
+  const seeded = run(process.execPath, [SCRIPT, "task", "initial task"], { cwd: repo, env: buildEnv(binDir) });
+  assert.equal(seeded.status, 0, seeded.stderr);
+  const env = buildEnv(binDir, { FAKE_CODEX_TURN_DELAY_MS: "60000", FAKE_CODEX_IGNORE_INTERRUPT: "1" });
+  const launched = run(process.execPath, [SCRIPT, "task", "--background", "--resume-last", "--json", "hold"], { cwd: repo, env });
+  const jobId = JSON.parse(launched.stdout).jobId;
+  const withPid = await waitFor(() => { const j = readPersistedJob(repo, jobId); return j.pid ? j : null; });
+  t.after(() => { try { process.kill(withPid.pid, "SIGKILL"); } catch {} });
+  await waitFor(() => { const j = readPersistedJob(repo, jobId); return j.status === "running" && j.turnId ? j : null; });
+  const tree = cimTree(withPid.pid);
+  t.after(() => { for (const { pid } of tree) { try { process.kill(pid, "SIGKILL"); } catch {} } });
+  process.kill(withPid.pid, "SIGKILL");
+  await waitFor(() => (!isAlive(withPid.pid) ? "dead" : null));
+  const cancel = run(process.execPath, [SCRIPT, "cancel", jobId, "--json"], { cwd: repo, env });
+  assert.notEqual(cancel.status, 0, "the reaper already failed the job; cancel has nothing active to signal");
+  assert.equal(readPersistedJob(repo, jobId).status, "failed");
+  // The orphaned children are the documented limitation here: nothing is touched by number.
+  assert.ok(tree.filter((n) => n.pid !== withPid.pid).some((n) => isAlive(n.pid)));
+});
+
+test("a reused-looking identity is never signalled on Windows: the reaper fails the job and cancel reports it", { skip: !IS_WIN, timeout: 90_000 }, async (t) => {
+  const repo = seededRepo(); const binDir = makeTempDir(); installFakeCodex(binDir);
+  const env = buildEnv(binDir, { FAKE_CODEX_TURN_DELAY_MS: "60000", FAKE_CODEX_IGNORE_INTERRUPT: "1" });
+  const launched = run(process.execPath, [SCRIPT, "task", "--background", "--json", "hold"], { cwd: repo, env });
+  const jobId = JSON.parse(launched.stdout).jobId;
+  const withPid = await waitFor(() => { const j = readPersistedJob(repo, jobId); return j.pid ? j : null; });
+  t.after(() => { try { process.kill(withPid.pid, "SIGKILL"); } catch {} });
+  await waitFor(() => { const j = readPersistedJob(repo, jobId); return j.status === "running" && j.pidIdentity ? j : null; });
+  upsertJob(repo, { id: jobId, pidIdentity: "win32:1" });
+  const jobFile = path.join(resolveStateDir(repo), "jobs", `${jobId}.json`);
+  fs.writeFileSync(jobFile, JSON.stringify({ ...JSON.parse(fs.readFileSync(jobFile, "utf8")), pidIdentity: "win32:1" }));
+  const cancel = run(process.execPath, [SCRIPT, "cancel", jobId, "--json"], { cwd: repo, env });
+  assert.notEqual(cancel.status, 0);
+  assert.equal(isAlive(withPid.pid), true, "the process holding the pid is a stranger to this record and must stay");
+  const stored = readPersistedJob(repo, jobId);
+  assert.equal(stored.status, "failed");
+  assert.match(stored.errorMessage ?? "", /pid reused/);
+});
+
+test("SessionEnd tears down a broker that acknowledged shutdown but stayed up, by its recorded identity", { skip: !IS_WIN, timeout: 90_000 }, async (t) => {
+  const repo = seededRepo(); const binDir = makeTempDir(); installFakeCodex(binDir);
+  const env = buildEnv(binDir, { CODEX_COMPANION_SESSION_ID: "sess-win", CODEX_COMPANION_BROKER_HANG_ON_SHUTDOWN: "1", CODEX_COMPANION_BROKER_IDLE_TIMEOUT_MS: "60000" });
+  const seeded = run(process.execPath, [SCRIPT, "task", "initial task"], { cwd: repo, env });
+  assert.equal(seeded.status, 0, seeded.stderr);
+  const broker = await waitFor(() => loadBrokerSession(repo));
+  t.after(() => { try { process.kill(broker.pid, "SIGKILL"); } catch {} });
+  assert.match(broker.pidIdentity ?? "", /^win32:\d+$/);
+  const cleanup = run(process.execPath, [SESSION_HOOK, "SessionEnd"], { cwd: repo, env, input: JSON.stringify({ hook_event_name: "SessionEnd", cwd: repo, session_id: "sess-win" }) });
+  assert.equal(cleanup.status, 0, cleanup.stderr);
+  assert.match(cleanup.stderr, /Broker teardown: .*signalled=true reason=identity-match/);
+  await waitFor(() => (!isAlive(broker.pid) ? "gone" : null));
+  assert.equal(loadBrokerSession(repo), null);
+});
+
+test("a planted PowerShell in the workspace or a relative PATH entry is never what the identity probe runs", { skip: !IS_WIN, timeout: 90_000 }, () => {
+  const repo = makeTempDir(); fs.mkdirSync(path.join(repo, "tools"));
+  const marker = path.join(repo, "HIJACKED");
+  fs.copyFileSync(path.join(process.env.SystemRoot, "System32", "cmd.exe"), path.join(repo, "powershell.exe"));
+  for (const planted of ["powershell.cmd", path.join("tools", "powershell.cmd"), path.join("tools", "powershell.exe.cmd")]) {
+    fs.writeFileSync(path.join(repo, planted), `@echo off\r\necho x> "${marker}"\r\n`);
+  }
+  const testEnvUrl = pathToFileURL(path.join(ROOT, "tests", "test-env.mjs")).href;
+  const processUrl = pathToFileURL(path.join(ROOT, "plugins", "codex", "scripts", "lib", "process.mjs")).href;
+  const probe = run(process.execPath, ["--import", testEnvUrl, "-e", `import(${JSON.stringify(processUrl)}).then(m => console.log(m.getProcessIdentity(process.pid) ?? 'null'))`], {
+    cwd: repo, env: { ...process.env, PATH: `.;tools;${process.env.PATH}`, PSModulePath: path.join(repo, "tools") }
+  });
+  assert.match(probe.stdout.trim(), /^win32:\d+$/, probe.stderr);
+  assert.equal(fs.existsSync(marker), false);
 });

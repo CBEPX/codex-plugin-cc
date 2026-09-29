@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.4.1 — 2026-09-29
+
+### Fixed
+- Windows: kills from stored process records (`/codex:cancel`, `SessionEnd` cleanup of a running job, stale-broker replacement, broker teardown) now verify the process by its start time and terminate the verified tree through one in-box PowerShell 5.1 run with pinned handles (no Store `pwsh` needed); a broker writes its record under the state lock before it spawns and a Windows cancel holds that lock through its kill, so the shared broker is only ever excluded by a verified identity (a record without one refuses the kill); a worker that vanished before the kill is cancelled only when it left no orphans and wrote its own final record (otherwise the cancel stays pending, orphans reported); a background worker's pid is recorded right after the spawn, before its identity probe, and a worker whose job was cancelled before it started exits without running it; cancel keeps a job record another process already finished unless its own interrupt or kill caused that finish, and always keeps a reaper-recorded failure; two racing broker starts no longer spawn two brokers (the claim is made inside the state lock); `SessionEnd` keeps a broker record that is still starting; a failed broker start is killed through the verified kill and its record and files kept (with identity) until the process has exited; closes the win32 half of #743 and #423/#577, #336, #416, #487, #718.
+- The Codex app-server transport dropped the connection when a notification contained U+2028/U+2029 (`node:readline` split the JSON frame): any turn whose command or output carried a line or paragraph separator failed as "connection closed before the turn completed" (both transports).
+- The posix `ps` command-line probe no longer spawns on a spent budget.
+
+### Changed
+- Windows: process identity is captured for workers and the broker at spawn; `status` and the reaper probe all live jobs in one PowerShell run; `cancel` reports `cancellationPending` with `survivors` (pid + identity) when part of the tree outlives the kill and never marks such a job cancelled; `SessionEnd` keeps records whose kill outcome is unknown (`kept=true` in the teardown decision line) so the next `SessionEnd` can retry; the shared broker is excluded from a worker's kill tree only by a verified identity (a broker record without identity refuses the kill).
+- `teardownBrokerSession` result gains `kept: false` on posix (no behaviour change there).
+- A stale broker whose kill cannot be verified keeps its record and the request falls back to the direct transport.
+- The broker writes its own pid into its record once its endpoint is bound; a broker whose endpoint answers is never replaced on elapsed time alone; a failed broker start no longer kills a broker another request already adopted, and a stale replacement that was delayed past its grace period aborts instead of killing. Windows: a newly started broker whose identity cannot be read yet stays unused (direct transport) until its identity is recorded.
+- Windows: `task --await` / `status --wait` loops remember the identity probe for 2 s inside the process, so polling costs at most one PowerShell run per 2 s; a `/codex:cancel` whose worker vanished before the kill is recorded cancelled only when no orphan evidence is found and the worker recorded a closed exit (its final record, marked after its app-server client closed) and the turn interrupt was acknowledged, and otherwise stays pending for the reaper (`process-missing`, with `survivors` when orphans are found); a failure the reaper already recorded is kept, while a worker's own final record written after the cancel's acknowledged interrupt or delivered kill becomes cancelled; a broker record that exists but cannot be read presumes a live broker and refuses the worker kill.
+
+### Known limitations
+- A brokered `/codex:cancel` (every platform) confirms the worker, not the turn: it can report `cancelled` while the app-server behind the shared broker keeps running the turn. `workerClosed` proves the app-server client closed, not that every descendant exited: on the direct transport a vanished-root job with no orphans found can be `cancelled` while a grandchild under a dead intermediate parent runs. Both are planned for v1.4.2.
+
+### Internal
+- CI: the "No leaked test processes" step is enforced on every OS through `scripts/check-leaks.mjs` (Windows enumerates via the plugin's own PowerShell launcher). PowerShell launches use a clean environment plus `LOCALAPPDATA`/`PSModuleAnalysisCachePath` pass-through; without them PowerShell 5.1 re-analysed modules on every launch (20-30 s cold starts on hosted runners).
+
 ## 1.4.0 — 2026-09-28
 
 ### Fixed
