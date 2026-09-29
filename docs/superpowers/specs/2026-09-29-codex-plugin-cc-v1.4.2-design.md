@@ -1,6 +1,6 @@
 # codex-plugin-cc v1.4.2 — cancel waits for the turn, close reports the exit
 
-Date: 2026-09-29 (rev. 1, 2026-09-29)
+Date: 2026-09-29 (rev. 2, 2026-09-29)
 
 ## Goal
 
@@ -36,7 +36,7 @@ Brokered wait: only when a turn is recorded (`turnId`) and the transport is not 
 |---|---|---|---|---|---|---|
 | 1 | any | no (queued, pre-turn) | not sent (no ids) | not waited | v1.4.1 | v1.4.1 |
 | 2 | `direct` | yes | skipped, `turnInterruptAttempted: false` | not waited | v1.4.1: posix group signal, win32 verified tree kill | delivered → `cancelled`; posix not delivered, root alive → pending `not-delivered`; win32 survivors/unverified → pending `kill-failed`; win32 241 → `cancelled` only with no orphans and `isWorkerProvedRecord` (3.3), else pending `process-missing` |
-| 3 | `broker` or missing | yes | not acknowledged | not waited | none | pending `turn-not-interrupted`, exit 1 |
+| 3 | `broker` or missing | yes | not acknowledged | record already terminal → row 5/6 outcome; otherwise not waited | none | pending `turn-not-interrupted`, exit 1 |
 | 4 | `broker` or missing | yes | acknowledged | none within 10 s | none | pending `turn-not-interrupted`, exit 1 |
 | 5 | `broker` or missing | yes | acknowledged | the worker's own (`workerClosed: true`) | none | `cancelled` (record overwritten, v1.4.0 rule), exit 0 |
 | 6 | `broker` or missing | yes | acknowledged | terminal without the marker (crash guard, reaper) | none | stored status kept and reported, exit 0 |
@@ -49,7 +49,7 @@ Rows 3–4 answer `{ jobId, status: "running", cancellationPending: true, reason
 
 ### 3.4 SessionEnd (win32)
 
-`cleanupSessionJobs` (`session-lifecycle-hook.mjs` L189): `unresolved = platform === "win32" && (refused || ["identity-unavailable", "kill-failed"].includes(reason) || (outcome?.survivors?.length ?? 0) > 0 || outcome?.unverified === true)` — the rule of `teardownBrokerSession` (`lib/broker-lifecycle.mjs` L743–745). This amends v1.4.1 spec §3.7 (L83), which kept a refusal only "while `isPidAlive(pid) !== false`": `identity-unavailable` and a thrown kill (`kill-failed`) now keep the job whatever the root did; `identity-mismatch`, and `process-missing` without survivors, with a dead root are still dropped (the reaper's domain). `budget-exhausted` and posix are unchanged.
+`cleanupSessionJobs` (`session-lifecycle-hook.mjs` L191): `unresolved = platform === "win32" && (refused || ["identity-unavailable", "kill-failed"].includes(reason) || (outcome?.survivors?.length ?? 0) > 0 || outcome?.unverified === true)` — the rule of `teardownBrokerSession` (`lib/broker-lifecycle.mjs` L743–745). This amends v1.4.1 spec §3.7 (L83), which kept a refusal only "while `isPidAlive(pid) !== false`": `identity-unavailable` and a thrown kill (`kill-failed`) now keep the job whatever the root did; `identity-mismatch`, and `process-missing` without survivors, with a dead root are still dropped (the reaper's domain). `budget-exhausted` and posix are unchanged.
 
 ### 3.5 `updateJobPid`
 
@@ -87,4 +87,4 @@ Rows 3–4 answer `{ jobId, status: "running", cancellationPending: true, reason
 | rev | date | trigger | change |
 |---|---|---|---|
 | 1 | 2026-09-29 | v1.4.1 adversarial pass 13 parked limits; controller rulings 1–5 | initial |
-
+| 2 | 2026-09-29 | T4 review + implementation observations | transport kept on the final record; row 3 reads the record first; pending text without pid |

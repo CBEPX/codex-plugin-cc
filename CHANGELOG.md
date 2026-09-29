@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.4.2 — 2026-09-30
+
+### Fixed
+- A brokered `/codex:cancel` (every platform) no longer reports `cancelled` while the shared runtime keeps running the turn: it sends `turn/interrupt`, waits up to 10 s for the worker's own final record, and only then records `cancelled`; if the turn does not end it answers `cancellationPending` with `reason: "turn-not-interrupted"` (exit 1), kills nothing and leaves the job `running` (killing the worker left the turn running in the broker). A direct job's cancel no longer sends `turn/interrupt` (a second client could not reach the worker's own app-server and could start a stray `codex app-server`) and kills the worker as before (`turnInterruptAttempted: false`).
+- Windows: a direct job whose worker vanished before the kill is cancelled only when its final record also says the app-server's exit was observed; a close that hit its 5 s deadline with the child alive leaves the cancel `cancellationPending` for the reaper.
+- Windows `SessionEnd`: a job whose kill was refused (`identity-unavailable`) or threw (`kill-failed`) is kept even when its worker already exited, the rule the broker teardown uses; `identity-mismatch` and `process-missing` without survivors still drop it.
+- A background worker's pid sidecar is written only while its job is queued or running, under the state lock: a cancel during the identity probe no longer gets the sidecar written back.
+
+### Changed
+- `status --json` / `result --json` job records carry `transport` (`broker`/`direct`, set when the turn starts) and, on the worker's own final record, `appServerExited`.
+
+### Known limitations
+- A brokered turn that never ends after `turn/interrupt` keeps the job `running`: `/codex:cancel` answers `turn-not-interrupted` until the turn ends on its own or the shared broker is shut down (`SessionEnd`); a turn that ends on its own during the 10 s wait is recorded `cancelled` (spec §Limits)
+- Jobs started before 1.4.2 have no `transport` and are treated as brokered: a pre-1.4.2 direct job cannot be cancelled until its turn ends (spec §Limits)
+- Windows: on the direct transport the observed app-server child is `cmd.exe` running the `codex.cmd` shim; its exit is evidence, not proof, that the shim's descendants exited (spec §Limits)
+
 ## 1.4.1 — 2026-09-29
 
 ### Fixed
