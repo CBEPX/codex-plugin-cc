@@ -7,7 +7,7 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { createBrokerEndpoint, parseBrokerEndpoint } from "./broker-endpoint.mjs";
 import { getProcessIdentity, isPidAlive, processCommandLine, terminateProcessTree, terminateRecordedProcess } from "./process.mjs";
-import { resolveStateDir, retryOnWindows, withStateLock } from "./state.mjs";
+import { resolveStateDir, retryOnWindows, STATE_LOCK_TIMEOUT_CODE, withStateLock } from "./state.mjs";
 
 export const PID_FILE_ENV = "CODEX_COMPANION_APP_SERVER_PID_FILE";
 export const LOG_FILE_ENV = "CODEX_COMPANION_APP_SERVER_LOG_FILE";
@@ -235,6 +235,7 @@ const FAILED_START_EXIT_WAIT_MS = 2000;
 // A start that finds another start's record inside the lock takes the stale/wait
 // path for it again; bounded, so records that keep appearing cannot loop forever.
 const CLAIM_ATTEMPTS = 3;
+const READY_SAVE_RETRY_MS = 250;
 
 export async function ensureBrokerSession(cwd, options = {}, attempt = 1) {
   const killProcess = options.killProcess ?? terminateProcessTree;
@@ -258,22 +259,43 @@ export async function ensureBrokerSession(cwd, options = {}, attempt = 1) {
         return loadBrokerSession(cwd) ?? existing;
       }
     }
-    teardownBrokerSession({
-      endpoint: existing.endpoint ?? null,
-      pidFile: existing.pidFile ?? null,
-      logFile: existing.logFile ?? null,
-      sessionDir: existing.sessionDir ?? null,
-      // Only a live broker that is provably ours gets a signal (#762); a dead or
-      // recycled pid is left alone (#749) — the files are stale either way.
-      pid: liveOwned ? pid : null,
-      pidIdentity: existing.pidIdentity ?? null,
-      killProcess: liveOwned ? killProcess : null,
-      // Re-checked at kill time: the pid may have been recycled during the retry.
-      ownsProcess: ownsProcessImpl
-    });
-    // Compare before delete: a concurrent caller may already have replaced it.
-    if (loadBrokerSession(cwd)?.endpoint === existing.endpoint) {
-      clearBrokerSession(cwd);
+    // Act on the current claim, not the snapshot: another start may have saved
+    // its pid/identity (or replaced the record) while this call waited.
+    const current = withStateLock(cwd, () => loadBrokerSession(cwd));
+    if (current && (current.endpoint !== existing.endpoint || current.pid !== existing.pid || current.pidIdentity !== existing.pidIdentity)) {
+      if (attempt >= CLAIM_ATTEMPTS) {
+        process.stderr.write(`[codex] broker start gave up: the broker record kept changing (${attempt} attempts).\n`);
+        return null;
+      }
+      return await ensureBrokerSession(cwd, options, attempt + 1);
+    }
+    if (current) {
+      const outcome = teardownBrokerSession({
+        endpoint: existing.endpoint ?? null,
+        pidFile: existing.pidFile ?? null,
+        logFile: existing.logFile ?? null,
+        sessionDir: existing.sessionDir ?? null,
+        // Only a live broker that is provably ours gets a signal (#762); a dead or
+        // recycled pid is left alone (#749) — the files are stale either way.
+        pid: liveOwned ? pid : null,
+        pidIdentity: existing.pidIdentity ?? null,
+        killProcess: liveOwned ? killProcess : null,
+        // Re-checked at kill time: the pid may have been recycled during the retry.
+        ownsProcess: ownsProcessImpl,
+        terminateRecordedProcessImpl: options.terminateRecordedProcessImpl ?? terminateRecordedProcess,
+        // An unsettled kill keeps the record: a live broker with no record could
+        // never be torn down verifiably later.
+        keepOnUnknown: true,
+        keepOnUnknownAnyPlatform: true
+      });
+      if (outcome.kept) {
+        process.stderr.write(`[codex] stale broker pid ${pid} could not be verified stopped (${outcome.reason}); its record is kept and this request uses the direct transport.\n`);
+        return null;
+      }
+      // Compare before delete: a concurrent caller may already have replaced it.
+      if (loadBrokerSession(cwd)?.endpoint === existing.endpoint) {
+        clearBrokerSession(cwd);
+      }
     }
   }
 
@@ -328,16 +350,25 @@ export async function ensureBrokerSession(cwd, options = {}, attempt = 1) {
   // Every later save is guarded by the claim: the record on disk must still be
   // this start's (its endpoint, unique to its session dir, and its pid). One that
   // was replaced or cleared meanwhile is left alone.
-  const saveClaimed = (record, what) =>
-    withStateLock(cwd, () => {
-      const current = loadBrokerSession(cwd);
-      if (current?.endpoint !== endpoint || current.pid !== (child.pid ?? null)) {
-        process.stderr.write(`[codex] broker ${what} not saved: the record no longer belongs to broker pid ${child.pid}.\n`);
-        return false;
+  const saveClaimed = (record, what) => {
+    try {
+      return withStateLock(cwd, () => {
+        const current = loadBrokerSession(cwd);
+        if (current?.endpoint !== endpoint || current.pid !== (child.pid ?? null)) {
+          process.stderr.write(`[codex] broker ${what} not saved: the record no longer belongs to broker pid ${child.pid}.\n`);
+          return false;
+        }
+        (options.saveBrokerSessionImpl ?? saveBrokerSession)(cwd, record);
+        return true;
+      });
+    } catch (error) {
+      if (error?.code !== STATE_LOCK_TIMEOUT_CODE) {
+        throw error;
       }
-      saveBrokerSession(cwd, record);
-      return true;
-    });
+      process.stderr.write(`[codex] broker ${what} not saved: ${error.message}\n`);
+      return false;
+    }
+  };
 
   // Recorded for later teardowns, which only trust a stored pid by identity.
   let pidIdentity = getProcessIdentityImpl(child.pid ?? Number.NaN);
@@ -345,8 +376,7 @@ export async function ensureBrokerSession(cwd, options = {}, attempt = 1) {
     saveClaimed({ ...base, pid: child.pid, pidIdentity }, "identity");
   }
 
-  const ready = await waitForBrokerEndpoint(endpoint, options.timeoutMs ?? 2000);
-  if (!ready) {
+  const abandonStart = async () => {
     // A child that already exited is not signalled at all: its pid may belong to
     // someone else by now. A live one is killed through the verified kill with
     // the identity captured above (win32: the pinned tree kill; posix: its group,
@@ -390,6 +420,11 @@ export async function ensureBrokerSession(cwd, options = {}, attempt = 1) {
     }
     process.stderr.write(`[codex] broker pid ${child.pid} was not stopped after the failed start; its record and files are kept.\n`);
     return null;
+  };
+
+  const ready = await waitForBrokerEndpoint(endpoint, options.timeoutMs ?? 2000);
+  if (!ready) {
+    return await abandonStart();
   }
 
   const session = {
@@ -400,7 +435,14 @@ export async function ensureBrokerSession(cwd, options = {}, attempt = 1) {
     pid: child.pid ?? null,
     pidIdentity
   };
-  saveClaimed(session, "ready record");
+  // Never return a session whose on-disk record does not name it: one retry after
+  // a short wait, then the verified failed-start teardown.
+  if (!saveClaimed(session, "ready record")) {
+    await new Promise((resolve) => setTimeout(resolve, READY_SAVE_RETRY_MS));
+    if (!saveClaimed(session, "ready record")) {
+      return await abandonStart();
+    }
+  }
   return session;
 }
 
@@ -444,6 +486,7 @@ export function teardownBrokerSession({
   ownsProcess = ownsBrokerProcess,
   platform = process.platform,
   keepOnUnknown = false,
+  keepOnUnknownAnyPlatform = false,
   starting = false,
   terminateRecordedProcessImpl = terminateRecordedProcess
 }) {
@@ -475,7 +518,7 @@ export function teardownBrokerSession({
   // foreign process is a settled answer and is cleaned up as before; a dead
   // root does not settle an unknown outcome.
   const unknown =
-    platform === "win32" &&
+    (platform === "win32" || keepOnUnknownAnyPlatform) &&
     (["identity-unavailable", "kill-failed"].includes(reason) || outcome?.unverified === true || (outcome?.survivors?.length ?? 0) > 0);
   const kept = keepOnUnknown && !signalled && unknown;
   if (kept) {
