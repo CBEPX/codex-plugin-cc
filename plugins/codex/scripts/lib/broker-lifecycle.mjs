@@ -257,14 +257,16 @@ export function clearBrokerSessionIfEndpoint(cwd, endpoint, options = {}) {
   return writeBrokerSessionIf(cwd, (record) => record?.endpoint === endpoint, null, options);
 }
 
-// A bound broker writes its own pid and identity into its record (state and
-// every other field untouched), so a live broker that answers is never behind a
-// pid-less record. The identity is probed by the caller, outside the lock.
-export function registerBrokerProcess(cwd, endpoint, pid, pidIdentity, options = {}) {
+// A bound broker writes its own pid into its record (state and every other
+// field untouched), so a live broker that answers is never behind a pid-less
+// record. It probes no identity (a PowerShell run on win32 would block its event
+// loop while its starter waits for the endpoint): the starter's probe or the next
+// caller's adoption records that; an identity kept for another pid is dropped.
+export function registerBrokerProcess(cwd, endpoint, pid, options = {}) {
   return writeBrokerSessionIf(
     cwd,
     (record) => record?.endpoint === endpoint,
-    (record) => ({ ...record, pid, pidIdentity: pidIdentity ?? (record.pid === pid ? record.pidIdentity : null) }),
+    (record) => ({ ...record, pid, pidIdentity: record.pid === pid ? record.pidIdentity : null }),
     options
   );
 }
@@ -623,7 +625,7 @@ async function ensureBrokerSessionLocked(cwd, options, attempt) {
 
   // win32 excludes the broker from worker kills only by its identity: without
   // one it stays starting (its pid saved) and a later call promotes it once the
-  // identity can be read (its own registration, or the adopt probe).
+  // identity can be read (the next caller's adopt probe).
   if (platform === "win32" && !pidIdentity) {
     process.stderr.write(`[codex] broker pid ${child.pid} has no identity yet; it stays starting and this request uses the direct transport.\n`);
     return null;

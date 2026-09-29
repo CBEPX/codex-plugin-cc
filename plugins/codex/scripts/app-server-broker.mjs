@@ -9,7 +9,6 @@ import { parseArgs } from "./lib/args.mjs";
 import { BROKER_BUSY_RPC_CODE, CodexAppServerClient } from "./lib/app-server.mjs";
 import { parseBrokerEndpoint } from "./lib/broker-endpoint.mjs";
 import { clearBrokerSessionIfEndpoint, registerBrokerProcess } from "./lib/broker-lifecycle.mjs";
-import { getProcessIdentity } from "./lib/process.mjs";
 
 const STREAMING_METHODS = new Set(["turn/start", "review/start", "thread/compact/start"]);
 
@@ -184,14 +183,14 @@ async function main() {
     }
   }
 
-  // Once bound, the broker writes its own pid and identity into its record
-  // (state untouched): a broker that answers is never behind a pid-less record,
-  // whatever happened to its starter's saves. The identity is probed before the
-  // lock is taken. Best-effort and bounded like the clear above.
+  // Once bound, the broker writes its own pid into its record (state untouched):
+  // a broker that answers is never behind a pid-less record, whatever happened
+  // to its starter's saves. No identity probe here — on win32 it would block the
+  // event loop for seconds right after bind. Best-effort and bounded like the
+  // clear above.
   function registerOwnSessionRecord() {
     try {
-      const identity = getProcessIdentity(process.pid);
-      registerBrokerProcess(cwd, endpoint, process.pid, identity, { waitMs: OWN_RECORD_CLEAR_WAIT_MS });
+      registerBrokerProcess(cwd, endpoint, process.pid, { waitMs: OWN_RECORD_CLEAR_WAIT_MS });
     } catch (error) {
       process.stderr.write(`[codex] broker pid not registered: ${error instanceof Error ? error.message : String(error)}\n`);
     }

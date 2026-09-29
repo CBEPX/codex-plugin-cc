@@ -50,6 +50,19 @@ function waitForExit(child, { timeoutMs = 10000 } = {}) {
   });
 }
 
+// 30 s: hosted Windows VMs have been seen 2-3x slower for hours.
+async function waitFor(predicate, { timeoutMs = 30000, intervalMs = 50 } = {}) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const value = await predicate();
+    if (value) {
+      return value;
+    }
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+  throw new Error("Timed out waiting for condition.");
+}
+
 function isAlive(pid) {
   try {
     process.kill(pid, 0);
@@ -2056,10 +2069,13 @@ test("registerBrokerProcess writes only into its own endpoint's record and keeps
   const workspace = makeTempDir();
   const record = { endpoint: "unix:/tmp/r.sock", pid: null, pidIdentity: null, pidFile: null, logFile: null, sessionDir: null, state: "replacing", replacer: "a", replacingAt: 1 };
   saveBrokerSession(workspace, record);
-  assert.equal(registerBrokerProcess(workspace, "unix:/tmp/other.sock", 42, "x:42"), false);
+  assert.equal(registerBrokerProcess(workspace, "unix:/tmp/other.sock", 42), false);
   assert.deepEqual(loadBrokerSession(workspace), record);
-  assert.equal(registerBrokerProcess(workspace, record.endpoint, 42, "x:42"), true);
-  assert.deepEqual(loadBrokerSession(workspace), { ...record, pid: 42, pidIdentity: "x:42" });
+  assert.equal(registerBrokerProcess(workspace, record.endpoint, 42), true);
+  assert.deepEqual(loadBrokerSession(workspace), { ...record, pid: 42, pidIdentity: null });
+  saveBrokerSession(workspace, { ...record, pid: 42, pidIdentity: "x:42" });
+  assert.equal(registerBrokerProcess(workspace, record.endpoint, 42), true);
+  assert.equal(loadBrokerSession(workspace)?.pidIdentity, "x:42", "the starter's identity for the same pid is kept");
   clearBrokerSession(workspace);
 });
 
@@ -2125,8 +2141,8 @@ test("ensureBrokerSession promotes an answering starting broker, and keeps it on
   }
 });
 
-// Wave 10 (W1): a bound broker writes its own pid and identity into its record.
-test("broker registers its pid and identity in its own record once it listens", async () => {
+// Wave 10 (W1): a bound broker writes its own pid (no identity probe) into its record.
+test("broker registers its pid in its own record once it listens", async () => {
   const binDir = makeTempDir();
   installFakeCodex(binDir);
   const workspace = makeTempDir();
@@ -2140,15 +2156,11 @@ test("broker registers its pid and identity in its own record once it listens", 
     { cwd: workspace, env: buildEnv(binDir), stdio: "ignore" }
   );
   try {
-    assert.equal(await waitForBrokerEndpoint(endpoint, 5000), true);
-    const deadline = Date.now() + 5000;
-    let record = loadBrokerSession(workspace);
-    while (record?.pid !== child.pid && Date.now() < deadline) {
-      await new Promise((resolve) => setTimeout(resolve, 50));
-      record = loadBrokerSession(workspace);
-    }
-    assert.equal(record?.pid, child.pid, "the broker recorded its own pid");
-    assert.equal(record.pidIdentity, getProcessIdentity(child.pid));
+    const record = await waitFor(() => {
+      const current = loadBrokerSession(workspace);
+      return current?.pid === child.pid ? current : null;
+    });
+    assert.equal(record.pidIdentity, null, "the broker probes no identity");
     assert.equal(record.state, "starting", "the state is left to the starter");
     assert.equal(record.startedAt, startedAt);
   } finally {
