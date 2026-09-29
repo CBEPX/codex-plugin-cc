@@ -7,6 +7,7 @@
 // else — a stray line, a second COUNT, a count that disagrees — fails the step
 // instead of passing as "no leaks".
 import process from "node:process";
+import { realpathSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
 import { parseProtocolLines, runPowerShell } from "../plugins/codex/scripts/lib/process.mjs";
@@ -49,7 +50,7 @@ function main() {
     process.stdout.write("Leaked test processes after 10 s: 0\n");
     return;
   }
-  const filter = `Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match '${MARKER}' -and $_.ProcessId -ne $PID }`;
+  const filter = `Get-CimInstance -ClassName Win32_Process -Property ProcessId,ParentProcessId,Name,CommandLine | Where-Object { $_.CommandLine -match '${MARKER}' -and $_.ProcessId -ne $PID }`;
   const run = runPowerShell(
     `$ErrorActionPreference = 'Stop'; $p = @(${filter}); foreach ($x in $p) { [Console]::Out.WriteLine('LEAK ' + [int]$x.ProcessId + ' ' + [int]$x.ParentProcessId) }; [Console]::Out.WriteLine('COUNT ' + $p.Count)`,
     { timeoutMs: ENUMERATE_MS }
@@ -70,6 +71,14 @@ function main() {
   }
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+function isDirectRun() {
+  try {
+    return Boolean(process.argv[1]) && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href;
+  } catch {
+    return false;
+  }
+}
+
+if (isDirectRun()) {
   main();
 }

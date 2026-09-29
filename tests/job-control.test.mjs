@@ -11,13 +11,13 @@ const SURVIVORS = [{ pid: 4301, identity: "win32:7" }];
 test("cancelDecision: what each kill outcome means for the job", () => {
   const cases = [
     [{ pid: 1, kill: { attempted: true, delivered: true }, alive: false, platform: "win32" }, { pending: false, reason: null, survivors: [] }],
-    [{ pid: 1, kill: { attempted: true, delivered: false, survivors: SURVIVORS }, alive: false, platform: "win32" }, { pending: true, reason: "kill-failed", survivors: SURVIVORS }],
+    [{ pid: 1, kill: { attempted: true, delivered: false, survivors: SURVIVORS }, alive: false, platform: "win32" }, { pending: true, reason: "kill-failed", survivors: SURVIVORS, rootAlive: false }],
     [{ pid: 1, kill: { attempted: true, delivered: false, survivors: SURVIVORS }, alive: false, platform: "linux" }, { pending: false, reason: null, survivors: [] }],
-    [{ pid: 1, kill: { attempted: false, reason: "identity-unavailable" }, alive: true, platform: "win32" }, { pending: true, reason: "identity-unavailable", survivors: [] }],
-    [{ pid: 1, kill: { attempted: true, delivered: false, unverified: true }, alive: false, platform: "win32" }, { pending: true, reason: "kill-failed", survivors: [] }],
-    [{ pid: 1, kill: { attempted: false, delivered: false, method: "handle", reason: "process-missing" }, alive: false, platform: "win32" }, { pending: true, reason: "process-missing", survivors: [] }],
+    [{ pid: 1, kill: { attempted: false, reason: "identity-unavailable" }, alive: true, platform: "win32" }, { pending: true, reason: "identity-unavailable", survivors: [], rootAlive: true }],
+    [{ pid: 1, kill: { attempted: true, delivered: false, unverified: true }, alive: false, platform: "win32" }, { pending: true, reason: "kill-failed", survivors: [], rootAlive: false }],
+    [{ pid: 1, kill: { attempted: false, delivered: false, method: "handle", reason: "process-missing" }, alive: false, platform: "win32" }, { pending: true, reason: "process-missing", survivors: [], rootAlive: false }],
     [{ pid: 1, kill: { attempted: false, delivered: false, method: "handle", reason: "process-missing" }, alive: false, platform: "linux" }, { pending: false, reason: null, survivors: [] }],
-    [{ pid: 1, kill: { attempted: true, delivered: false }, alive: true, platform: "linux" }, { pending: true, reason: "not-delivered", survivors: [] }],
+    [{ pid: 1, kill: { attempted: true, delivered: false }, alive: true, platform: "linux" }, { pending: true, reason: "not-delivered", survivors: [], rootAlive: true }],
     [{ pid: null, kill: { attempted: false, reason: "no-pid" }, alive: null, platform: "win32" }, { pending: false, reason: null, survivors: [] }]
   ];
   for (const [input, expected] of cases) {
@@ -55,6 +55,14 @@ test("renderCancelPending reports survivors on win32", () => {
   assert.deepEqual(rendered.json.survivors, SURVIVORS);
   assert.ok(rendered.logLine.endsWith(" worker tree survivors: 4301:win32:7"));
   assert.equal(rendered.diagnostic, "[codex] worker tree survivors: 4301:win32:7\n");
+});
+
+test("renderCancelPending says the root exited when only its tree survives", () => {
+  const rendered = renderCancelPending({ pending: true, reason: "kill-failed", survivors: SURVIVORS, rootAlive: false }, 4300, "job-1");
+  assert.ok(rendered.text.includes("worker pid 4300 exited but part of its tree is still running (survivors: 4301:win32:7); the job stays running until the reaper judges it."));
+  assert.ok(!rendered.text.includes("until the worker exits"));
+  const alive = renderCancelPending({ pending: true, reason: "kill-failed", survivors: SURVIVORS, rootAlive: true }, 4300, "job-1");
+  assert.ok(alive.text.includes("until the worker exits"));
 });
 
 test("renderCancelPending marks an unverified kill without survivors", () => {

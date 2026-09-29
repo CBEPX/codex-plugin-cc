@@ -90,3 +90,22 @@ test("SessionEnd without a recorded broker still kills the worker, excluding not
   cleanupSessionJobs(repo, "s", 1000, () => 8000, { platform: "win32", broker: null, terminateRecordedProcessImpl: (pid, options) => { seen = options; return { attempted: true, delivered: true, method: "handle", reason: "identity-match" }; } });
   assert.deepEqual(seen.exclude, []);
 });
+
+test("SessionEnd drops a pid-less job even when the broker presence is unknown", () => {
+  const repo = makeTempDir();
+  upsertJob(repo, { id: "job-1", status: "running", sessionId: "s", background: false });
+  const written = [];
+  const original = process.stderr.write;
+  process.stderr.write = (chunk) => { written.push(String(chunk)); return true; };
+  try {
+    cleanupSessionJobs(repo, "s", 1000, () => 8000, {
+      platform: "win32",
+      broker: "unknown",
+      terminateRecordedProcessImpl: () => ({ attempted: false, delivered: false, reason: "no-pid" })
+    });
+  } finally {
+    process.stderr.write = original;
+  }
+  assert.deepEqual(loadState(repo).jobs, []);
+  assert.doesNotMatch(written.join(""), /refused/);
+});

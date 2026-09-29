@@ -333,7 +333,7 @@ export function cancelDecision({ pid, kill, alive, platform = process.platform }
   // The root vanished between the interrupt and the kill: its tree was never
   // examined, so "cancelled" would be a guess. The reaper fails the job instead.
   if (platform === "win32" && kill.reason === "process-missing") {
-    return { pending: true, reason: "process-missing", survivors: [] };
+    return { pending: true, reason: "process-missing", survivors: [], rootAlive: alive };
   }
   const win32Unknown = platform === "win32" && kill.attempted && (kill.survivors?.length > 0 || kill.unverified === true);
   const stillHere = (!kill.attempted || !kill.delivered) && alive === true;
@@ -341,7 +341,7 @@ export function cancelDecision({ pid, kill, alive, platform = process.platform }
     return { pending: false, reason: null, survivors: [] };
   }
   const reason = kill.attempted ? (platform === "win32" ? "kill-failed" : "not-delivered") : kill.reason;
-  return { pending: true, reason, survivors: platform === "win32" ? (kill.survivors ?? []) : [] };
+  return { pending: true, reason, survivors: platform === "win32" ? (kill.survivors ?? []) : [], rootAlive: alive };
 }
 
 // The loaded broker record, `"unknown"` when none is readable but an endpoint is
@@ -378,9 +378,14 @@ export function renderCancelPending(decision, pid, jobId) {
   const suffix = survivors.length > 0
     ? ` worker tree survivors: ${survivorText}`
     : decision.reason === "kill-failed" ? " (unverified)" : "";
+  // The root exited but part of its tree did not: nothing "waits for the worker".
+  const rootGone = decision.reason === "kill-failed" && survivors.length > 0 && decision.rootAlive === false;
+  const tail = rootGone
+    ? `worker pid ${pid} exited but part of its tree is still running (survivors: ${survivorText}); the job stays running until the reaper judges it.`
+    : "the job stays running until the worker exits.";
   return {
     json: { jobId, status: "running", cancellationPending: true, reason: decision.reason, ...(survivors.length > 0 ? { survivors } : {}) },
-    text: `${pending}\nThe turn interrupt was sent; the job stays running until the worker exits. Re-run cancel or wait for result.\n`,
+    text: `${pending}\nThe turn interrupt was sent; ${tail} Re-run cancel or wait for result.\n`,
     logLine: `${pending}${suffix}`,
     diagnostic: survivors.length > 0 ? `[codex] worker tree survivors: ${survivorText}\n` : null,
   };

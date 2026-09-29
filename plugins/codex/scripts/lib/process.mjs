@@ -205,9 +205,10 @@ export function notFound(command) {
 
 export function runCommand(command, args = [], options = {}) {
   const windows = (options.platform ?? process.platform) === "win32";
-  // win32: a path is used as is, a bare name goes through where.exe. Nothing
-  // found is reported as ENOENT without spawning: libuv would otherwise search
-  // the cwd (the reviewed repo) for a same-named .exe.
+  // win32: a path is used as is, a bare name is resolved by the file-based
+  // resolver (PATH/PATHEXT scan, no where.exe). Nothing found is reported as
+  // ENOENT without spawning: libuv would otherwise search the cwd (the
+  // reviewed repo) for a same-named .exe.
   const target = !windows || /[\\/]/.test(command) ? command : resolveExecutable(command, options);
   if (target === null) {
     return { command, args, status: null, signal: null, stdout: "", stderr: "", error: notFound(command) };
@@ -480,7 +481,7 @@ export function terminateScript(pid, fileTime, exclude, deadlineFileTime) {
     "  try {",
     "    try { $root = Pin $target } catch [System.ArgumentException] { $code = 241; throw } ",
     "    if ($root.StartTime.ToFileTimeUtc().ToString() -ne $expected) { $code = 242; throw 'mismatch' }",
-    "    $rows = @(Get-CimInstance Win32_Process | Select-Object ProcessId, ParentProcessId, CreationDate)",
+    "    $rows = @(Get-CimInstance -ClassName Win32_Process -Property ProcessId,ParentProcessId,CreationDate | Select-Object ProcessId, ParentProcessId, CreationDate)",
     "    $tree = @($root)",
     "    $starts = @{ $target = (Micro $root.StartTime) }",
     "    $seen = @{ $target = $true }",

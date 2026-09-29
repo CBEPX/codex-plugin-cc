@@ -7,7 +7,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { makeTempDir, run } from "./helpers.mjs";
 import { getProcessIdentity } from "../plugins/codex/scripts/lib/process.mjs";
-import { reapDeadJobs, runTrackedJob } from "../plugins/codex/scripts/lib/tracked-jobs.mjs";
+import { reapDeadJobs, resetWin32ProbeMemo, runTrackedJob } from "../plugins/codex/scripts/lib/tracked-jobs.mjs";
 import {
   listJobs,
   readJobFile,
@@ -38,6 +38,8 @@ function spawnDeadPid() {
   assert.equal(result.status, 0);
   return result.pid;
 }
+
+test.beforeEach(() => resetWin32ProbeMemo());
 
 test("reapDeadJobs marks a running job with a dead pid as failed", () => {
   const workspace = makeTempDir();
@@ -522,6 +524,25 @@ test("reapDeadJobs on win32 probes the live identities in one batch after the ch
   }
 });
 
+test("reapDeadJobs on win32 memoises live probes for 2 s, nulls included", () => {
+  const workspace = makeTempDir();
+  const jobs = [{ id: "j", status: "running", pid: process.pid, pidIdentity: "win32:1" }];
+  seedJob(workspace, jobs[0]);
+  for (const answer of ["win32:1", null]) {
+    resetWin32ProbeMemo();
+    let clock = 1000;
+    let calls = 0;
+    const options = { platform: "win32", now: () => clock, getProcessIdentitiesImpl: (pids) => { calls += 1; return new Map(pids.map((pid) => [pid, answer])); } };
+    reapDeadJobs(workspace, jobs, options);
+    clock += 1999;
+    reapDeadJobs(workspace, jobs, options);
+    assert.equal(calls, 1, `within the TTL (${answer}) nothing is re-probed`);
+    clock += 2;
+    reapDeadJobs(workspace, jobs, options);
+    assert.equal(calls, 2, `after the TTL (${answer}) it probes again`);
+  }
+});
+
 test("reapDeadJobs on win32 leaves every job alone when the batch answers nothing", () => {
   const workspace = makeTempDir();
   const jobs = [{ id: "job-x", status: "running", pid: process.pid, pidIdentity: "win32:1" }];
@@ -555,6 +576,7 @@ test("reapDeadJobs on win32 gives the batch probe a cold-start budget bounded by
   const jobs = [{ id: "j", status: "running", pid: process.pid, pidIdentity: "win32:1" }];
   seedJob(workspace, jobs[0]);
   reapDeadJobs(workspace, jobs, { platform: "win32", getProcessIdentitiesImpl: impl });
+  resetWin32ProbeMemo();
   reapDeadJobs(workspace, jobs, { platform: "win32", getProcessIdentitiesImpl: impl, remainingMs: () => 1500 });
   assert.deepEqual(seen, [6000, 1500]);
 });

@@ -150,12 +150,16 @@ export function cleanupSessionJobs(cwd, sessionId, lockWaitMs, remainingMs, deps
       let outcome = null;
       if (probeMs >= MIN_STEP_MS) {
         let pid;
+        // Presumed refused until a pid proves there is nothing to kill.
+        let refused = platform === "win32" && Boolean(broker) && exclude === null;
         try {
           const recorded = resolveJobPid(workspaceRoot, job);
           pid = recorded.pid;
           // The shared broker can be this worker's child on Windows: never in its
           // tree — and only a broker with a verified identity can be excluded.
-          outcome = platform === "win32" && broker && exclude === null
+          // Only a pid there is to kill can be refused; a pid-less job is `no-pid` as ever.
+          refused = refused && Boolean(pid);
+          outcome = refused
             ? { attempted: false, delivered: false, reason: "identity-unavailable" }
             : terminateRecordedProcessImpl(pid, {
                 identity: recorded.identity,
@@ -179,7 +183,6 @@ export function cleanupSessionJobs(cwd, sessionId, lockWaitMs, remainingMs, deps
         // the next SessionEnd judges it again (no survivor records — spec §1).
         // A refused kill (broker not excludable) is unresolved too: the worker's
         // tree was never looked at, so a dead root proves nothing about it.
-        const refused = platform === "win32" && broker && exclude === null;
         const unresolved = platform === "win32" && (refused || (outcome?.survivors?.length ?? 0) > 0 || outcome?.unverified === true);
         if (reason && isPidAlive(pid) === false && !unresolved) {
           reason = null;

@@ -370,9 +370,18 @@ function isQueuedWithoutWorker(job, pid) {
 const REAP_MIN_STEP_MS = 100;
 const IDENTITY_PROBE_MS = 2000;
 const WIN32_BATCH_PROBE_MS = 6000; // one cold PowerShell start (<=3 s) with margin
+// win32 polls (`status`, `--await`) reap on every tick; a live pid's identity
+// does not change, so a fresh answer (a null too) is reused for this long.
+// Only the reaper reads it: a kill re-verifies in its own script.
+const WIN32_PROBE_MEMO_MS = 2000;
+const win32ProbeMemo = new Map();
+
+export function resetWin32ProbeMemo() {
+  win32ProbeMemo.clear();
+}
 
 /**
- * @param {{ lockWaitMs?: number, remainingMs?: () => number, getProcessIdentityImpl?: typeof getProcessIdentity, getProcessIdentitiesImpl?: typeof getProcessIdentities, processCommandLineImpl?: typeof processCommandLine, platform?: string }} [options] Bounds the
+ * @param {{ lockWaitMs?: number, remainingMs?: () => number, getProcessIdentityImpl?: typeof getProcessIdentity, getProcessIdentitiesImpl?: typeof getProcessIdentities, processCommandLineImpl?: typeof processCommandLine, platform?: string, now?: () => number }} [options] Bounds the
  * reaper's own state-lock waits. Each dead job costs one acquisition, so a caller
  * working to a deadline passes `remainingMs` and every wait is clamped to what is
  * left of it; once that is spent the remaining jobs are left for the next run
@@ -385,7 +394,8 @@ export function reapDeadJobs(workspaceRoot, jobs, options = {}) {
     getProcessIdentityImpl = getProcessIdentity,
     getProcessIdentitiesImpl = getProcessIdentities,
     processCommandLineImpl = processCommandLine,
-    platform = process.platform
+    platform = process.platform,
+    now = () => performance.now()
   } = options;
   const waitFor = () => {
     if (!remainingMs) {
@@ -422,12 +432,28 @@ export function reapDeadJobs(workspaceRoot, jobs, options = {}) {
   // ponytail: each win32 candidate's job file is read twice (here and in the loop).
   let batch = new Map();
   if (platform === "win32") {
-    const candidatePids = [...new Set(jobs.map(liveIdentityCandidate).filter(Boolean).map((candidate) => candidate.pid))];
+    const allPids = [...new Set(jobs.map(liveIdentityCandidate).filter(Boolean).map((candidate) => candidate.pid))];
+    const at = now();
+    const candidatePids = [];
+    for (const pid of allPids) {
+      const memo = win32ProbeMemo.get(pid);
+      if (memo && at - memo.at < WIN32_PROBE_MEMO_MS) {
+        batch.set(pid, memo.identity);
+      } else {
+        candidatePids.push(pid);
+      }
+    }
     if (candidatePids.length > 0 && !(remainingMs && remainingMs() < REAP_MIN_STEP_MS)) {
       try {
-        batch = getProcessIdentitiesImpl(candidatePids, { platform, timeoutMs: batchProbeMs() });
+        const fresh = getProcessIdentitiesImpl(candidatePids, { platform, timeoutMs: batchProbeMs() });
+        const stamp = now();
+        for (const pid of candidatePids) {
+          const identity = fresh.get(pid) ?? null;
+          batch.set(pid, identity);
+          win32ProbeMemo.set(pid, { identity, at: stamp });
+        }
       } catch {
-        batch = new Map();
+        // A failed batch judges nothing and is not remembered.
       }
     }
   }

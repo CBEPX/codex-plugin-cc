@@ -11,6 +11,7 @@ import {
   buildLaunch,
   getProcessIdentities,
   getProcessIdentity,
+  isPidAlive,
   parseProtocolLines,
   powerShellEnvironment,
   processCommandLine,
@@ -660,12 +661,14 @@ test("terminateRecordedProcess on win32 runs the pinned verify-and-kill script a
     assert.doesNotMatch(script, /app-server-broker/, "no command-line marker exclusion");
     assert.ok(script.indexOf("$exclude.ContainsKey($cid)") > script.indexOf("$live = Micro $h.StartTime"), "exclusion is decided after the pin and start-time read");
     assert.match(script, /\$code = 245\n/);
+    assert.match(script, /Get-CimInstance -ClassName Win32_Process -Property ProcessId,ParentProcessId,CreationDate \|/, "provider-side projection");
+    assert.doesNotMatch(script, /CommandLine/, "CommandLine is never computed for the kill");
     assert.match(script, /\$code = 245; throw 'budget'/);
     assert.equal(script.match(/exit 244/g).length, 1, "244 is only the CLM guard");
     assert.match(script, new RegExp(`FromFileTimeUtc\\(${expectedDeadline}\\)`), "absolute deadline counts the PowerShell start-up");
     assert.match(script, /\$null = \$h\.Handle/, "the handle is pinned before StartTime is read");
     assert.match(script, /catch \[System\.ArgumentException\] \{ \$code = 241; throw \}/);
-    assert.match(script, /catch \[System\.ArgumentException\] \{ continue \}/, "a child that is already gone is skipped, any other pin error aborts with 244");
+    assert.match(script, /catch \[System\.ArgumentException\] \{ continue \}/, "a child that is already gone is skipped, any other pin error aborts with 245");
     assert.match(script, /\$t - \(\$t % 10\)/, "exact Int64 microsecond truncation");
     assert.match(script, /\.Kill\(\)/);
     assert.doesNotMatch(script, /taskkill|& "|Start-Process/, "no external program is ever started");
@@ -713,4 +716,33 @@ test("terminateRecordedProcess win32: empty exclusion is an empty hashtable and 
   ran = false;
   runPowerShell("x", { ...psBase, runCommandImpl: () => { ran = true; return working; } });
   assert.ok(ran, "exit 245 never trips the breaker");
+});
+
+// Live: the real kill script's 241 (gone before the pin) and 242 (identity mismatch).
+function spawnIdler(t) {
+  const child = spawn(process.execPath, ["-e", "setInterval(()=>{},1000)"], { stdio: "ignore" });
+  t.after(() => { try { child.kill(); } catch { /* already gone */ } });
+  return child;
+}
+
+test("terminateRecordedProcess on live win32 reports process-missing for a pid that is gone", { skip: !IS_WIN, timeout: 30_000 }, (t) => {
+  resetWindowsIdentityCircuit();
+  const child = spawnIdler(t);
+  const identity = getProcessIdentity(child.pid);
+  assert.match(identity, /^win32:\d+$/);
+  child.kill();
+  const deadline = Date.now() + 10_000;
+  while (isPidAlive(child.pid) && Date.now() < deadline) {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+  }
+  assert.equal(isPidAlive(child.pid), false);
+  assert.equal(terminateRecordedProcess(child.pid, { identity, timeoutMs: 10_000 }).reason, "process-missing");
+});
+
+test("terminateRecordedProcess on live win32 refuses a wrong identity and leaves the process alive", { skip: !IS_WIN, timeout: 30_000 }, (t) => {
+  resetWindowsIdentityCircuit();
+  const child = spawnIdler(t);
+  assert.ok(getProcessIdentity(child.pid));
+  assert.equal(terminateRecordedProcess(child.pid, { identity: "win32:1", timeoutMs: 10_000 }).reason, "identity-mismatch");
+  assert.equal(isPidAlive(child.pid), true);
 });
