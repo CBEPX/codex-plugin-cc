@@ -58,7 +58,7 @@
 | #380 | issue | — | SessionEnd cleanup fails when review cwd ≠ session cwd — broker.json looked up by cwd-hash, leaving orphan brokers even on graceful /quit | planned v1.5.0 | see #381 |
 | #402 | issue | — | Sequential task calls fail ~50% with "codex app-server connection closed" — broker reused after single-turn exit, shouldRetryDirect misses clean close | verify | — |
 | #404 | pr | +156/-4 | fix: stop broker readiness race and reap prior-session orphans | verify | — |
-| #416 | issue | — | Windows: zombie broker + codex app-server trees accumulate — broker/shutdown acks before unbounded cleanup, and taskkill tree-kill breaks under Git Bash SHELL | planned v1.4.1 | taskkill-under-Git-Bash part fixed-in v1.4.0 (no $SHELL); tree kill from stored records needs process identity (v1.4.1) |
+| #416 | issue | — | Windows: zombie broker + codex app-server trees accumulate — broker/shutdown acks before unbounded cleanup, and taskkill tree-kill breaks under Git Bash SHELL | fixed-in v1.4.1 | taskkill-under-Git-Bash part fixed-in v1.4.0 (no $SHELL); tree kill from stored records needs process identity (v1.4.1) |
 | #432 | issue | — | Rescue runs launched via the harness's background Bash die silently when the shell tree is reaped — job wedges at "running" with companion, broker, and app-server all killed mid-turn | verify | — |
 | #439 | pr | +573/-23 | fix: multi-session broker and state lifecycle bugs | verify | — |
 | #450 | issue | — | Shared/co-owned broker orphaned when an owning session exits without SessionEnd | fixed-in 1.1.1 | see #457 |
@@ -66,7 +66,7 @@
 | #453 | pr | +19/-0 | Terminate broker when its app-server child exits (fixes wedged/zombie broker hangs) | verify | cherry-pick candidate |
 | #457 | pr | +202/-3 | fix(broker): self-terminate on idle to reap orphaned shared brokers (#450) | fixed-in 1.1.1 | fixes #450 |
 | #484 | pr | +28/-3 | fix: use a deterministic Windows shell for broker spawns (#236) | verify | fixes #236 |
-| #487 | issue | — | Windows: broker child processes leak and stale broker.json poisons setup tests on persistent machines | planned v1.4.1 | stale broker.json validation fixed-in v1.3.0; leaked children need the v1.4.1 kill path |
+| #487 | issue | — | Windows: broker child processes leak and stale broker.json poisons setup tests on persistent machines | fixed-in v1.4.1 | stale broker.json validation fixed-in v1.3.0; leaked children need the v1.4.1 kill path |
 | #490 | pr | +199/-3 | Stop orphaned Codex companion brokers | verify | — |
 | #509 | issue | — | Rescue tasks intermittently hang forever: stale shared broker reused without a health check; headless app-server inherits desktop MCP servers | verify | — |
 | #518 | pr | +1320/-175 | fix: close detached broker and worker lifecycles | verify | — |
@@ -99,9 +99,9 @@
 | #697 | issue | — | app-server-broker silently disables all git hooks when started in a git worktree | verify | — |
 | #706 | issue | — | App-server broker retains thread subscriptions after task clients disconnect | verify | — |
 | #715 | pr | +289/-23 | fix(setup): fall back when broker auth is busy | verify | — |
-| #718 | issue | — | Windows: every command leaks an orphaned broker, and a live app-server makes the workspace directory undeletable | planned v1.4.1 | orphaned broker cleanup from stored records needs process identity (v1.4.1) |
+| #718 | issue | — | Windows: every command leaks an orphaned broker, and a live app-server makes the workspace directory undeletable | fixed-in v1.4.1 | orphaned broker cleanup from stored records needs process identity (v1.4.1) |
 | #741 | issue | — | `npm test` leaves a detached broker and a fake app-server behind for every test workspace | verify | — |
-| #743 | issue | — | SessionEnd kills whatever pid `broker.json` names, without checking it is still a broker (pid reuse → SIGTERM to an unrelated process group) | fixed-in v1.3.0 | posix-only; Windows kill-from-record refusal now targeted v1.4.1, not v1.4.0 |
+| #743 | issue | — | SessionEnd kills whatever pid `broker.json` names, without checking it is still a broker (pid reuse → SIGTERM to an unrelated process group) | fixed-in v1.4.1 | posix-only; Windows kill-from-record refusal now targeted v1.4.1, not v1.4.0; win32 half fixed-in v1.4.1 |
 | #749 | pr | +72/-7 | fix(broker): do not signal stale persisted pids | fixed-in v1.3.0 | cherry-pick candidate |
 | #753 | issue | — | ensureBrokerSession() deletes a live broker's state without killing it — the only production caller passes no killProcess | fixed-in v1.3.0 | see #762 |
 | #762 | pr | +5/-3 | fix: terminate broker process when ensureBrokerSession tears down (fixes #753) | fixed-in v1.3.0 | fixes #753 |
@@ -146,12 +146,12 @@ Windows-специфика: taskkill, spawn/PATHEXT, PowerShell, EPERM/ENOENT н
 | #295 | issue | — | Windows: shell tool-calls inside Codex turn fail with 'CreateProcessAsUserW failed: 1920' on plugin v1.0.4 | verify | CreateProcessAsUserW 1920 comes from Codex's own tool sandbox, not the plugin spawn |
 | #310 | issue | — | Windows zh-TW: codex app-server JSONL parser crashes on Big5-encoded taskkill stdout leak | verify | taskkill stdout is captured by spawnSync in v1.4.0 and never reaches the app-server stream; needs a zh-TW retest |
 | #330 | issue | — | codex-companion IPC pipe deadlocks mid-review when codex spawns stdout-heavy PowerShell commands on Windows | verify | — |
-| #336 | issue | — | Codex sandbox shell commands fail with CreateProcessAsUserW 1312 on Windows — Store pwsh.exe cannot be spawned from Git Bash subprocess context | planned v1.4.1 | — |
+| #336 | issue | — | Codex sandbox shell commands fail with CreateProcessAsUserW 1312 on Windows — Store pwsh.exe cannot be spawned from Git Bash subprocess context | fixed-in v1.4.1 | — |
 | #349 | issue | — | Windows: /codex:review and /codex:rescue silently return empty results because plugin forces broken sandbox modes | planned v1.5.0 | sandbox/profile surface (--sandbox/--profile sugar) |
 | #360 | pr | +423/-25 | [Night Shift] Fix Windows sandbox and rescue error output | verify | — |
 | #403 | issue | — | SessionEnd hook can hit 5s timeout on Windows due to shelling out to git | verify | — |
 | #409 | issue | — | [Windows] POSIX path conversion mangles slash-prefixed CLI args under Git Bash | fixed-in v1.4.0 | — |
-| #423 | issue | — | `/codex:cancel` throws and leaves the job stuck as "running" when the pid is already dead on non-English Windows | planned v1.4.1 | see #577 |
+| #423 | issue | — | `/codex:cancel` throws and leaves the job stuck as "running" when the pid is already dead on non-English Windows | fixed-in v1.4.1 | see #577 |
 | #438 | pr | +16/-4 | fix(windows): resolve cross-platform test compatibility and path separation issues | verify | cherry-pick candidate |
 | #440 | issue | — | spawnBrokerProcess() missing windowsHide: true — leftover spawn site from #67 | fixed-in v1.4.0 | — |
 | #441 | issue | — | Stop hook flashes a visible console window on Windows at every turn end — consider not registering it while stopReviewGate is disabled | verify | — |
@@ -162,7 +162,7 @@ Windows-специфика: taskkill, spawn/PATHEXT, PowerShell, EPERM/ENOENT н
 | #528 | issue | — | session-lifecycle-hook: SessionStart appends env exports without dedup - env file grows unboundedly on resume/compact, breaking Bash on Windows (8191-char limit) | fixed-in 1.1.0 | — |
 | #530 | issue | — | Stop hook hangs until 900s timeout on Windows even when review gate is disabled (stdin EOF never arrives) | fixed-in v1.4.0 | see #544 |
 | #544 | pr | +149/-19 | fix: bound Stop hook stdin read so disabled gate cannot hang on Windows (#530) | fixed-in v1.4.0 | fixes #530 |
-| #577 | pr | +215/-15 | fix: make cancel work under Git Bash on a non-English Windows (#423) | planned v1.4.1 | fixes #423 |
+| #577 | pr | +215/-15 | fix: make cancel work under Git Bash on a non-English Windows (#423) | fixed-in v1.4.1 | fixes #423 |
 | #618 | issue | — | /codex:transfer always fails on Windows: ledger lookup can never match (verbatim \?\ paths + hash of a live transcript) | planned v1.5.0 | — |
 | #626 | issue | — | teardownBrokerSession: unguarded pid/log unlinkSync throws EPERM on Windows and fails the whole job - the other four cleanup steps in the same function are already guarded | fixed-in v1.3.0 | guarded pid/log unlink landed in v1.3.0 (best-effort teardown); not announced upstream yet |
 | #633 | issue | — | teardownBrokerSession: unguarded pid/log unlinkSync throws EPERM on Windows and fails the whole job - the other four cleanup steps in the same function are already guarded | fixed-in v1.3.0 | duplicate of #626; duplicate of #626; same v1.3.0 fix |
@@ -825,9 +825,13 @@ Issue (не PR) со статусом `fixed-in`/`planned`, сгруппиров
 
 #626, #633 (guarded pid/log unlink in broker teardown)
 
+### fixed-in v1.4.1
+
+#336, #416, #423, #487, #577, #718, #743 (win32)
+
 ### planned v1.4.1
 
-#70, #336, #416, #423, #487, #718
+#70
 
 ### verify (Windows, needs a reporter retest after v1.4.0)
 

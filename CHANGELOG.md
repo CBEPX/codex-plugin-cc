@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.4.1 — 2026-09-29
+
+### Fixed
+- Windows: kills from stored process records (`/codex:cancel`, `SessionEnd` cleanup of a running job, stale-broker replacement, broker teardown) now verify the process by its start time and terminate the verified tree through one in-box PowerShell 5.1 run with pinned handles (no Store `pwsh` needed); closes the win32 half of #743 and #423/#577, #336, #416, #487, #718.
+- The Codex app-server transport dropped the connection when a notification contained U+2028/U+2029 (`node:readline` split the JSON frame): any turn whose command or output carried a line or paragraph separator failed as "connection closed before the turn completed" (both transports).
+- The posix `ps` command-line probe no longer spawns on a spent budget.
+
+### Changed
+- Windows: process identity is captured for workers and the broker at spawn; `status` and the reaper probe all live jobs in one PowerShell run; `cancel` reports `cancellationPending` with `survivors` (pid + identity) when part of the tree outlives the kill and never marks such a job cancelled; `SessionEnd` keeps records whose kill outcome is unknown (`kept=true` in the teardown decision line) so the next `SessionEnd` can retry; the shared broker is excluded from a worker's kill tree only by a verified identity (a broker record without identity refuses the kill).
+- `teardownBrokerSession` result gains `kept: false` on posix (no behaviour change there).
+
+### Internal
+- CI: the "No leaked test processes" step is enforced on every OS through `scripts/check-leaks.mjs` (Windows enumerates via the plugin's own PowerShell launcher). PowerShell launches use a clean environment plus `LOCALAPPDATA`/`PSModuleAnalysisCachePath` pass-through; without them PowerShell 5.1 re-analysed modules on every launch (20-30 s cold starts on hosted runners).
+
 ## 1.4.0 — 2026-09-28
 
 ### Fixed
