@@ -334,6 +334,13 @@ export function isWorkerTerminalRecord(stored) {
   return isTerminalRecord(stored) && stored.workerClosed === true;
 }
 
+// The worker's own terminal record whose close also saw the app-server exit.
+// `false` = the close deadline passed with the child alive; a pre-1.4.2 record
+// has no field and counts (its `workerClosed` was the v1.4.1 proof).
+export function isWorkerProvedRecord(stored) {
+  return isWorkerTerminalRecord(stored) && stored.appServerExited !== false;
+}
+
 // The cancel's terminal write, one locked step: another process's `saveState`
 // prune works off a diff of the index, so a cancel split across the write can
 // have its record pruned away, or the payload it deleted counted as still owned.

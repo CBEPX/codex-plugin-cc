@@ -835,13 +835,18 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
   }
 }
 
+// The result carries what the client's close() observed (direct: the child's
+// exit; broker: the socket released). Non-object results pass through.
+function withCloseOutcome(result, closed) {
+  return result && typeof result === "object" ? { ...result, appServerExited: closed?.exited === true } : result;
+}
+
 async function withAppServer(cwd, fn, clientOptions = {}) {
   let client = null;
   try {
     client = await CodexAppServerClient.connect(cwd, clientOptions);
     const result = await fn(client);
-    await client.close();
-    return result;
+    return withCloseOutcome(result, await client.close());
   } catch (error) {
     const brokerRequested = client?.transport === "broker" || Boolean(process.env[BROKER_ENDPOINT_ENV]);
     const shouldRetryDirect =
@@ -858,11 +863,14 @@ async function withAppServer(cwd, fn, clientOptions = {}) {
     }
 
     const directClient = await CodexAppServerClient.connect(cwd, { ...clientOptions, disableBroker: true });
+    let result;
     try {
-      return await fn(directClient);
-    } finally {
+      result = await fn(directClient);
+    } catch (retryError) {
       await directClient.close();
+      throw retryError;
     }
+    return withCloseOutcome(result, await directClient.close());
   }
 }
 

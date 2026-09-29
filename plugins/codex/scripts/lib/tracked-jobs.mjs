@@ -228,10 +228,14 @@ export async function runTrackedJob(job, runner, options = {}) {
         pidIdentity: null,
         phase: completionStatus === "completed" ? "done" : "failed",
         completedAt,
-        // `runner()` resolved, so withAppServer already awaited client.close():
-        // the direct child is gone or the broker socket released. Only this
-        // cooperative write proves it (crash guard and reaper never set it).
+        // `runner()` resolved, so withAppServer already awaited client.close().
+        // `workerClosed`: that close returned. `appServerExited`: it saw the
+        // direct child exit (a broker connection always counts); a close that hit
+        // its 5 s deadline with the child alive records false, and so does a
+        // runner that does not say. Only this cooperative write sets either
+        // (crash guard and reaper never do).
         workerClosed: true,
+        appServerExited: execution.appServerExited === true,
         result: execution.payload,
         rendered: execution.rendered
       });
@@ -247,6 +251,7 @@ export async function runTrackedJob(job, runner, options = {}) {
         pid: null,
         pidIdentity: null,
         workerClosed: true,
+        appServerExited: execution.appServerExited === true,
         completedAt
       });
       removeJobPidFile(job.workspaceRoot, job.id);

@@ -427,6 +427,17 @@ test("runTrackedJob sets workerClosed only on its cooperative terminal write, af
   assert.equal(readJobFile(resolveJobFile(workspace, thrown.id)).workerClosed, undefined);
 });
 
+test("runTrackedJob records whether the app-server exit was observed; a silent runner records false", async () => {
+  const workspace = makeTempDir();
+  for (const [id, reported, expected] of [["job-exit-seen", true, true], ["job-exit-unseen", false, false], ["job-exit-unsaid", undefined, false]]) {
+    const job = { id, status: "queued", workspaceRoot: workspace, logFile: null };
+    seedJob(workspace, job);
+    await runTrackedJob(job, async () => ({ exitStatus: 0, payload: {}, rendered: "ok\n", summary: "ok", appServerExited: reported }));
+    assert.equal(readJobFile(resolveJobFile(workspace, id)).appServerExited, expected, id);
+    assert.equal(listJobs(workspace).find((entry) => entry.id === id).appServerExited, expected, id);
+  }
+});
+
 // A live pid is not proof of a live worker: the OS may have handed the number to
 // something else (#743). The recorded identity tells them apart.
 test("reapDeadJobs fails a running job whose pid was recycled by another process", () => {

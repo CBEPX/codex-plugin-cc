@@ -51,7 +51,7 @@ import {
   cancelDecision,
   commitCancel,
   emitCancelPending,
-  isWorkerTerminalRecord,
+  isWorkerProvedRecord,
   readStoredJob,
   resolveCancelableJob,
   resolveResultJob,
@@ -592,6 +592,7 @@ async function executeReviewRun(request) {
       threadId: result.threadId,
       turnId: result.turnId,
       resolved: result.resolved,
+      appServerExited: result.appServerExited,
       payload,
       rendered,
       errorMessage: result.error?.message ?? null,
@@ -644,6 +645,7 @@ async function executeReviewRun(request) {
     threadId: result.threadId,
     turnId: result.turnId,
     resolved: result.resolved,
+    appServerExited: result.appServerExited,
     payload,
     rendered: renderReviewResult(parsed, {
       reviewLabel: reviewName,
@@ -730,6 +732,7 @@ async function executeTaskRun(request) {
     threadId: result.threadId,
     turnId: result.turnId,
     resolved: result.resolved,
+    appServerExited: result.appServerExited,
     payload,
     rendered,
     errorMessage: failureMessage || null,
@@ -1373,7 +1376,7 @@ function finishCancel({ workspaceRoot, job, existing, interrupt, pid, identity, 
   // so a later cancel or the reaper can still find it.
   // win32, the root was gone before the kill (241): only the worker's own terminal
   // record, read under the kill's lock, proves its tree closed.
-  const workerProved = win32 && kill.reason === "process-missing" && isWorkerTerminalRecord(readStoredJob(workspaceRoot, job.id));
+  const workerProved = win32 && kill.reason === "process-missing" && isWorkerProvedRecord(readStoredJob(workspaceRoot, job.id));
   const decision = cancelDecision({ pid, kill, alive: isPidAlive(pid), workerProved });
   if (decision.pending) {
     emitCancelPending(decision, pid, job.id, { json: options.json, appendLog: (line) => appendLogLine(job.logFile, line) });

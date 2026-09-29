@@ -8,7 +8,7 @@ import { saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle
 import { DEAD_WORKER_MESSAGE } from "../plugins/codex/scripts/lib/tracked-jobs.mjs";
 import assert from "node:assert/strict";
 
-import { brokerExclusion, brokerPresence, cancelDecision, commitCancel, emitCancelPending, isWorkerTerminalRecord, renderCancelPending } from "../plugins/codex/scripts/lib/job-control.mjs";
+import { brokerExclusion, brokerPresence, cancelDecision, commitCancel, emitCancelPending, isWorkerProvedRecord, isWorkerTerminalRecord, renderCancelPending } from "../plugins/codex/scripts/lib/job-control.mjs";
 
 const SURVIVORS = [{ pid: 4301, identity: "win32:7" }];
 
@@ -148,6 +148,14 @@ test("isWorkerTerminalRecord requires the workerClosed marker on a terminal reco
   assert.equal(isWorkerTerminalRecord(done), false, "legacy v1.4.0 record");
   assert.equal(isWorkerTerminalRecord({ status: "running", workerClosed: true }), false);
   assert.equal(isWorkerTerminalRecord(null), false);
+});
+
+test("isWorkerProvedRecord also needs the app-server exit observed; a pre-1.4.2 record without the field counts", () => {
+  const done = { status: "failed", phase: "failed", workerClosed: true };
+  assert.equal(isWorkerProvedRecord({ ...done, appServerExited: true }), true);
+  assert.equal(isWorkerProvedRecord(done), true, "v1.4.1 record");
+  assert.equal(isWorkerProvedRecord({ ...done, appServerExited: false }), false, "close deadline passed, child alive");
+  assert.equal(isWorkerProvedRecord({ status: "failed", appServerExited: true }), false, "crash guard / reaper: no marker");
 });
 
 test("commitCancel writes cancelled over an active record and keeps a terminal one", () => {
