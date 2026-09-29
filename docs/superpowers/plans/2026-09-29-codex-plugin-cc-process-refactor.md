@@ -67,18 +67,18 @@ common boundary (usually `plugins/codex/scripts/lib/`); never add caller-specifi
 - Search with `rg`, never `grep`/`egrep`/`fgrep`. Never `git add -A`.
 - Commit only through an `&&` chain on exit codes: `npm run check && <leak check> && git add <files> && git commit`. Never judge a gate by matching log text.
 - Work in a worktree under `.worktrees/`; `main` is the release base and the review base (`--base main`).
-- Do not push, merge, tag, release or post upstream comments without the user's explicit instruction.
-- Claim the work item with `agent-work` before writing; check the claim before each write batch; release it at the end of the stage.
+- Pushing a work branch under an active claim is fine; merging, tagging, publishing a release and posting upstream comments each need the user's explicit go.
+- Maintainers claim the work item with the `agent-work` tool before writing and release the claim at the end of the stage (see `docs/agent/process.md`); contributors without it open a draft PR first.
 - README describes behaviour by observable outputs (flags, `status --json` / `result --json` fields, exit codes, decision lines, error text). Function names and `scripts/lib/...` paths belong in `docs/*.md`.
 - The `codex@cbepx` plugin is installed from the marketplace cache per Claude config dir; the working tree is not what `/codex:*` runs. After a release: `claude plugin marketplace update cbepx && claude plugin update codex@cbepx` in each config dir, then restart the session.
 
 ## Read on demand
 
-- `docs/agent/process.md` — stages, mandatory skills per stage, model roles, adversarial-gate stop rule, SDD ledger and evidence rules, upstream comments.
-- `docs/agent/testing-and-ci.md` — gate sequence, timing rules for slow hosted runners, CI watching, PowerShell lessons.
-- `docs/agent/windows-threat-model.md` — the five-point checklist for any Windows spawn change.
-- `docs/agent/docs.md` — README rule, spec/plan templates, CHANGELOG copies.
-- `docs/RELEASING.md` — release procedure, steps 0–6.
+- [docs/agent/process.md](docs/agent/process.md) — stages, mandatory skills per stage, model roles, adversarial-gate stop rule, SDD ledger and evidence rules, `agent-work` claims, upstream comments.
+- [docs/agent/testing-and-ci.md](docs/agent/testing-and-ci.md) — gate sequence, timing rules for slow hosted runners, CI watching, PowerShell lessons.
+- [docs/agent/windows-threat-model.md](docs/agent/windows-threat-model.md) — the five-point checklist for any Windows spawn change.
+- [docs/agent/docs.md](docs/agent/docs.md) — README rule, spec/plan templates, CHANGELOG copies.
+- [docs/RELEASING.md](docs/RELEASING.md) — release procedure, steps 0–6.
 ```
 
 - [ ] **Step 3: Write `docs/agent/process.md`** with these sections (English; keep the wording of the rules below, they are the translated constraints 2, 4, 5, 6, 10 and the roles table):
@@ -93,7 +93,7 @@ common boundary (usually `plugins/codex/scripts/lib/`); never add caller-specifi
 | Brainstorm | `superpowers:brainstorming` | roadmap section |
 | Spec | `superpowers:brainstorming` design → written spec; second opinion `/codex:rescue --effort xhigh` (read-only) | `docs/superpowers/specs/<date>-<topic>-design.md` |
 | Plan | `superpowers:writing-plans` | `docs/superpowers/plans/<date>-codex-plugin-cc-vX.Y.Z.md` |
-| Claim | `agent-work claim --target <PR url>` before any write; `check` before each batch | claim id in the ledger |
+| Claim | Maintainer tooling: `agent-work claim --target <PR url>` (the `~/.local/bin/agent-work` cooperative-claim CLI; issues are disabled, the PR is the work item) before any write; `check` before each batch; `release --stopped` at the end of the stage. Contributors without the tool: open a draft PR first | claim id in the ledger |
 | Implement | `superpowers:subagent-driven-development` + `superpowers:test-driven-development`; `superpowers:systematic-debugging` on any failure | commits, `task-N-brief.md` / `task-N-report.md` |
 | Task review | `superpowers:requesting-code-review` (Fable); `pr-review-toolkit` agents on the final whole-branch pass | review note in the ledger |
 | Adversarial gate | `/codex:adversarial-review --base main --effort max` | `adv-<version>-passN.json`, fix-wave reports |
@@ -336,7 +336,8 @@ test("relative links and anchors in the docs resolve", () => {
 test("README describes behaviour by observable outputs, not code paths", () => {
   const readme = read("README.md");
   assert.doesNotMatch(readme, /scripts\/lib\//, "README must not name scripts/lib paths");
-  assert.doesNotMatch(readme, /\b[a-z][A-Za-z]+\(\)/, "README must not name functions");
+  // Code spans are stripped first: a pinned command line may legitimately contain `word()`.
+  assert.doesNotMatch(readme.replace(/`[^`\n]*`/g, ""), /\b[a-z][A-Za-z]+\(\)/, "README must not name functions");
 });
 ```
 
