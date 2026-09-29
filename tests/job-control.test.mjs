@@ -2,12 +2,12 @@ import test from "node:test";
 import fs from "node:fs";
 import path from "node:path";
 import { makeTempDir } from "./helpers.mjs";
-import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
+import { readJobFile, resolveJobFile, resolveStateDir, writeJobFile } from "../plugins/codex/scripts/lib/state.mjs";
 import { BROKER_ENDPOINT_ENV } from "../plugins/codex/scripts/lib/app-server.mjs";
 import { saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
 import assert from "node:assert/strict";
 
-import { brokerExclusion, brokerPresence, cancelDecision, finishedBeforeCancel, emitCancelPending, renderCancelPending } from "../plugins/codex/scripts/lib/job-control.mjs";
+import { brokerExclusion, brokerPresence, cancelDecision, commitCancel, emitCancelPending, renderCancelPending } from "../plugins/codex/scripts/lib/job-control.mjs";
 
 const SURVIVORS = [{ pid: 4301, identity: "win32:7" }];
 
@@ -18,9 +18,9 @@ test("cancelDecision: what each kill outcome means for the job", () => {
     [{ pid: 1, kill: { attempted: true, delivered: false, survivors: SURVIVORS }, alive: false, platform: "linux" }, { pending: false, reason: null, survivors: [] }],
     [{ pid: 1, kill: { attempted: false, reason: "identity-unavailable" }, alive: true, platform: "win32" }, { pending: true, reason: "identity-unavailable", survivors: [], rootAlive: true }],
     [{ pid: 1, kill: { attempted: true, delivered: false, unverified: true }, alive: false, platform: "win32" }, { pending: true, reason: "kill-failed", survivors: [], rootAlive: false }],
-    [{ pid: 1, kill: { attempted: false, delivered: false, method: "handle", reason: "process-missing" }, alive: false, platform: "win32" }, { pending: true, reason: "process-missing", survivors: [], rootAlive: false }],
+    [{ pid: 1, kill: { attempted: false, delivered: false, method: "handle", reason: "process-missing" }, alive: false, platform: "win32" }, { pending: false, reason: null, survivors: [] }],
     [{ pid: 1, kill: { attempted: false, delivered: false, method: "handle", reason: "process-missing" }, alive: false, platform: "linux" }, { pending: false, reason: null, survivors: [] }],
-    [{ pid: 1, kill: { attempted: false, delivered: false, method: "handle", reason: "process-missing" }, alive: false, platform: "win32" }, { pending: true, reason: "process-missing", survivors: [], rootAlive: false }],
+    [{ pid: 1, kill: { attempted: false, delivered: false, method: "handle", reason: "process-missing", survivors: SURVIVORS }, alive: false, platform: "win32" }, { pending: true, reason: "process-missing", survivors: SURVIVORS, rootAlive: false }],
     [{ pid: 1, kill: { attempted: false, reason: "identity-unavailable" }, alive: false, platform: "win32" }, { pending: true, reason: "identity-unavailable", survivors: [], rootAlive: false }],
     [{ pid: 1, kill: { attempted: false, reason: "identity-mismatch" }, alive: false, platform: "win32" }, { pending: true, reason: "identity-mismatch", survivors: [], rootAlive: false }],
     [{ pid: 1, kill: { attempted: false, reason: "identity-unavailable" }, alive: false, platform: "linux" }, { pending: false, reason: null, survivors: [] }],
@@ -68,12 +68,13 @@ test("brokerPresence: an existing but unreadable broker.json presumes a broker",
   }
 });
 
-test("renderCancelPending renders process-missing plainly", () => {
-  const rendered = renderCancelPending({ pending: true, reason: "process-missing", survivors: [], rootAlive: false }, 4300, "job-1");
-  assert.equal(rendered.logLine, "cancellation not confirmed: worker pid 4300 left running (process-missing)");
-  assert.match(rendered.text, /worker pid 4300 exited before it could be signalled; the job stays running until the reaper judges it/);
+test("renderCancelPending reports the orphans a vanished worker left", () => {
+  const rendered = renderCancelPending({ pending: true, reason: "process-missing", survivors: SURVIVORS, rootAlive: false }, 4300, "job-1");
+  assert.equal(rendered.logLine, "cancellation not confirmed: worker pid 4300 left running (process-missing) worker tree survivors: 4301:win32:7");
+  assert.ok(rendered.text.includes("worker pid 4300 exited but part of its tree is still running (survivors: 4301:win32:7); the job stays running until the reaper judges it."));
   assert.equal(rendered.json.reason, "process-missing");
-  assert.equal(rendered.diagnostic, null);
+  assert.deepEqual(rendered.json.survivors, SURVIVORS);
+  assert.equal(rendered.diagnostic, "[codex] worker tree survivors: 4301:win32:7\n");
 });
 
 test("renderCancelPending says an unverifiable dead worker waits for the reaper", () => {
@@ -135,12 +136,30 @@ test("emitCancelPending never puts the diagnostic on stdout", () => {
   }
 });
 
-test("finishedBeforeCancel: a terminal stored record is kept and reported, an active one is not", () => {
-  const interrupt = { attempted: true, interrupted: true };
-  const report = finishedBeforeCancel("task-1", { status: "failed", title: "T" }, interrupt);
-  assert.deepEqual(report.payload, { jobId: "task-1", status: "failed", title: "T", cancellationPending: false, turnInterruptAttempted: true, turnInterrupted: true });
-  assert.equal(report.text, "job task-1 already finished (failed) before the cancel completed; record kept");
-  assert.equal(finishedBeforeCancel("task-1", { status: "running" }, interrupt), null);
-  assert.equal(finishedBeforeCancel("task-1", { status: "queued" }, interrupt), null);
-  assert.equal(finishedBeforeCancel("task-1", null, interrupt), null);
+test("commitCancel writes cancelled over an active record and keeps a terminal one", () => {
+  const workspace = makeTempDir();
+  const job = { id: "task-1", status: "running", title: "T" };
+  const next = { ...job, status: "cancelled", phase: "cancelled", pid: null, pidIdentity: null, requestFile: null, completedAt: "2026-09-29T00:00:00.000Z", errorMessage: "Cancelled by user." };
+  const log = [];
+  writeJobFile(workspace, "task-1", { ...job, threadId: "th" });
+  assert.equal(commitCancel(workspace, job, next, {}, { leftRunning: null, log: (line) => log.push(line) }), null);
+  const written = readJobFile(resolveJobFile(workspace, "task-1"));
+  assert.equal(written.status, "cancelled");
+  assert.equal(written.threadId, "th", "the stored record is the base");
+  assert.equal(written.cancelledAt, next.completedAt);
+  assert.deepEqual(log, ["Cancelled by user."]);
+
+  // The worker (or the reaper) already finished it: kept, reported, not overwritten.
+  const finished = { ...job, status: "failed", phase: "failed", errorMessage: "Turn interrupted." };
+  writeJobFile(workspace, "task-1", finished);
+  log.length = 0;
+  assert.deepEqual(commitCancel(workspace, job, next, {}, { leftRunning: "worker pid 5 left running: identity-mismatch", log: (line) => log.push(line) }), finished);
+  assert.deepEqual(readJobFile(resolveJobFile(workspace, "task-1")), finished);
+  assert.deepEqual(log, ["cancel: record already failed, kept (interrupt not acknowledged)"]);
+
+  // This cancel caused the finish (acknowledged interrupt, or delivered kill): cancelled wins (v1.4.0).
+  log.length = 0;
+  assert.equal(commitCancel(workspace, job, next, {}, { leftRunning: null, causedByCancel: true, log: (line) => log.push(line) }), null);
+  assert.equal(readJobFile(resolveJobFile(workspace, "task-1")).status, "cancelled");
+  assert.deepEqual(log, ["Cancelled by user."]);
 });

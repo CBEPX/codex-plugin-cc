@@ -630,6 +630,10 @@ test("terminateRecordedProcess on win32 runs the pinned verify-and-kill script a
     [0, "failure 5\r\n", { attempted: false, delivered: false, reason: "identity-unavailable" }],
     [0, "KILL\r\nZugriff verweigert\r\n", { attempted: true, delivered: false, method: "handle", reason: "kill-failed", survivors: [], unverified: true }],
     [241, "", { attempted: false, delivered: false, method: "handle", reason: "process-missing" }],
+    [241, "SURVIVOR 4300 1337\r\nSURVIVOR 4301 1338\r\n", { attempted: false, delivered: false, method: "handle", reason: "process-missing", survivors: [{ pid: 4300, identity: "win32:1337" }, { pid: 4301, identity: "win32:1338" }] }],
+    [241, "SURVIVOR 4300 1\r\nSURVIVOR 4300 2\r\n", { attempted: false, delivered: false, reason: "identity-unavailable" }],
+    [241, "SURVIVOR 0 0\r\n", { attempted: false, delivered: false, reason: "identity-unavailable" }],
+    [241, "SURVIVOR 4300 1337\r\nOK\r\n", { attempted: false, delivered: false, reason: "identity-unavailable" }],
     [241, "KILL\r\n", { attempted: true, delivered: false, method: "handle", reason: "kill-failed", survivors: [], unverified: true }],
     [242, "", { attempted: false, delivered: false, method: "handle", reason: "identity-mismatch" }],
     [241, "junk\r\n", { attempted: false, delivered: false, reason: "identity-unavailable" }],
@@ -661,16 +665,22 @@ test("terminateRecordedProcess on win32 runs the pinned verify-and-kill script a
     assert.ok(script.indexOf("$exclude.ContainsKey($cid)") > script.indexOf("$live = Micro $h.StartTime"), "exclusion is decided after the pin and start-time read");
     assert.match(script, /\$code = 245\n/);
     assert.match(script, /Get-CimInstance -ClassName Win32_Process -Property ProcessId,ParentProcessId,CreationDate \|/, "provider-side projection");
-    assert.doesNotMatch(script.match(/Get-CimInstance[^\n]*Property ProcessId[^\n]*/)[0], /CommandLine/, "the main snapshot never projects CommandLine");
-    assert.match(script, /Get-CimInstance -ClassName Win32_Process -Filter \"ProcessId = \$cid\" -Property CommandLine/, "one filtered query per admitted child");
-    assert.ok(script.indexOf("app-server-broker.mjs") > script.indexOf("$live = Micro $h.StartTime"), "the shield is decided after the pin and start-time read");
-    assert.match(script, /\$shielded \+= \$h; continue/, "a shielded broker is kept pinned and not enqueued");
-    assert.match(script, /\$survivors = @\(\$survivors\) \+ @\(\$shielded\)/, "a shielded broker is a reported survivor");
+    assert.doesNotMatch(script, /CommandLine|app-server-broker|shielded/, "no command-line shielding: a child mentioning the broker is an ordinary child");
     assert.match(script, /\$code = 245; throw 'budget'/);
     assert.equal(script.match(/exit 244/g).length, 1, "244 is only the CLM guard");
     assert.match(script, new RegExp(`FromFileTimeUtc\\(${expectedDeadline}\\)`), "absolute deadline counts the PowerShell start-up");
     assert.match(script, /\$null = \$h\.Handle/, "the handle is pinned before StartTime is read");
-    assert.match(script, /catch \[System\.ArgumentException\] \{ \$code = 241; throw \}/);
+    // 241: the root is gone; orphans it left (same parent pid, created no earlier than the recorded start) are reported, never killed.
+    const missingAt = script.indexOf("try { $root = Pin $target } catch [System.ArgumentException] {");
+    const missingEnd = script.indexOf("$code = 241; throw 'missing'");
+    assert.ok(missingAt > 0 && missingEnd > missingAt, "241 is decided after the orphan report");
+    const missing = script.slice(missingAt, missingEnd);
+    assert.match(missing, /\$floor = Micro \(\[DateTime\]::FromFileTimeUtc\(\[long\]\$expected\)\)/, "the recorded start in the microsecond domain");
+    assert.match(missing, /Get-CimInstance -ClassName Win32_Process -Filter "ParentProcessId = \$target" -Property ProcessId,CreationDate/);
+    assert.match(missing, /if \(\(Micro \$r\.CreationDate\) -lt \$floor\) \{ continue \}/, "older than the root: not its child");
+    assert.match(missing, /if \(\(Micro \$h\.StartTime\) -ne \(Micro \$r\.CreationDate\)\) \{ continue \}/, "a reused pid is not an orphan");
+    assert.doesNotMatch(missing, /Kill\(\)/, "orphans are reported, never killed");
+    assert.ok(missing.indexOf("Write-Output") > missing.indexOf("$orphans +="), "rows are printed only after a complete pass (245 until then)");
     assert.match(script, /catch \[System\.ArgumentException\] \{ continue \}/, "a child that is already gone is skipped, any other pin error aborts with 245");
     assert.match(script, /\$t - \(\$t % 10\)/, "exact Int64 microsecond truncation");
     assert.match(script, /\.Kill\(\)/);
@@ -739,7 +749,34 @@ test("terminateRecordedProcess on live win32 reports process-missing for a pid t
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
   }
   assert.equal(isPidAlive(child.pid), false);
-  assert.equal(terminateRecordedProcess(child.pid, { identity, timeoutMs: 10_000 }).reason, "process-missing");
+  const outcome = terminateRecordedProcess(child.pid, { identity, timeoutMs: 10_000 });
+  assert.equal(outcome.reason, "process-missing");
+  assert.equal(outcome.survivors, undefined, "no orphans: nothing to report");
+});
+
+test("terminateRecordedProcess on live win32 reports, and never kills, an orphan the gone root left", { skip: !IS_WIN, timeout: 30_000 }, async (t) => {
+  resetWindowsIdentityCircuit();
+  const parent = spawn(process.execPath, ["-e", "const c=require('child_process').spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});console.log(c.pid);setInterval(()=>{},1000)"], { stdio: ["ignore", "pipe", "ignore"] });
+  let orphan = null;
+  t.after(() => {
+    try { parent.kill(); } catch { /* already gone */ }
+    try { if (orphan) process.kill(orphan); } catch { /* already gone */ }
+  });
+  orphan = Number(await new Promise((resolve) => parent.stdout.once("data", (chunk) => resolve(String(chunk).trim()))));
+  const identity = getProcessIdentity(parent.pid);
+  const orphanIdentity = getProcessIdentity(orphan);
+  assert.match(identity, /^win32:\d+$/);
+  assert.match(orphanIdentity, /^win32:\d+$/);
+  parent.kill();
+  const deadline = Date.now() + 10_000;
+  while (isPidAlive(parent.pid) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  assert.equal(isPidAlive(parent.pid), false);
+  assert.deepEqual(terminateRecordedProcess(parent.pid, { identity, timeoutMs: 10_000 }), {
+    attempted: false, delivered: false, method: "handle", reason: "process-missing", survivors: [{ pid: orphan, identity: orphanIdentity }]
+  });
+  assert.equal(isPidAlive(orphan), true, "an orphan is reported, never killed");
 });
 
 test("terminateRecordedProcess on live win32 refuses a wrong identity and leaves the process alive", { skip: !IS_WIN, timeout: 30_000 }, (t) => {

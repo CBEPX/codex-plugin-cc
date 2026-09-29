@@ -476,11 +476,24 @@ export function terminateScript(pid, fileTime, exclude, deadlineFileTime) {
     "function Micro($dt) { $t = [long]$dt.ToUniversalTime().Ticks; return $t - ($t % 10) }",
     "function Remaining() { return [int][Math]::Floor([Math]::Max(0, ($deadline - [DateTime]::UtcNow).TotalMilliseconds)) }",
     "$tree = @()",
-    "$shielded = @()",
     "$code = 245",
     "try {",
     "  try {",
-    "    try { $root = Pin $target } catch [System.ArgumentException] { $code = 241; throw } ",
+    "    try { $root = Pin $target } catch [System.ArgumentException] {",
+    "      # The root is gone. Children it left behind (same parent pid, created no earlier than the",
+    "      # recorded root) are reported, never killed: parent pid and time order are all that ties them to it.",
+    "      # $code stays 245 until the pass is complete, so a failed enumeration is never a clean 241.",
+    "      $floor = Micro ([DateTime]::FromFileTimeUtc([long]$expected))",
+    "      $orphans = @()",
+    "      foreach ($r in @(Get-CimInstance -ClassName Win32_Process -Filter \"ParentProcessId = $target\" -Property ProcessId,CreationDate)) {",
+    "        if ((Micro $r.CreationDate) -lt $floor) { continue }",
+    "        try { $h = Pin ([int]$r.ProcessId) } catch [System.ArgumentException] { continue }",
+    "        if ((Micro $h.StartTime) -ne (Micro $r.CreationDate)) { continue }",
+    "        $orphans += ('SURVIVOR {0} {1}' -f $h.Id, $h.StartTime.ToFileTimeUtc().ToString())",
+    "      }",
+    "      foreach ($line in $orphans) { Write-Output $line }",
+    "      $code = 241; throw 'missing'",
+    "    }",
     "    if ($root.StartTime.ToFileTimeUtc().ToString() -ne $expected) { $code = 242; throw 'mismatch' }",
     "    $rows = @(Get-CimInstance -ClassName Win32_Process -Property ProcessId,ParentProcessId,CreationDate | Select-Object ProcessId, ParentProcessId, CreationDate)",
     "    $tree = @($root)",
@@ -499,9 +512,6 @@ export function terminateScript(pid, fileTime, exclude, deadlineFileTime) {
     "        if ($exclude.ContainsKey($cid) -and $exclude[$cid] -eq $h.StartTime.ToFileTimeUtc().ToString()) { continue }",
     "        if ($live -ne (Micro $r.CreationDate)) { continue }                  # a stranger holding a reused pid",
     "        if ($live -lt $starts[$pp]) { continue }                             # stale ParentProcessId",
-    "        # A broker that started under the worker but has no record yet is never killed: shielded, reported as a survivor.",
-    "        $cl = (Get-CimInstance -ClassName Win32_Process -Filter \"ProcessId = $cid\" -Property CommandLine).CommandLine",
-    "        if ($cl -and $cl.Contains('app-server-broker.mjs')) { $shielded += $h; continue }",
     "        $starts[$cid] = $live",
     "        $tree += $h",
     "        $queue += $cid",
@@ -526,7 +536,6 @@ export function terminateScript(pid, fileTime, exclude, deadlineFileTime) {
     "  } catch {",
     "    $survivors = @($tree)",
     "  }",
-    "  $survivors = @($survivors) + @($shielded)",
     "  if ($survivors.Count -eq 0) { Write-Output 'OK'; exit 0 }",
     "  # Identity from the still-pinned object: a later report can never be confused with a reused pid.",
     "  foreach ($h in $survivors) { $ft = '0'; try { $ft = $h.StartTime.ToFileTimeUtc().ToString() } catch { }; Write-Output ('SURVIVOR {0} {1}' -f $h.Id, $ft) }",
@@ -548,7 +557,9 @@ export function terminateScript(pid, fileTime, exclude, deadlineFileTime) {
 // follows their parent's, skips the verified excluded processes (the shared broker), kills children-first through
 // the pinned objects and waits for each until an absolute deadline. Every answer
 // is an exit code plus protocol lines; an exit that could not be confirmed is a
-// survivor, and a corrupted answer after KILL is an unverified attempt.
+// survivor, and a corrupted answer after KILL is an unverified attempt. A root
+// already gone (241) reports the orphans it left — parent pid equal to the root,
+// created no earlier than its recorded start — as SURVIVOR rows, never killed.
 function terminateWindowsRecordedProcess(pid, identity, options) {
   const refused = (reason) => ({ attempted: false, delivered: false, reason });
   const fileTime = typeof identity === "string" ? /^win32:(\d+)$/.exec(identity)?.[1] : null;
@@ -568,7 +579,6 @@ function terminateWindowsRecordedProcess(pid, identity, options) {
   const protocol = parseProtocolLines(run.stdout);
   const clean = protocol !== null;
   const killStarted = rawLines.includes("KILL");
-  const survivorRows = (protocol ?? []).slice(1).map((line) => /^SURVIVOR (\d+) (\d+)$/.exec(line));
   const failed = (extra) => ({ attempted: true, delivered: false, method: "handle", reason: "kill-failed", ...extra });
   const unverified = () => failed({ survivors: [], unverified: true });
   // The exit code classifies, the protocol refines, a contradiction is unknown:
@@ -585,19 +595,35 @@ function terminateWindowsRecordedProcess(pid, identity, options) {
         return { attempted: true, delivered: true, method: "handle", reason: "identity-match" };
       }
       return killStarted ? unverified() : refused("identity-unavailable");
-    case WINDOWS_PROCESS_MISSING_EXIT:
-      return run.stdout !== "" ? refused("identity-unavailable") : { attempted: false, delivered: false, method: "handle", reason: "process-missing" };
+    case WINDOWS_PROCESS_MISSING_EXIT: {
+      // Gone before the pin. Only SURVIVOR rows (orphans it left) may follow.
+      const missing = { attempted: false, delivered: false, method: "handle", reason: "process-missing" };
+      if (run.stdout === "") {
+        return missing;
+      }
+      const survivors = clean ? survivorsOf(protocol) : null;
+      return survivors ? { ...missing, survivors } : refused("identity-unavailable");
+    }
     case WINDOWS_IDENTITY_MISMATCH_EXIT:
       return run.stdout !== "" ? refused("identity-unavailable") : { attempted: false, delivered: false, method: "handle", reason: "identity-mismatch" };
-    case WINDOWS_TERMINATION_FAILED_EXIT:
+    case WINDOWS_TERMINATION_FAILED_EXIT: {
       // A 243 without at least one SURVIVOR row is not the script's answer.
-      return clean && protocol.length >= 2 && protocol[0] === "KILL" && survivorRows.every(Boolean) &&
-        survivorRows.every((row) => isWin32Pid(Number(row[1]))) && new Set(survivorRows.map((row) => row[1])).size === survivorRows.length
-        ? failed({ survivors: survivorRows.map((row) => ({ pid: Number(row[1]), identity: row[2] === "0" ? null : `win32:${row[2]}` })) })
-        : unverified();
+      const survivors = clean && protocol[0] === "KILL" ? survivorsOf(protocol.slice(1)) : null;
+      return survivors ? failed({ survivors }) : unverified();
+    }
     default:
       return refused("identity-unavailable");
   }
+}
+
+// At least one SURVIVOR row, every line one, each a valid pid at most once;
+// anything else is null (not the script's answer).
+function survivorsOf(lines) {
+  const rows = lines.map((line) => /^SURVIVOR (\d+) (\d+)$/.exec(line));
+  if (rows.length === 0 || !rows.every((row) => row && isWin32Pid(Number(row[1]))) || new Set(rows.map((row) => row[1])).size !== rows.length) {
+    return null;
+  }
+  return rows.map((row) => ({ pid: Number(row[1]), identity: row[2] === "0" ? null : `win32:${row[2]}` }));
 }
 
 // Signals a recorded PID only once it is proven to still be the recorded

@@ -49,7 +49,7 @@ import {
   brokerPresence,
   buildStatusSnapshot,
   cancelDecision,
-  finishedBeforeCancel,
+  commitCancel,
   emitCancelPending,
   readStoredJob,
   resolveCancelableJob,
@@ -1344,34 +1344,40 @@ async function handleCancel(argv) {
 
   // Only a pid that is provably still this job's worker is signalled (#743).
   const { pid, identity } = resolveJobPid(workspaceRoot, job);
-  const broker = process.platform === "win32" ? brokerPresence(workspaceRoot) : null;
+  // win32: the broker read, the kill and the record write share one state lock.
+  // A broker saves its starting record under the same lock before it spawns, so
+  // none can start between this read and the kill script's snapshot. The kill
+  // is bounded like SessionEnd's win32 step, under the other takers' lock wait.
+  if (process.platform === "win32") {
+    withStateLock(workspaceRoot, () => finishCancel({ workspaceRoot, job, existing, interrupt, pid, identity, options }));
+  } else {
+    finishCancel({ workspaceRoot, job, existing, interrupt, pid, identity, options });
+  }
+}
+
+const WIN32_CANCEL_KILL_MS = 4000;
+
+function finishCancel({ workspaceRoot, job, existing, interrupt, pid, identity, options }) {
+  const win32 = process.platform === "win32";
+  const broker = win32 ? brokerPresence(workspaceRoot) : null;
   const exclude = brokerExclusion(broker);
-  // A broker record without a win32 identity cannot be excluded safely: refuse
-  // rather than risk killing the shared broker under the worker (spec §3.4 rev. 12).
+  // A broker record without a win32 identity (a starting one included) cannot be
+  // excluded safely: refuse rather than risk killing the shared broker under the worker.
   const kill = broker && exclude === null
     ? { attempted: false, delivered: false, reason: "identity-unavailable" }
-    : terminateRecordedProcess(pid, { identity, commandLineMatch: workerCommandLine(job.id), exclude: exclude ?? [] });
+    : terminateRecordedProcess(pid, { identity, commandLineMatch: workerCommandLine(job.id), exclude: exclude ?? [], ...(win32 ? { timeoutMs: WIN32_CANCEL_KILL_MS } : {}) });
   // A worker we may not signal, or whose signal reached nothing, but that is
   // still alive is not cancelled: the job stays running, and the sidecar stays
   // so a later cancel or the reaper can still find it.
-  // win32: a terminal record (the worker's own, or the reaper's) is never overwritten.
-  const finished = process.platform === "win32" ? finishedBeforeCancel(job.id, readStoredJob(workspaceRoot, job.id), interrupt) : null;
-  if (finished) {
-    appendLogLine(job.logFile, finished.text);
-    outputCommandResult(finished.payload, `${finished.text}\n`, options.json);
-    return;
-  }
   const decision = cancelDecision({ pid, kill, alive: isPidAlive(pid) });
   if (decision.pending) {
     emitCancelPending(decision, pid, job.id, { json: options.json, appendLog: (line) => appendLogLine(job.logFile, line) });
     process.exitCode = 1;
     return;
   }
-  const leftRunning = pid && !kill.attempted ? `worker pid ${pid} left running: ${kill.reason}` : null;
-  if (leftRunning) {
-    appendLogLine(job.logFile, leftRunning);
-  }
-  appendLogLine(job.logFile, "Cancelled by user.");
+  // win32: a root proven gone with no orphans was not left running.
+  const goneClean = win32 && kill.reason === "process-missing";
+  const leftRunning = pid && !kill.attempted && !goneClean ? `worker pid ${pid} left running: ${kill.reason}` : null;
 
   const completedAt = nowIso();
   const nextJob = {
@@ -1384,34 +1390,19 @@ async function handleCancel(argv) {
     completedAt,
     errorMessage: "Cancelled by user."
   };
-
-  // Deleting the artifacts and writing the terminal record is one step: another
-  // process's `saveState` prune works off a diff of the index, so a cancel split
-  // across that write can have the record it just wrote pruned away — or the
-  // payload it just deleted counted as still owned.
-  withStateLock(workspaceRoot, () => {
-    // A worker cancelled inside the queued window may never have consumed its
-    // private payload, and a cancelled job is terminal — the reaper will never
-    // look at it again — so the 0600 file (possibly holding `--config` secrets)
-    // has to be released here.
-    removeJobRequestFile(workspaceRoot, job.id);
-    removeJobPidFile(workspaceRoot, job.id);
-    writeJobFile(workspaceRoot, job.id, {
-      ...(readStoredJob(workspaceRoot, job.id) ?? existing),
-      ...nextJob,
-      cancelledAt: completedAt
-    });
-    upsertJob(workspaceRoot, {
-      id: job.id,
-      status: "cancelled",
-      phase: "cancelled",
-      pid: null,
-      pidIdentity: null,
-      requestFile: null,
-      errorMessage: "Cancelled by user.",
-      completedAt
-    });
-  });
+  const kept = commitCancel(workspaceRoot, job, nextJob, existing, { leftRunning, causedByCancel: interrupt.interrupted === true || (kill.attempted === true && kill.delivered === true), log: (line) => appendLogLine(job.logFile, line) });
+  const common = {
+    jobId: job.id,
+    title: job.title,
+    turnInterruptAttempted: interrupt.attempted,
+    turnInterrupted: interrupt.interrupted
+  };
+  if (kept) {
+    // Finished before this cancel could write: the stored outcome stands.
+    const text = `Job ${job.id} already ${kept.status}; its record is kept.\n`;
+    outputCommandResult({ ...common, status: kept.status, cancellationPending: false }, text, options.json);
+    return;
+  }
 
   const payload = {
     jobId: job.id,

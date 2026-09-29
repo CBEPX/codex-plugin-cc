@@ -3,7 +3,7 @@ import fs from "node:fs";
 import { BROKER_ENDPOINT_ENV } from "./app-server.mjs";
 import { loadBrokerSession, resolveBrokerStateFile } from "./broker-lifecycle.mjs";
 import { getSessionRuntimeStatus } from "./codex.mjs";
-import { getConfig, listJobs, readJobFile, resolveJobFile } from "./state.mjs";
+import { getConfig, listJobs, readJobFile, removeJobPidFile, removeJobRequestFile, resolveJobFile, upsertJob, withStateLock, writeJobFile } from "./state.mjs";
 import { reapDeadJobs, SESSION_ID_ENV } from "./tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
@@ -323,24 +323,44 @@ export function resolveCancelableJob(cwd, reference, options = {}) {
   throw new Error("No active Codex jobs to cancel.");
 }
 
-// An existing terminal record is never overwritten by cancel. Returns the
-// report for a stored job that already finished, or null while it is active.
-export function finishedBeforeCancel(jobId, stored, interrupt) {
-  if (!stored || stored.status === "running" || stored.status === "queued") {
-    return null;
-  }
-  const text = `job ${jobId} already finished (${stored.status}) before the cancel completed; record kept`;
-  return {
-    text,
-    payload: {
-      jobId,
-      status: stored.status,
-      title: stored.title,
-      cancellationPending: false,
-      turnInterruptAttempted: interrupt.attempted,
-      turnInterrupted: interrupt.interrupted
+// The cancel's terminal write, one locked step: another process's `saveState`
+// prune works off a diff of the index, so a cancel split across the write can
+// have its record pruned away, or the payload it deleted counted as still owned.
+// A record already terminal (the worker's own, or the reaper's) is kept and
+// returned for the caller to report — unless this cancel caused it (its
+// interrupt was acknowledged, or its kill was delivered): the worker's record is
+// then a consequence of this cancel and is overwritten with `cancelled`
+// (v1.4.0). Otherwise `null` once written.
+export function commitCancel(workspaceRoot, job, nextJob, existing, { leftRunning, log, causedByCancel = false }) {
+  return withStateLock(workspaceRoot, () => {
+    const stored = readStoredJob(workspaceRoot, job.id);
+    if (causedByCancel !== true && stored && stored.status !== "queued" && stored.status !== "running") {
+      log(`cancel: record already ${stored.status}, kept (interrupt not acknowledged)`);
+      return stored;
     }
-  };
+    if (leftRunning) {
+      log(leftRunning);
+    }
+    log("Cancelled by user.");
+    // A worker cancelled inside the queued window may never have consumed its
+    // private payload, and a cancelled job is terminal — the reaper will never
+    // look at it again — so the 0600 file (possibly holding `--config` secrets)
+    // has to be released here.
+    removeJobRequestFile(workspaceRoot, job.id);
+    removeJobPidFile(workspaceRoot, job.id);
+    writeJobFile(workspaceRoot, job.id, { ...(stored ?? existing), ...nextJob, cancelledAt: nextJob.completedAt });
+    upsertJob(workspaceRoot, {
+      id: job.id,
+      status: "cancelled",
+      phase: "cancelled",
+      pid: null,
+      pidIdentity: null,
+      requestFile: null,
+      errorMessage: nextJob.errorMessage,
+      completedAt: nextJob.completedAt
+    });
+    return null;
+  });
 }
 
 // What cancel does with a kill outcome. posix keeps its v1.4.0 answer; win32
@@ -350,9 +370,14 @@ export function cancelDecision({ pid, kill, alive, platform = process.platform }
   if (!pid) {
     return { pending: false, reason: null, survivors: [] };
   }
-  // win32, nothing was signalled (root already gone, or the kill was refused) and
-  // the root is dead: its tree was never examined, so "cancelled" is a guess — the
-  // reaper judges the job.
+  // win32, the root was already gone (241): the kill script looked for orphans it
+  // left. Any → pending with them; none → the worker is gone, cancel proceeds.
+  if (platform === "win32" && kill.attempted === false && kill.reason === "process-missing") {
+    const survivors = kill.survivors ?? [];
+    return survivors.length > 0 ? { pending: true, reason: kill.reason, survivors, rootAlive: alive } : { pending: false, reason: null, survivors: [] };
+  }
+  // win32, the kill was refused and the root is dead: its tree was never
+  // examined, so "cancelled" is a guess — the reaper judges the job.
   if (platform === "win32" && kill.attempted === false && kill.reason !== "no-pid" && alive === false) {
     return { pending: true, reason: kill.reason, survivors: [], rootAlive: alive };
   }
@@ -403,13 +428,11 @@ export function renderCancelPending(decision, pid, jobId) {
     ? ` worker tree survivors: ${survivorText}`
     : decision.reason === "kill-failed" ? " (unverified)" : "";
   // The root exited but part of its tree did not: nothing "waits for the worker".
-  const rootGone = decision.reason === "kill-failed" && survivors.length > 0 && decision.rootAlive === false;
-  const tail = decision.reason === "process-missing" && decision.rootAlive === false
-    ? `worker pid ${pid} exited before it could be signalled; the job stays running until the reaper judges it.`
+  const rootGone = survivors.length > 0 && decision.rootAlive === false;
+  const tail = rootGone
+    ? `worker pid ${pid} exited but part of its tree is still running (survivors: ${survivorText}); the job stays running until the reaper judges it.`
     : (decision.reason === "identity-unavailable" || decision.reason === "identity-mismatch") && decision.rootAlive === false
     ? `worker pid ${pid} exited before it could be verified; the job stays running until the reaper judges it.`
-    : rootGone
-    ? `worker pid ${pid} exited but part of its tree is still running (survivors: ${survivorText}); the job stays running until the reaper judges it.`
     : "the job stays running until the worker exits.";
   return {
     json: { jobId, status: "running", cancellationPending: true, reason: decision.reason, ...(survivors.length > 0 ? { survivors } : {}) },
