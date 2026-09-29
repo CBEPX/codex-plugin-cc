@@ -191,6 +191,8 @@ test("commitCancel keeps a reaper-written failure even when this cancel's interr
     ["worker uncaughtException: boom", undefined, true, false],
     ["Turn interrupted.", undefined, true, false],
     ["Codex CLI is not installed or is missing required runtime support. Install it with `npm install -g @openai/codex`, then rerun `/codex:setup`.", undefined, true, false],
+    ["worker uncaughtException: boom", undefined, false, true],
+    ["Turn interrupted.", undefined, false, true],
     ["Turn interrupted.", true, true, false],
     ["Turn interrupted.", true, false, true]
   ];
