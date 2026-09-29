@@ -8,7 +8,8 @@ import process from "node:process";
 import { parseArgs } from "./lib/args.mjs";
 import { BROKER_BUSY_RPC_CODE, CodexAppServerClient } from "./lib/app-server.mjs";
 import { parseBrokerEndpoint } from "./lib/broker-endpoint.mjs";
-import { clearBrokerSessionIfEndpoint } from "./lib/broker-lifecycle.mjs";
+import { clearBrokerSessionIfEndpoint, registerBrokerProcess } from "./lib/broker-lifecycle.mjs";
+import { getProcessIdentity } from "./lib/process.mjs";
 
 const STREAMING_METHODS = new Set(["turn/start", "review/start", "thread/compact/start"]);
 
@@ -27,7 +28,7 @@ const STREAMING_METHODS = new Set(["turn/start", "review/start", "thread/compact
 // been processed yet — leaves the connection open. Anything still open after this
 // is closed outright.
 const SHUTDOWN_SOCKET_GRACE_MS = 1000;
-// The broker's own record clear at shutdown waits at most this long for the state lock.
+// The broker's own record writes (registration once bound, clear at shutdown) wait at most this long for the state lock.
 const OWN_RECORD_CLEAR_WAIT_MS = 1500;
 
 const IDLE_TIMEOUT_ENV = "CODEX_COMPANION_BROKER_IDLE_TIMEOUT_MS";
@@ -180,6 +181,19 @@ async function main() {
       clearBrokerSessionIfEndpoint(cwd, endpoint, { waitMs: OWN_RECORD_CLEAR_WAIT_MS });
     } catch (error) {
       process.stderr.write(`[codex] broker record not cleared: ${error instanceof Error ? error.message : String(error)}\n`);
+    }
+  }
+
+  // Once bound, the broker writes its own pid and identity into its record
+  // (state untouched): a broker that answers is never behind a pid-less record,
+  // whatever happened to its starter's saves. The identity is probed before the
+  // lock is taken. Best-effort and bounded like the clear above.
+  function registerOwnSessionRecord() {
+    try {
+      const identity = getProcessIdentity(process.pid);
+      registerBrokerProcess(cwd, endpoint, process.pid, identity, { waitMs: OWN_RECORD_CLEAR_WAIT_MS });
+    } catch (error) {
+      process.stderr.write(`[codex] broker pid not registered: ${error instanceof Error ? error.message : String(error)}\n`);
     }
   }
 
@@ -420,6 +434,7 @@ async function main() {
     // receives a client (or whose only client connects briefly during the
     // readiness probe) must still self-terminate instead of lingering.
     armIdleTimer();
+    registerOwnSessionRecord();
   });
 }
 
