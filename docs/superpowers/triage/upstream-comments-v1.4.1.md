@@ -1,6 +1,6 @@
 # Upstream comment drafts — CBEPX fork v1.4.1
 
-Drafts — not posted. Post only after user approval, one comment per issue.
+Posted 2026-09-29 after user approval (one comment per issue: #743 #423 #577 #336 #416 #487 #718; retest asks #70 #113 #236 #285 #295 #310).
 
 Post each section's body with `gh issue comment <n> -R openai/codex-plugin-cc --body-file <file>`.
 
