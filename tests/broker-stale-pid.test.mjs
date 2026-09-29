@@ -1214,6 +1214,27 @@ test("ensureBrokerSession kills a fresh broker that never becomes ready as a pro
   }
 });
 
+// A failed start whose child did not exit keeps the provisional record: the
+// pid stays findable for SessionEnd and the next start.
+test("ensureBrokerSession keeps the provisional record while a failed broker is still alive", async () => {
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const workspace = makeTempDir();
+  const scriptPath = path.join(makeTempDir(), "ignores-sigterm.mjs");
+  fs.writeFileSync(scriptPath, `process.on("SIGTERM", () => {});\nsetInterval(() => {}, 1000);\n`);
+  const spawned = [];
+  try {
+    const session = await ensureBrokerSession(workspace, { env: buildEnv(binDir), scriptPath, timeoutMs: 300,
+      killProcess: () => {},
+      getProcessIdentityImpl: (pid) => (spawned.push(pid), null)
+    });
+    assert.equal(session, null);
+    assert.equal(loadBrokerSession(workspace)?.pid, spawned[0], "the record of a live failed broker is kept");
+  } finally {
+    for (const pid of spawned) { try { process.kill(pid, "SIGKILL"); } catch {} }
+  }
+});
+
 // A fresh child that exited during the readiness wait has a pid the OS may
 // already have handed on: nothing may be signalled by number.
 test("ensureBrokerSession never signals the pid of a fresh broker that already exited", async () => {

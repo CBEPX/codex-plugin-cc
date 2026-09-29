@@ -7,7 +7,7 @@ import { BROKER_ENDPOINT_ENV } from "../plugins/codex/scripts/lib/app-server.mjs
 import { saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
 import assert from "node:assert/strict";
 
-import { brokerExclusion, brokerPresence, cancelDecision, emitCancelPending, renderCancelPending } from "../plugins/codex/scripts/lib/job-control.mjs";
+import { brokerExclusion, brokerPresence, cancelDecision, finishedBeforeCancel, emitCancelPending, renderCancelPending } from "../plugins/codex/scripts/lib/job-control.mjs";
 
 const SURVIVORS = [{ pid: 4301, identity: "win32:7" }];
 
@@ -20,14 +20,10 @@ test("cancelDecision: what each kill outcome means for the job", () => {
     [{ pid: 1, kill: { attempted: true, delivered: false, unverified: true }, alive: false, platform: "win32" }, { pending: true, reason: "kill-failed", survivors: [], rootAlive: false }],
     [{ pid: 1, kill: { attempted: false, delivered: false, method: "handle", reason: "process-missing" }, alive: false, platform: "win32" }, { pending: true, reason: "process-missing", survivors: [], rootAlive: false }],
     [{ pid: 1, kill: { attempted: false, delivered: false, method: "handle", reason: "process-missing" }, alive: false, platform: "linux" }, { pending: false, reason: null, survivors: [] }],
-    [{ pid: 1, kill: { attempted: false, delivered: false, method: "handle", reason: "process-missing" }, alive: false, platform: "win32", workerFinished: true }, { pending: false, reason: null, survivors: [] }],
-    [{ pid: 1, kill: { attempted: false, delivered: false, method: "handle", reason: "process-missing" }, alive: false, platform: "win32", workerFinished: false }, { pending: true, reason: "process-missing", survivors: [], rootAlive: false }],
-    [{ pid: 1, kill: { attempted: false, reason: "identity-unavailable" }, alive: false, platform: "win32", workerFinished: true }, { pending: false, reason: null, survivors: [] }],
-    [{ pid: 1, kill: { attempted: false, reason: "identity-unavailable" }, alive: false, platform: "win32", workerFinished: false }, { pending: true, reason: "identity-unavailable", survivors: [], rootAlive: false }],
-    [{ pid: 1, kill: { attempted: false, reason: "identity-mismatch" }, alive: false, platform: "win32", workerFinished: false }, { pending: true, reason: "identity-mismatch", survivors: [], rootAlive: false }],
-    [{ pid: 1, kill: { attempted: false, reason: "identity-mismatch" }, alive: false, platform: "win32", workerFinished: true }, { pending: false, reason: null, survivors: [] }],
-    [{ pid: 1, kill: { attempted: false, reason: "process-missing" }, alive: true, platform: "win32", workerFinished: true }, { pending: true, reason: "process-missing", survivors: [], rootAlive: true }],
-    [{ pid: 1, kill: { attempted: false, reason: "identity-unavailable" }, alive: false, platform: "linux", workerFinished: false }, { pending: false, reason: null, survivors: [] }],
+    [{ pid: 1, kill: { attempted: false, delivered: false, method: "handle", reason: "process-missing" }, alive: false, platform: "win32" }, { pending: true, reason: "process-missing", survivors: [], rootAlive: false }],
+    [{ pid: 1, kill: { attempted: false, reason: "identity-unavailable" }, alive: false, platform: "win32" }, { pending: true, reason: "identity-unavailable", survivors: [], rootAlive: false }],
+    [{ pid: 1, kill: { attempted: false, reason: "identity-mismatch" }, alive: false, platform: "win32" }, { pending: true, reason: "identity-mismatch", survivors: [], rootAlive: false }],
+    [{ pid: 1, kill: { attempted: false, reason: "identity-unavailable" }, alive: false, platform: "linux" }, { pending: false, reason: null, survivors: [] }],
     [{ pid: 1, kill: { attempted: true, delivered: false }, alive: true, platform: "linux" }, { pending: true, reason: "not-delivered", survivors: [], rootAlive: true }],
     [{ pid: null, kill: { attempted: false, reason: "no-pid" }, alive: null, platform: "win32" }, { pending: false, reason: null, survivors: [] }]
   ];
@@ -137,4 +133,14 @@ test("emitCancelPending never puts the diagnostic on stdout", () => {
     assert.equal(log.length, 1);
     assert.ok(log[0].endsWith("worker tree survivors: 4301:win32:7"));
   }
+});
+
+test("finishedBeforeCancel: a terminal stored record is kept and reported, an active one is not", () => {
+  const interrupt = { attempted: true, interrupted: true };
+  const report = finishedBeforeCancel("task-1", { status: "failed", title: "T" }, interrupt);
+  assert.deepEqual(report.payload, { jobId: "task-1", status: "failed", title: "T", cancellationPending: false, turnInterruptAttempted: true, turnInterrupted: true });
+  assert.equal(report.text, "job task-1 already finished (failed) before the cancel completed; record kept");
+  assert.equal(finishedBeforeCancel("task-1", { status: "running" }, interrupt), null);
+  assert.equal(finishedBeforeCancel("task-1", { status: "queued" }, interrupt), null);
+  assert.equal(finishedBeforeCancel("task-1", null, interrupt), null);
 });

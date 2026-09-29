@@ -49,6 +49,7 @@ import {
   brokerPresence,
   buildStatusSnapshot,
   cancelDecision,
+  finishedBeforeCancel,
   emitCancelPending,
   readStoredJob,
   resolveCancelableJob,
@@ -1353,16 +1354,20 @@ async function handleCancel(argv) {
   // A worker we may not signal, or whose signal reached nothing, but that is
   // still alive is not cancelled: the job stays running, and the sidecar stays
   // so a later cancel or the reaper can still find it.
-  // The worker's own terminal record proves it finished cooperatively.
-  const storedAfter = readStoredJob(workspaceRoot, job.id);
-  const workerFinished = Boolean(storedAfter) && storedAfter.status !== "running" && storedAfter.status !== "queued";
-  const decision = cancelDecision({ pid, kill, alive: isPidAlive(pid), workerFinished });
+  // win32: a terminal record (the worker's own, or the reaper's) is never overwritten.
+  const finished = process.platform === "win32" ? finishedBeforeCancel(job.id, readStoredJob(workspaceRoot, job.id), interrupt) : null;
+  if (finished) {
+    appendLogLine(job.logFile, finished.text);
+    outputCommandResult(finished.payload, `${finished.text}\n`, options.json);
+    return;
+  }
+  const decision = cancelDecision({ pid, kill, alive: isPidAlive(pid) });
   if (decision.pending) {
     emitCancelPending(decision, pid, job.id, { json: options.json, appendLog: (line) => appendLogLine(job.logFile, line) });
     process.exitCode = 1;
     return;
   }
-  const leftRunning = pid && !kill.attempted && !workerFinished ? `worker pid ${pid} left running: ${kill.reason}` : null;
+  const leftRunning = pid && !kill.attempted ? `worker pid ${pid} left running: ${kill.reason}` : null;
   if (leftRunning) {
     appendLogLine(job.logFile, leftRunning);
   }

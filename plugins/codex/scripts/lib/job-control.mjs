@@ -323,18 +323,37 @@ export function resolveCancelableJob(cwd, reference, options = {}) {
   throw new Error("No active Codex jobs to cancel.");
 }
 
+// An existing terminal record is never overwritten by cancel. Returns the
+// report for a stored job that already finished, or null while it is active.
+export function finishedBeforeCancel(jobId, stored, interrupt) {
+  if (!stored || stored.status === "running" || stored.status === "queued") {
+    return null;
+  }
+  const text = `job ${jobId} already finished (${stored.status}) before the cancel completed; record kept`;
+  return {
+    text,
+    payload: {
+      jobId,
+      status: stored.status,
+      title: stored.title,
+      cancellationPending: false,
+      turnInterruptAttempted: interrupt.attempted,
+      turnInterrupted: interrupt.interrupted
+    }
+  };
+}
+
 // What cancel does with a kill outcome. posix keeps its v1.4.0 answer; win32
 // treats survivors and an unverified attempt as "not cancelled": the job stays
 // running and the survivors are reported, never followed by a record (spec §1).
-export function cancelDecision({ pid, kill, alive, platform = process.platform, workerFinished = false }) {
+export function cancelDecision({ pid, kill, alive, platform = process.platform }) {
   if (!pid) {
     return { pending: false, reason: null, survivors: [] };
   }
   // win32, nothing was signalled (root already gone, or the kill was refused) and
   // the root is dead: its tree was never examined, so "cancelled" is a guess — the
-  // reaper judges the job. Unless the worker wrote its own terminal record: that
-  // proves it finished cooperatively and closed its own app-server.
-  if (platform === "win32" && kill.attempted === false && kill.reason !== "no-pid" && alive === false && !workerFinished) {
+  // reaper judges the job.
+  if (platform === "win32" && kill.attempted === false && kill.reason !== "no-pid" && alive === false) {
     return { pending: true, reason: kill.reason, survivors: [], rootAlive: alive };
   }
   const win32Unknown = platform === "win32" && kill.attempted && (kill.survivors?.length > 0 || kill.unverified === true);

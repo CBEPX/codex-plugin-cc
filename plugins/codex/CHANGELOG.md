@@ -3,7 +3,7 @@
 ## 1.4.1 — 2026-09-29
 
 ### Fixed
-- Windows: kills from stored process records (`/codex:cancel`, `SessionEnd` cleanup of a running job, stale-broker replacement, broker teardown) now verify the process by its start time and terminate the verified tree through one in-box PowerShell 5.1 run with pinned handles (no Store `pwsh` needed); closes the win32 half of #743 and #423/#577, #336, #416, #487, #718.
+- Windows: kills from stored process records (`/codex:cancel`, `SessionEnd` cleanup of a running job, stale-broker replacement, broker teardown) now verify the process by its start time and terminate the verified tree through one in-box PowerShell 5.1 run with pinned handles (no Store `pwsh` needed); a broker that started under the worker but has no record yet is never killed (reported as a survivor, cancel stays pending), an existing terminal job record is never overwritten by cancel, and a failed broker start keeps its provisional record until the child's exit is verified; closes the win32 half of #743 and #423/#577, #336, #416, #487, #718.
 - The Codex app-server transport dropped the connection when a notification contained U+2028/U+2029 (`node:readline` split the JSON frame): any turn whose command or output carried a line or paragraph separator failed as "connection closed before the turn completed" (both transports).
 - The posix `ps` command-line probe no longer spawns on a spent budget.
 

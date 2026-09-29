@@ -227,6 +227,8 @@ async function isBrokerEndpointReady(endpoint) {
 
 const STALE_BROKER_RETRY_MS = 2000;
 
+const BROKER_EXIT_WAIT_MS = 1000;
+
 export async function ensureBrokerSession(cwd, options = {}) {
   const killProcess = options.killProcess ?? terminateProcessTree;
   const isAliveImpl = options.isAliveImpl ?? isPidAlive;
@@ -311,8 +313,16 @@ export async function ensureBrokerSession(cwd, options = {}) {
       }
     }
     teardownBrokerSession({ endpoint, pidFile, logFile, sessionDir });
-    // The failed child is cleaned up, so its provisional record goes with it.
-    if (loadBrokerSession(cwd)?.endpoint === endpoint) {
+    // The provisional record goes only with a child known to have exited; a
+    // record without identity refuses kills, so keeping it is safe (SessionEnd
+    // and the next start still find the pid).
+    let exited = false;
+    for (let waited = 0; !(exited = child.exitCode !== null || child.signalCode !== null) && waited < BROKER_EXIT_WAIT_MS; waited += 50) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    if (!exited) {
+      process.stderr.write(`codex broker pid ${child.pid} did not exit after the failed start; its record is kept.\n`);
+    } else if (loadBrokerSession(cwd)?.endpoint === endpoint) {
       clearBrokerSession(cwd);
     }
     return null;

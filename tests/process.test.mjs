@@ -658,11 +658,14 @@ test("terminateRecordedProcess on win32 runs the pinned verify-and-kill script a
     assert.match(script, /\$target = 4242\n/);
     assert.match(script, /\$expected = '133700000000000000'/);
     assert.match(script, /\$exclude = @\{ 555 = '133700000000000000' \}\n/, "only the verified win32 exclusion survives");
-    assert.doesNotMatch(script, /app-server-broker/, "no command-line marker exclusion");
     assert.ok(script.indexOf("$exclude.ContainsKey($cid)") > script.indexOf("$live = Micro $h.StartTime"), "exclusion is decided after the pin and start-time read");
     assert.match(script, /\$code = 245\n/);
     assert.match(script, /Get-CimInstance -ClassName Win32_Process -Property ProcessId,ParentProcessId,CreationDate \|/, "provider-side projection");
-    assert.doesNotMatch(script, /CommandLine/, "CommandLine is never computed for the kill");
+    assert.doesNotMatch(script.match(/Get-CimInstance[^\n]*Property ProcessId[^\n]*/)[0], /CommandLine/, "the main snapshot never projects CommandLine");
+    assert.match(script, /Get-CimInstance -ClassName Win32_Process -Filter \"ProcessId = \$cid\" -Property CommandLine/, "one filtered query per admitted child");
+    assert.ok(script.indexOf("app-server-broker.mjs") > script.indexOf("$live = Micro $h.StartTime"), "the shield is decided after the pin and start-time read");
+    assert.match(script, /\$shielded \+= \$h; continue/, "a shielded broker is kept pinned and not enqueued");
+    assert.match(script, /\$survivors = @\(\$survivors\) \+ @\(\$shielded\)/, "a shielded broker is a reported survivor");
     assert.match(script, /\$code = 245; throw 'budget'/);
     assert.equal(script.match(/exit 244/g).length, 1, "244 is only the CLM guard");
     assert.match(script, new RegExp(`FromFileTimeUtc\\(${expectedDeadline}\\)`), "absolute deadline counts the PowerShell start-up");
