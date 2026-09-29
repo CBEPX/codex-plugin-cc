@@ -8,7 +8,7 @@
 
 **Tech Stack:** Node ≥18.18, ESM `.mjs`, `node --test` (`scripts/run-tests.mjs`), fake Codex fixture, Windows PowerShell 5.1 (in-box), .NET `System.Diagnostics.Process`, CIM `Win32_Process` (снимок дерева), GitHub Actions с обязательным Windows.
 
-**Spec:** `docs/superpowers/specs/2026-09-28-codex-plugin-cc-v1.4.1-design.md` (rev. 10; план rev. 12); roadmap `/Users/g.mehrenin/.claude/plans/glistening-chasing-backus.md`, разделы «v1.4.1» и «Дизайн: process identity».
+**Spec:** `docs/superpowers/specs/2026-09-28-codex-plugin-cc-v1.4.1-design.md` (rev. 12; план rev. 13); roadmap `/Users/g.mehrenin/.claude/plans/glistening-chasing-backus.md`, разделы «v1.4.1» и «Дизайн: process identity».
 
 ## Global Constraints
 
@@ -814,8 +814,8 @@ function terminateWindowsRecordedProcess(pid, identity, options) {
 
 **Files:**
 - Modify: `plugins/codex/scripts/lib/tracked-jobs.mjs:380-440` (`reapDeadJobs`: win32 batch)
-- Modify: `plugins/codex/scripts/lib/job-control.mjs` (новая `cancelDecision`; `readStoredJob` там уже объявлена — не импортировать её из `state.mjs`)
-- Modify: `plugins/codex/scripts/codex-companion.mjs:1340-1365` (cancel: `excludePids`, survivors в ответе/логе на win32)
+- Modify: `plugins/codex/scripts/lib/job-control.mjs` (новые `cancelDecision`, `brokerExclusion`; `readStoredJob` там уже объявлена — не импортировать её из `state.mjs`)
+- Modify: `plugins/codex/scripts/codex-companion.mjs:1340-1365` (cancel: `exclude` через `brokerExclusion`, survivors в ответе/логе на win32)
 - Modify: `plugins/codex/scripts/session-lifecycle-hook.mjs` (константы ~22–45; `cleanupSessionJobs` ~98–166 → `export`; teardown ~298–322; существующий `main().catch((error) => { process.stderr.write(…); process.exit(1); })` (~347–350) целиком, без изменений, оборачивается в `if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) { … }` с `import { pathToFileURL } from "node:url"` — иначе `import` модуля из теста читал бы hook stdin; `.catch` остаётся, чтобы ошибка записи state по-прежнему печаталась одной строкой с exit 1, а не unhandled rejection; `hooks.json` вызывает файл напрямую, поведение хука при прямом запуске не меняется)
 - Modify: `plugins/codex/scripts/lib/broker-lifecycle.mjs:342-380` (`teardownBrokerSession`: опции `platform`, `keepOnUnknown`, `terminateRecordedProcessImpl`; поле `kept`)
 - Modify: `plugins/codex/scripts/app-server-broker.mjs` (~294–315, `broker/shutdown`: тестовый knob `CODEX_COMPANION_BROKER_HANG_ON_SHUTDOWN=1`)
@@ -823,7 +823,7 @@ function terminateWindowsRecordedProcess(pid, identity, options) {
 - Modify: `tests/runtime.test.mjs` (Step 8); `tests/helpers.mjs` (`cimTree`)
 - Test: новые тесты в `tests/tracked-jobs.test.mjs`, `tests/broker-stale-pid.test.mjs`, `tests/runtime.test.mjs`, `tests/job-control.test.mjs` (`cancelDecision`, `renderCancelPending`, `emitCancelPending`), новый `tests/session-lifecycle-hook.test.mjs`; `tests/runtime.test.mjs:1922` (legacy win32 `deepEqual` без `survivors`: поле добавляется в JSON только когда список непуст, поэтому ожидание остаётся верным)
 
-**Interfaces (Consumes):** `getProcessIdentities`, `terminateRecordedProcess` win32 (`process-missing`, `survivors: [{pid, identity}]`, `unverified`, `excludePids`). **Produces:**
+**Interfaces (Consumes):** `getProcessIdentities`, `terminateRecordedProcess` win32 (`process-missing`, `survivors: [{pid, identity}]`, `unverified`, `exclude: [{pid, identity}]` — Task 4 fix round 1, spec §3.4 rev. 12; `excludePids` no longer exists). **Produces:**
 - `reapDeadJobs(…, { getProcessIdentitiesImpl })` (только win32-ветка).
 - `export function cancelDecision({ pid, kill, alive, platform })` → `{ pending: boolean, reason: string|null, survivors: [{pid, identity}] }` (`lib/job-control.mjs`); на posix `survivors` всегда `[]`, причины как в v1.4.0.
 - `teardownBrokerSession(…, { platform, keepOnUnknown, terminateRecordedProcessImpl })` → `{ signalled, reason, kept }`; `export function killStepMs(platform)` в хуке.
@@ -1064,11 +1064,18 @@ export function emitCancelPending(decision, pid, jobId, { json, appendLog, stdou
 }
 ```
 
-  В `codex-companion.mjs` (~1340): импортировать `loadBrokerSession` (`./lib/broker-lifecycle.mjs`), `cancelDecision` и `emitCancelPending` (`./lib/job-control.mjs`); заменить существующую строку `const kill = terminateRecordedProcess(pid, { identity, commandLineMatch: workerCommandLine(job.id) });` (1342) и блок `if (pid && (!kill.attempted || !kill.delivered) && isPidAlive(pid) === true) { … }` (1346–1356) — вместе, чтобы `kill` объявлялся один раз — на:
+  В `lib/job-control.mjs` (рядом с `cancelDecision`): `export function brokerExclusion(broker) { if (!broker) return []; const identity = typeof broker.pidIdentity === "string" && /^win32:\d+$/.test(broker.pidIdentity) ? broker.pidIdentity : null; return Number.isInteger(broker.pid) && broker.pid >= 1 && identity ? [{ pid: broker.pid, identity }] : null; }` — `[]` без брокера, `null` когда брокер записан, но исключить его нельзя (нет `win32:`-identity или pid), иначе одна пара. Тест: `[]`/`null`/пара для трёх входов.
+
+  В `codex-companion.mjs` (~1340): импортировать `loadBrokerSession` (`./lib/broker-lifecycle.mjs`), `cancelDecision`, `emitCancelPending` и `brokerExclusion` (`./lib/job-control.mjs`); заменить существующую строку `const kill = terminateRecordedProcess(pid, { identity, commandLineMatch: workerCommandLine(job.id) });` (1342) и блок `if (pid && (!kill.attempted || !kill.delivered) && isPidAlive(pid) === true) { … }` (1346–1356) — вместе, чтобы `kill` объявлялся один раз — на:
 
 ```js
-  const brokerPid = process.platform === "win32" ? loadBrokerSession(workspaceRoot)?.pid : null;
-  const kill = terminateRecordedProcess(pid, { identity, commandLineMatch: workerCommandLine(job.id), excludePids: Number.isInteger(brokerPid) ? [brokerPid] : [] });
+  const broker = process.platform === "win32" ? loadBrokerSession(workspaceRoot) : null;
+  const exclude = brokerExclusion(broker);
+  // A broker record without a win32 identity cannot be excluded safely: refuse
+  // rather than risk killing the shared broker under the worker (spec §3.4 rev. 12).
+  const kill = broker && exclude === null
+    ? { attempted: false, delivered: false, reason: "identity-unavailable" }
+    : terminateRecordedProcess(pid, { identity, commandLineMatch: workerCommandLine(job.id), exclude: exclude ?? [] });
   // A worker we may not signal, or whose signal reached nothing, but that is
   // still alive is not cancelled: the job stays running, and the sidecar stays
   // so a later cancel or the reaper can still find it.
@@ -1102,7 +1109,8 @@ export function killStepMs(platform = process.platform) {
 
 ```js
 export function cleanupSessionJobs(cwd, sessionId, lockWaitMs, remainingMs, deps = {}) {
-  const { platform = process.platform, terminateRecordedProcessImpl = terminateRecordedProcess, brokerPid = null } = deps;
+  const { platform = process.platform, terminateRecordedProcessImpl = terminateRecordedProcess, broker = null } = deps;
+  const exclude = brokerExclusion(broker);
   if (!cwd || !sessionId) {
     return;
   }
@@ -1150,13 +1158,16 @@ export function cleanupSessionJobs(cwd, sessionId, lockWaitMs, remainingMs, deps
         try {
           const recorded = resolveJobPid(workspaceRoot, job);
           pid = recorded.pid;
-          outcome = terminateRecordedProcessImpl(pid, {
-            identity: recorded.identity,
-            commandLineMatch: workerCommandLine(job.id),
-            timeoutMs: probeMs,
-            // The shared broker can be this worker's child on Windows: never in its tree.
-            excludePids: Number.isInteger(brokerPid) ? [brokerPid] : []
-          });
+          // The shared broker can be this worker's child on Windows: never in its
+          // tree — and only a broker with a verified identity can be excluded.
+          outcome = platform === "win32" && broker && exclude === null
+            ? { attempted: false, delivered: false, reason: "identity-unavailable" }
+            : terminateRecordedProcessImpl(pid, {
+                identity: recorded.identity,
+                commandLineMatch: workerCommandLine(job.id),
+                timeoutMs: probeMs,
+                exclude: exclude ?? []
+              });
           reason =
             outcome.reason === "no-pid" || (outcome.attempted && outcome.delivered)
               ? null
@@ -1196,7 +1207,7 @@ export function cleanupSessionJobs(cwd, sessionId, lockWaitMs, remainingMs, deps
 }
 ```
 
-  В `handleSessionEnd` (~218) вызов становится `cleanupSessionJobs(cwd, input.session_id || process.env[SESSION_ID_ENV], stepBudget(STATE_LOCK_STEP_MS), remainingMs, { brokerPid: process.platform === "win32" ? pid : null });` (`pid` — pid брокера из `brokerSession`, объявлен выше). Teardown (~298–322):
+  В `handleSessionEnd` (~218) вызов становится `cleanupSessionJobs(cwd, input.session_id || process.env[SESSION_ID_ENV], stepBudget(STATE_LOCK_STEP_MS), remainingMs, { broker: process.platform === "win32" ? brokerSession : null });` (`brokerSession` объявлен выше; импорт `brokerExclusion` из `./lib/job-control.mjs`). Teardown (~298–322):
 
 ```js
   const teardown = teardownBrokerSession({
@@ -1259,7 +1270,7 @@ test("SessionEnd keeps a job whose tree left survivors and drops one whose kill 
     const original = process.stderr.write;
     process.stderr.write = (chunk) => { written.push(String(chunk)); return true; };
     try {
-      cleanupSessionJobs(repo, sessionId, 1000, () => 8000, { platform, terminateRecordedProcessImpl: () => outcome, brokerPid: 555 });
+      cleanupSessionJobs(repo, sessionId, 1000, () => 8000, { platform, terminateRecordedProcessImpl: () => outcome, broker: { pid: 555, pidIdentity: "win32:1" } });
     } finally {
       process.stderr.write = original;
     }
@@ -1271,14 +1282,19 @@ test("SessionEnd keeps a job whose tree left survivors and drops one whose kill 
   }
 });
 
-test("SessionEnd passes the broker pid as the excluded subtree", () => {
+test("SessionEnd passes the verified broker as the excluded subtree and refuses without its identity", () => {
   const repo = makeTempDir();
   const deadPid = spawnSync(process.execPath, ["-e", "0"]).pid;
   upsertJob(repo, { id: "job-1", status: "running", sessionId: "s", background: false, pid: deadPid, pidIdentity: "win32:1" });
   let seen = null;
-  cleanupSessionJobs(repo, "s", 1000, () => 8000, { platform: "win32", brokerPid: 555, terminateRecordedProcessImpl: (pid, options) => { seen = options; return { attempted: true, delivered: true, method: "handle", reason: "identity-match" }; } });
-  assert.deepEqual(seen.excludePids, [555]);
+  cleanupSessionJobs(repo, "s", 1000, () => 8000, { platform: "win32", broker: { pid: 555, pidIdentity: "win32:1" }, terminateRecordedProcessImpl: (pid, options) => { seen = options; return { attempted: true, delivered: true, method: "handle", reason: "identity-match" }; } });
+  assert.deepEqual(seen.exclude, [{ pid: 555, identity: "win32:1" }]);
   assert.ok(seen.timeoutMs <= 4000 && seen.timeoutMs >= 100);
+  // A recorded broker without identity: the kill is not even attempted; the job is kept.
+  const repo2 = makeTempDir();
+  upsertJob(repo2, { id: "job-1", status: "running", sessionId: "s", background: false, pid: deadPid, pidIdentity: "win32:1" });
+  cleanupSessionJobs(repo2, "s", 1000, () => 8000, { platform: "win32", broker: { pid: 555, pidIdentity: null }, terminateRecordedProcessImpl: () => assert.fail("must not kill") });
+  assert.deepEqual(loadState(repo2).jobs.map((job) => job.id), ["job-1"]);
 });
 ```
 
