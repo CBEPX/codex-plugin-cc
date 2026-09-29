@@ -1340,9 +1340,10 @@ async function handleCancel(argv) {
   const turnId = existing.turnId ?? job.turnId ?? null;
   // A direct worker owns its app-server: a second client cannot reach it (it
   // would start a codex of its own), and the kill below takes it down.
-  // Defense in depth: the updater writes both in one patch; a file that says
-  // direct while the index does not is forged or torn, and the brokered path
-  // (no kill without the turn's end) is the safe one.
+  // Defense in depth: the updater writes the index, then the file, unlocked
+  // (the index leads by one synchronous write); a file that says direct while
+  // the index does not is forged or torn, and the brokered path (no kill
+  // without the turn's end) is the safe one.
   const direct = existing.transport === "direct" && job.transport === "direct";
 
   const interrupt = direct
@@ -1373,11 +1374,12 @@ async function handleCancel(argv) {
       process.exitCode = 1;
       return;
     }
-    // Caused by this cancel only when our acknowledged interrupt met the worker's
-    // own record; a record found terminal without an acknowledged interrupt, a
+    // Caused by this cancel only when our interrupt, acknowledged by the shared
+    // broker (a stray direct app-server may acknowledge a turn it never ran),
+    // met the worker's own record; a record found terminal without that, a
     // crash-guard or a reaper record is kept by commitCancel. Either way the
     // worker is done with the job: nothing is killed.
-    turnEnded = interrupt.interrupted && isWorkerTerminalRecord(stored);
+    turnEnded = interrupt.interrupted && interrupt.transport === "broker" && isWorkerTerminalRecord(stored);
     pid = null;
     identity = null;
   }

@@ -12,6 +12,7 @@ import { getProcessIdentity, isPidAlive } from "../plugins/codex/scripts/lib/pro
 import { resolveClaudeSessionPath, resolveClaudeProjectsDir } from "../plugins/codex/scripts/lib/claude-session-transfer.mjs";
 import {
   consumeJobRequestFile,
+  listJobs,
   readJobFile,
   resolveJobFile,
   resolveJobPidFile,
@@ -2257,6 +2258,8 @@ test("a job file forged to transport direct does not take the direct kill path w
   assert.equal(cancel.status, 1, `cancel said: ${cancel.stdout.trim()}\n${jobDiagnostics(repo, jobId)}`);
   assert.deepEqual(JSON.parse(cancel.stdout), { jobId, status: "running", cancellationPending: true, reason: "turn-not-interrupted" }, jobDiagnostics(repo, jobId));
   assert.equal(isAlive(running.pid), true, `no kill on a disagreeing transport\n${jobDiagnostics(repo, jobId)}`);
+  assert.equal(readPersistedJob(repo, jobId).status, "running", jobDiagnostics(repo, jobId));
+  assert.equal(listJobs(repo).find((entry) => entry.id === jobId)?.transport, "broker", "the index was never forged");
   const fakeState = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
   assert.ok(fakeState.lastInterrupt, `the interrupt was sent (brokered path)\n${jobDiagnostics(repo, jobId)}`);
 });
