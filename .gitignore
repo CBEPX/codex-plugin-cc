@@ -154,3 +154,4 @@ plugins/codex/.generated/
 # c8/Stryker output at the repo root only; docs/superpowers/reports/ is tracked.
 /reports/
 .stryker-tmp/
+.superpowers/
