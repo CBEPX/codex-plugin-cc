@@ -374,7 +374,7 @@ If you need to point the built-in OpenAI provider at a different endpoint, set `
 
 ### Windows
 
-Requirements: `cmd.exe` and Windows PowerShell 5.1 (both ship with Windows; no Store `pwsh` needed); `codex` and `npm` on the Windows `PATH` as `.cmd`/`.exe`. Kills from stored records (`/codex:cancel`, `SessionEnd` cleanup, broker teardown) verify the process before killing it. `/codex:cancel` answers `cancelled`, or `cancellationPending` with `survivors` (pid and identity) when part of the tree outlived the kill, or `identity-unavailable` when the process could not be verified (for example while the shared broker is still starting, or under PowerShell Constrained Language Mode); `SessionEnd` keeps a record whose kill outcome is unknown (`kept=true`) and re-judges it next time. Details, limits and the state-directory fallback: [docs/windows.md](docs/windows.md).
+Requirements: `cmd.exe` and Windows PowerShell 5.1 (both ship with Windows; no Store `pwsh` needed); `codex` and `npm` on the Windows `PATH` as `.cmd`/`.exe`. Kills from stored records (`/codex:cancel`, `SessionEnd` cleanup, broker teardown) verify the process before killing it. `/codex:cancel` answers `cancelled`, or `cancellationPending` (the job stays running) with `survivors` (pid and identity) when part of the tree outlived the kill, or with `reason: identity-unavailable` when the process could not be verified (for example while the shared broker is still starting, or under PowerShell Constrained Language Mode); `SessionEnd` keeps a record whose kill outcome is unknown (`kept=true`) and re-judges it next time. Details, limits and the state-directory fallback: [docs/windows.md](docs/windows.md).
 
 ## Development
 

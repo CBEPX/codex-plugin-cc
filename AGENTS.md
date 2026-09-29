@@ -7,7 +7,7 @@ common boundary (usually `plugins/codex/scripts/lib/`); never add caller-specifi
 ## Commands
 
 - `npm run check` — the full gate (version metadata, changelog, lint, build/typecheck, test typecheck, tests). `npm run build` needs the `codex` CLI on `PATH`.
-- Leak check after the suite: `sleep 10; [ "$(pgrep -f codex-plugin-test- | wc -l)" = 0 ]` (CI runs `node scripts/check-leaks.mjs`).
+- Leak check after the suite: `sleep 10; [ "$(pgrep -f codex-plugin-test- | wc -l | tr -d ' ')" = 0 ]` (CI runs `node scripts/check-leaks.mjs`).
 - `claude plugin validate . --strict` before a release commit.
 
 ## Hard rules
@@ -17,7 +17,7 @@ common boundary (usually `plugins/codex/scripts/lib/`); never add caller-specifi
 - Work in a worktree under `.worktrees/`; `main` is the release base and the review base (`--base main`).
 - Pushing a work branch under an active claim is fine; merging, tagging, publishing a release and posting upstream comments each need the user's explicit go.
 - Maintainers claim the work item with the `agent-work` tool before writing and release the claim at the end of the stage (see `docs/agent/process.md`); contributors without it open a draft PR first.
-- README describes behaviour by observable outputs (flags, `status --json` / `result --json` fields, exit codes, decision lines, error text). Function names and `scripts/lib/...` paths belong in `docs/*.md`.
+- README describes behaviour by observable outputs (flags, `status --json` / `result --json` fields, exit codes, decision lines, error text). Function names and `plugins/codex/scripts/...` paths belong in the internals docs under `docs/` (rules: `docs/agent/docs.md`).
 - The `codex@cbepx` plugin is installed from the marketplace cache per Claude config dir; the working tree is not what `/codex:*` runs. After a release: `claude plugin marketplace update cbepx && claude plugin update codex@cbepx` in each config dir, then restart the session.
 
 ## Read on demand

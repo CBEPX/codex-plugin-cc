@@ -2,7 +2,7 @@
 
 ## Gate and commit
 
-`npm run check` (check-version, check:changelog, lint, build, typecheck:tests, tests) → exit 0; then `sleep 10; [ "$(pgrep -f codex-plugin-test- | wc -l)" = 0 ]`. Commit only through an `&&` chain on these exit codes; never through `;` or a log match (v1.4.0 shipped two commits with a red gate that way). `claude plugin validate . --strict` before a release commit.
+`npm run check` (check-version, check:changelog, lint, build, typecheck:tests, tests) → exit 0; then `sleep 10; [ "$(pgrep -f codex-plugin-test- | wc -l | tr -d ' ')" = 0 ]`. Commit only through an `&&` chain on these exit codes; never through `;` or a log match (v1.4.0 shipped two commits with a red gate that way). `claude plugin validate . --strict` before a release commit.
 
 ## Timing tests on slow hosted runners
 

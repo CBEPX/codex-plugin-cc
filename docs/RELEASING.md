@@ -10,7 +10,7 @@ SHA-256) attached as the release artifact. There is no npm publish (`package.jso
 - Draft PR against `main` is the work item (issues are disabled); claim it with `agent-work claim --target <PR url>`.
 - The adversarial gate is closed per `docs/agent/process.md` (stop rule): every parked finding is listed in the spec `## Limits` section and in the CHANGELOG "Known limitations" bullets.
 - Spec and plan revision tables are current; the CHANGELOG section for the new version exists.
-- `npm audit --omit=dev` reports 0 vulnerabilities; the CI matrix is green on the exact SHA that will be tagged.
+- `npm audit --omit=dev` reports 0 vulnerabilities. (The CI matrix must be green on the final release commit — the SHA that step 3 tags — which only exists after steps 1–2; record that run id and `rc` in the ledger.)
 
 ## 1. Prepare the release branch
 

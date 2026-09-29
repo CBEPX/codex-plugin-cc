@@ -15,21 +15,23 @@ function slug(heading) {
 }
 
 function headingSlugs(text) {
-  return new Set([...text.matchAll(/^#{1,6}\s+(.+)$/gm)].map((m) => slug(m[1])));
+  // Fenced code blocks may hold `#` lines (shell comments, notes templates) that are not headings.
+  const prose = text.replace(/^```[\s\S]*?^```/gm, "");
+  return new Set([...prose.matchAll(/^#{1,6}\s+(.+)$/gm)].map((m) => slug(m[1])));
 }
 
-const DOCS = ["AGENTS.md", "README.md", ...fs.readdirSync(path.join(ROOT, "docs")).filter((f) => f.endsWith(".md")).map((f) => `docs/${f}`), ...fs.readdirSync(path.join(ROOT, "docs", "agent")).map((f) => `docs/agent/${f}`)];
+const DOCS = ["AGENTS.md", "README.md", ...fs.readdirSync(path.join(ROOT, "docs")).filter((f) => f.endsWith(".md")).map((f) => `docs/${f}`), ...fs.readdirSync(path.join(ROOT, "docs", "agent")).filter((f) => f.endsWith(".md")).map((f) => `docs/agent/${f}`)];
 
 test("every plugin command has a README section", () => {
   const readme = read("README.md");
-  for (const file of fs.readdirSync(path.join(ROOT, "plugins", "codex", "commands"))) {
+  for (const file of fs.readdirSync(path.join(ROOT, "plugins", "codex", "commands")).filter((f) => f.endsWith(".md"))) {
     const name = file.replace(/\.md$/, "");
     assert.match(readme, new RegExp(`^### \`/codex:${name}\``, "m"), `README lacks a section for /codex:${name}`);
   }
 });
 
 test("AGENTS.md stays short and CLAUDE.md imports it", () => {
-  assert.ok(read("AGENTS.md").split("\n").length <= 50, "AGENTS.md must stay under 50 lines");
+  assert.ok(read("AGENTS.md").trimEnd().split("\n").length <= 50, "AGENTS.md must stay within 50 lines");
   assert.equal(read("CLAUDE.md").trim(), "@AGENTS.md");
 });
 

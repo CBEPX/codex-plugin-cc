@@ -6,7 +6,7 @@
 |---|---|---|
 | Brainstorm | `superpowers:brainstorming` | roadmap section |
 | Spec | `superpowers:brainstorming` design → written spec; second opinion `/codex:rescue --effort xhigh` (read-only) | `docs/superpowers/specs/<date>-<topic>-design.md` |
-| Plan | `superpowers:writing-plans` | `docs/superpowers/plans/<date>-codex-plugin-cc-vX.Y.Z.md` |
+| Plan | `superpowers:writing-plans` | `docs/superpowers/plans/<date>-codex-plugin-cc-<vX.Y.Z or topic>.md` |
 | Claim | Maintainer tooling: `agent-work claim --target <PR url>` (the `~/.local/bin/agent-work` cooperative-claim CLI; issues are disabled, the PR is the work item) before any write; `check` before each batch; `release --stopped` at the end of the stage. Contributors without the tool: open a draft PR first | claim id in the ledger |
 | Implement | `superpowers:subagent-driven-development` + `superpowers:test-driven-development`; `superpowers:systematic-debugging` on any failure | commits, `task-N-brief.md` / `task-N-report.md` |
 | Task review | `superpowers:requesting-code-review` (Fable); `pr-review-toolkit` agents on the final whole-branch pass | review note in the ledger |
