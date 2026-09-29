@@ -227,8 +227,12 @@ export async function runTrackedJob(job, runner, options = {}) {
     const errorMessage = completionStatus === "failed" ? execution.errorMessage ?? null : null;
     const logFile = options.logFile ?? job.logFile ?? null;
     writeTerminalUnlessCancelled(job.workspaceRoot, job.id, logFile, () => {
+      // `runningRecord` predates `turn/started`, which is where the progress
+      // updater stored the transport; read it back so the final record keeps it.
+      const stored = readStoredJobOrNull(job.workspaceRoot, job.id);
       writeJobFile(job.workspaceRoot, job.id, {
         ...runningRecord,
+        transport: stored?.transport ?? runningRecord.transport ?? null,
         status: completionStatus,
         errorMessage,
         threadId: execution.threadId ?? null,

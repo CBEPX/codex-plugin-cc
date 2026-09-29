@@ -1359,10 +1359,12 @@ async function handleCancel(argv) {
   // Brokered, or recorded before v1.4.2 (no `transport`): the turn runs in the
   // shared runtime, so a dead worker would not stop it. Only a terminal record
   // ends the wait; polled outside the state lock, which the worker's own
-  // terminal write takes. No turn recorded → nothing to wait for (v1.4.1 path).
+  // terminal write takes. A record that is already terminal ends it at once,
+  // whether or not the interrupt was acknowledged (a zero window reads once).
+  // No turn recorded → nothing to wait for (v1.4.1 path).
   let turnEnded = false;
   if (!direct && turnId) {
-    const stored = interrupt.interrupted ? await waitForTerminalRecord(workspaceRoot, job.id, TURN_INTERRUPT_ACK_MS) : null;
+    const stored = await waitForTerminalRecord(workspaceRoot, job.id, interrupt.interrupted ? TURN_INTERRUPT_ACK_MS : 0);
     if (!stored) {
       emitCancelPending({ pending: true, reason: "turn-not-interrupted", survivors: [] }, pid, job.id, { json: options.json, appendLog: (line) => appendLogLine(job.logFile, line) });
       process.exitCode = 1;

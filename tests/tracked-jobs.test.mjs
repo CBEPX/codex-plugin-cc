@@ -7,7 +7,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { makeTempDir, run } from "./helpers.mjs";
 import { getProcessIdentity } from "../plugins/codex/scripts/lib/process.mjs";
-import { reapDeadJobs, resetWin32ProbeMemo, runTrackedJob } from "../plugins/codex/scripts/lib/tracked-jobs.mjs";
+import { createJobProgressUpdater, reapDeadJobs, resetWin32ProbeMemo, runTrackedJob } from "../plugins/codex/scripts/lib/tracked-jobs.mjs";
 import {
   listJobs,
   readJobFile,
@@ -436,6 +436,26 @@ test("runTrackedJob records whether the app-server exit was observed; a silent r
     assert.equal(readJobFile(resolveJobFile(workspace, id)).appServerExited, expected, id);
     assert.equal(listJobs(workspace).find((entry) => entry.id === id).appServerExited, expected, id);
   }
+});
+
+test("runTrackedJob keeps the transport the turn/started patch recorded on the final job file", async () => {
+  const workspace = makeTempDir();
+  const job = { id: "job-transport", status: "queued", workspaceRoot: workspace, logFile: null };
+  seedJob(workspace, job);
+  const onProgress = createJobProgressUpdater(workspace, job.id);
+  await runTrackedJob(job, async () => {
+    // The main thread's turn/started event lands while the runner is still going.
+    onProgress({ message: "Turn started.", phase: "running", threadId: "thr-1", turnId: "turn-1", transport: "broker" });
+    return { exitStatus: 0, payload: {}, rendered: "ok\n", summary: "ok", threadId: "thr-1", turnId: "turn-1" };
+  });
+  assert.equal(readJobFile(resolveJobFile(workspace, job.id)).transport, "broker");
+  assert.equal(listJobs(workspace).find((entry) => entry.id === job.id).transport, "broker");
+
+  // A job whose turn never started has no transport to keep.
+  const bare = { id: "job-transport-none", status: "queued", workspaceRoot: workspace, logFile: null };
+  seedJob(workspace, bare);
+  await runTrackedJob(bare, async () => ({ exitStatus: 0, payload: {}, rendered: "ok\n", summary: "ok" }));
+  assert.equal(readJobFile(resolveJobFile(workspace, bare.id)).transport ?? null, null);
 });
 
 // A live pid is not proof of a live worker: the OS may have handed the number to

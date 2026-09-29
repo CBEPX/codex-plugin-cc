@@ -350,6 +350,8 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
     }
     // What close() saw, not what it asked for: `exitPromise` also settles on a
     // spawn 'error' or a JSONL parse error while the child is still running.
+    // No proc: nothing to observe; never reaches a record (the catch path
+    // discards the close result).
     return { exited: !this.proc || this.proc.exitCode !== null || this.proc.signalCode !== null };
   }
 

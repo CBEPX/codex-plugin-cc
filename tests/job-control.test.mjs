@@ -96,6 +96,13 @@ test("renderCancelPending says a brokered turn that did not end leaves the job r
   assert.equal(rendered.diagnostic, null);
 });
 
+test("renderCancelPending names no pid when there is none", () => {
+  const rendered = renderCancelPending({ pending: true, reason: "turn-not-interrupted", survivors: [] }, null, "job-1");
+  assert.equal(rendered.logLine, "cancellation not confirmed: worker left running (turn-not-interrupted)");
+  assert.match(rendered.text, /^cancellation not confirmed: worker left running \(turn-not-interrupted\)\n/);
+  assert.doesNotMatch(rendered.text, /null|undefined/);
+});
+
 test("renderCancelPending reports survivors on win32", () => {
   const rendered = renderCancelPending({ pending: true, reason: "kill-failed", survivors: SURVIVORS }, 4300, "job-1");
   assert.deepEqual(rendered.json.survivors, SURVIVORS);
@@ -185,7 +192,7 @@ test("commitCancel writes cancelled over an active record and keeps a terminal o
   log.length = 0;
   assert.deepEqual(commitCancel(workspace, job, next, {}, { leftRunning: "worker pid 5 left running: identity-mismatch", log: (line) => log.push(line) }), finished);
   assert.deepEqual(readJobFile(resolveJobFile(workspace, "task-1")), finished);
-  assert.deepEqual(log, ["cancel: record already failed, kept (interrupt not acknowledged)"]);
+  assert.deepEqual(log, ["cancel: record already failed, kept (not caused by this cancel)"]);
 
   // This cancel caused the finish (acknowledged interrupt, or delivered kill): cancelled wins (v1.4.0).
   log.length = 0;

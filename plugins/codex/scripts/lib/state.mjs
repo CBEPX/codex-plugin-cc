@@ -717,9 +717,10 @@ export function upsertJob(cwd, jobPatch) {
 export function updateJobPid(cwd, jobId, pid, identity = null) {
   // Sidecar and index patch share one lock, and neither is written for a job
   // that is no longer active: a cancel (or the worker's terminal write) that
-  // landed first removed the sidecar, and a rewrite would hand a finished job's
-  // pid to the next reader. Only `queued` gets the index patch — a worker that
-  // already reported `running` wrote its own pid there, the newer one.
+  // landed first removed the sidecar, and a rewrite would leave an orphan
+  // sidecar until the prune (readers ignore a terminal job's sidecar). Only
+  // `queued` gets the index patch — a worker that already reported `running`
+  // wrote its own pid there, the newer one.
   withStateLock(cwd, () => {
     const indexed = listJobs(cwd).find((job) => job.id === jobId);
     if (indexed?.status !== "queued" && indexed?.status !== "running") {

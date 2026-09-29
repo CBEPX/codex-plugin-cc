@@ -43,7 +43,7 @@ test("SessionEnd keeps a job whose tree left survivors and drops one whose kill 
       process.stderr.write = original;
     }
     const remaining = loadState(repo).jobs.map((job) => job.id);
-    assert.deepEqual(remaining, keptExpected ? ["job-1"] : [], `${platform} ${JSON.stringify(outcome)}`);
+    assert.deepEqual(remaining, keptExpected ? ["job-1"] : [], `${platform} ${typeof outcome === "function" ? "throws" : JSON.stringify(outcome)}`);
     if (stderrPattern) {
       assert.match(written.join(""), stderrPattern);
     }

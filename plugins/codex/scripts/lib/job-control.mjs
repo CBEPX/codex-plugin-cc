@@ -356,7 +356,7 @@ export function commitCancel(workspaceRoot, job, nextJob, existing, { leftRunnin
     const terminal = isTerminalRecord(stored);
     const reaped = terminal && typeof stored.errorMessage === "string" && stored.errorMessage.startsWith(DEAD_WORKER_MESSAGE);
     if (terminal && (reaped || causedByCancel !== true)) {
-      log(`cancel: record already ${stored.status}, kept (${reaped ? "written by the reaper" : "interrupt not acknowledged"})`);
+      log(`cancel: record already ${stored.status}, kept (${reaped ? "written by the reaper" : "not caused by this cancel"})`);
       return stored;
     }
     if (leftRunning) {
@@ -445,7 +445,8 @@ export function brokerExclusion(broker) {
 // to v1.4.0 there; only win32 adds a survivors suffix and a stderr diagnostic.
 export function renderCancelPending(decision, pid, jobId) {
   const survivors = decision.survivors ?? [];
-  const pending = `cancellation not confirmed: worker pid ${pid} left running (${decision.reason})`;
+  // A brokered job may have no pid to name (its worker was never signalled).
+  const pending = `cancellation not confirmed: worker ${pid == null ? "" : `pid ${pid} `}left running (${decision.reason})`;
   const survivorText = survivors.map((s) => `${s.pid}:${s.identity ?? "unknown"}`).join(" ");
   const suffix = survivors.length > 0
     ? ` worker tree survivors: ${survivorText}`
