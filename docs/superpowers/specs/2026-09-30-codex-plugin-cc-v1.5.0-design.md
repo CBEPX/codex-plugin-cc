@@ -1,6 +1,6 @@
 # codex-plugin-cc v1.5.0 — companion split, bounded read views, review surface
 
-Date: 2026-09-30 (rev. 6, 2026-09-30)
+Date: 2026-09-30 (rev. 7, 2026-10-01)
 
 ## Goal
 
@@ -195,15 +195,15 @@ Transport is decided per run by the existing `withAppServer`: broker when reacha
 **#714 verbatim focus.** New `splitArgsWithVerbatimTail(raw, spec)` in `lib/args.mjs`:
 - It tokenizes shell-like, with the existing splitter, until the first positional or `--`.
 - The value of a value or repeatable option (including `-m`, and a `--flag=value` form) is taken as one token.
-- From the first positional's start offset (or after `--`), the rest of the raw string, trimmed, becomes ONE token. Apostrophes, quotes, backslashes and newlines are kept byte for byte, and focus starting with `-` works after `--`.
+- From the first positional's start offset (or after `--`), the rest of the raw string, trimmed, becomes ONE token. Apostrophes, quotes, backslashes and newlines are kept byte for byte. A tail that itself starts with `-` and is not exactly `-` (a markdown bullet list) is emitted after a `--` token, so the parser takes it as the focus instead of an option; a token that starts with `-` is a flag as before, so `-x` at that position is still `Unknown option: -x`.
 - `applyArgsStdin(argv, spec)` uses it only when `main` passes `REVIEW_ARG_SPEC` (exported by `commands/review.mjs`, and also used for its own `parseCommandInput`). That happens for `review` and `adversarial-review`.
 - `review` now parses with `stopAtFirstPositional` like the adversarial variant. The #547 rule stays: text after the first positional is focus, even if it looks like a flag.
 - Unchanged: `task --args-stdin`, the single-string argv form (`normalizeArgv`, `argv.length === 1`), and plain argv.
 
 **#653 base validation.** In `resolveReviewTarget` (`lib/git.mjs:135`), for an explicit `--base <ref>`:
-- If `ref` starts with `-`, or `git rev-parse --verify --quiet <ref>^{commit}` exits non-zero, it throws: `Base ref "<ref>" not found in this repository; pass a branch, tag or commit that resolves locally (git fetch it first for a remote ref).` Exit 1.
+- If `ref` is empty (an explicit `--base ""` or `--base=`), starts with `-`, or `git rev-parse --verify --quiet <ref>^{commit}` exits non-zero or prints anything but one bare hexadecimal object id (a `^`-leading ref prints `^<sha>` with exit 0), it throws: `Base ref "<ref>" not found in this repository; pass a branch, tag or commit that resolves locally (git fetch it first for a remote ref).` Exit 1.
 - The check runs before any job, request file or `codex` start. It covers both commands, and the worker's re-resolve too.
-- Detected bases are not re-checked: `detectDefaultBranch` already verifies them with `show-ref`.
+- A detected base always resolves: the candidate loop of `detectDefaultBranch` checks `refs/heads/<c>` then `refs/remotes/origin/<c>`; the name taken from `symbolic-ref refs/remotes/origin/HEAD` is returned only if `refs/heads/<name>` exists, else as `origin/<name>` if that ref exists, else the candidate loop runs (and the existing "Unable to detect" error if nothing matches). An absent `--base` (undefined or null) means detection; only an explicit value is validated.
 
 **#529 persisted, named threads.**
 - `runAppServerReview` starts its thread with `ephemeral: false` and `threadName` (today `ephemeral: true` at `codex.mjs:1238`).
@@ -227,10 +227,10 @@ Transport is decided per run by the existing `withAppServer`: broker when reacha
 
 **#583 structured output, recovered as the sister plugin does** (user ruling; the upstream #583 rule — a fence around the whole message — is a special case). `parseStructuredOutput` (`lib/codex.mjs`) tries, on the trimmed message, in order:
 1. the whole message as JSON;
-2. the first fenced block anywhere, `/```(?:json)?\s*\n([\s\S]*?)\r?\n```/` (LF or CRLF);
-3. the first balanced `{…}` that parses — a scan that knows JSON strings and `\` escapes and moves to the next `{` when a candidate fails.
+2. the first fenced block anywhere — the opening line `` ``` `` or `` ```json `` (LF or CRLF), the body up to the next line that starts with `` ``` `` (found without backtracking) — but only when it parses to a non-null object or an array; a fenced primitive (`null`, `0`, `false`, `"…"`) falls through;
+3. the first complete top-level `{…}` that parses — a single linear pass that knows JSON strings and `\` escapes; candidates are disjoint, and a candidate that fails to parse is skipped. Objects nested inside a broken outer `{` are NOT recovered (the reference recovers them by restarting at every `{`, which is quadratic on hostile input — a message of only `{` took 11 s at 100 KB; the linear scan takes about 1 ms at the prompt ceiling).
 
-`rawOutput` stays the raw message. Malformed or truncated JSON, prose with no object and empty output fail as today, with today's texts. A parsed object that is not a review is already caught downstream: the renderer validates the shape and prints `Codex returned JSON with an unexpected review shape.` with the validation error and the raw final message (`render.mjs:26-43`, `:237-255`), so a wrong-shaped object is never shown as an empty review.
+`rawOutput` stays the raw message. Malformed or truncated JSON (including a truncated review that still holds one complete finding), prose with no object and empty output fail as today, with today's texts. The caller (`executeReviewRun`) then validates the shape with the renderer's validator: a parsed value that is not a review — a bare `{}`, an array, a primitive, a finding fragment — is reported as unparsed, `result: null` with `parseError` `Invalid review shape: <reason>` and the raw message in `rawOutput`, and the text output shows the raw message. Before 1.5.0 such a value reached `--json` as `result` with `parseError: null`.
 
 **#679 built-in `--json` shape.**
 - `exitedReviewMode` delivers only a string (`codex.mjs:516`), so a result in the schema's shape is impossible without guessing.
@@ -357,6 +357,7 @@ Transport is decided per run by the existing `withAppServer`: broker when reacha
 - **No wall-clock limit per job** (#615 defect 3). Use `--turn-timeout-ms`.
 - **The built-in reviewer never returns a schema-shaped `result`** (#679). `parseError` says so.
 - **Persisted review threads write rollouts** to `~/.codex/sessions`. `codex resume <id>` now works for them; they are never `--resume-last` candidates.
+- **Structured output is recovered from top-level candidates only.** An object nested inside a broken outer `{` is not recovered (the reference recovers it); the first candidate wins even when it is not the review (a `{}` in a js fence or in prose before the real review) — both end as `Invalid review shape` with the raw message, never as a wrong review.
 - **A reply that only quotes a JSON object is read as that object.** If the quoted object has the review shape it is shown as the review; `--json` carries the raw final message in `rawOutput` for checking. In `--json`, a parsed object of the wrong shape appears as `result` with `parseError: null` (pre-existing for bare JSON).
 - **The sister's throwaway review worktree is not ported.** It contains a reviewer that can write; here the reviewer runs in Codex's read-only sandbox.
 - **`--output` must name a path that is free when the command starts.** `status <id> --wait --output` refuses an occupied path before waiting, even if it would be free by the end of the wait. A path so long that its receipt would exceed 8192 bytes is refused.
@@ -415,3 +416,4 @@ Transport is decided per run by the existing `withAppServer`: broker when reacha
 | 4 | 2026-09-30 | user: compare with the sister plugin; Codex (gpt-6.1-sol) read the plan against cc-plugin-codex 66846d9 | random heredoc delimiter in every command file; untracked symlinks skipped; inline diff read bounded; worker stdout/stderr to the job log and `worker could not start: …` (one spawn option changes, threat model walked); bottom-out view measured, receipt preflight, own-property projection; first shrink step 512 for summary views and 4096 only for the `result` preview; summary-dropped arrays counted; depth nulls count as shortened in text; mode flags only before the focus; sister regressions and the concurrent-review cancel test added; limits: prose-embedded JSON and the review worktree not ported, `--output` path free at start |
 | 5 | 2026-09-30 | user ruling at plan review | structured output is recovered as in the sister plugin (first fenced block, then the first JSON object in prose) instead of the strict whole-message fence; `Co-authored-by` with noreply addresses and the worker-diagnostics task confirmed |
 | 6 | 2026-09-30 | Codex (gpt-6.1-sol) compared the implemented S2 code with the sister: 0 blocking, 1 should-fix | a failed `--output` write leaves the partial file and names it instead of unlinking by path (check-then-unlink window, also in the reference); the bottom-out of the active-job hint gets a runtime test |
+| 7 | 2026-10-01 | task reviews S3a.1–S3a.3 and Codex (gpt-6.1-sol) on S3a.3 | dash-led focus emitted after `--`; base predicate: empty and `^`-leading refs refused, rev-parse must print one hex id; detected base from origin/HEAD must resolve (S3a.2b); structured output: linear scanner, fenced primitives fall through, review-shape guard at the caller with `Invalid review shape: <reason>`; limits updated |
