@@ -107,7 +107,9 @@ test("the import parser sees every static form", () => {
     ""
   ].join("\n"));
   assert.deepEqual(imports(file), ["./double.mjs", "./single.mjs", "./side-effect.mjs", "../lib/reexport.mjs", "./multi-line.mjs"]);
-  assert.equal(inDir("/x/lib", "/x/commands/a.mjs", "../lib/../commands/b.mjs"), false);
-  assert.equal(inDir("/x/lib", "/x/lib/a.mjs", "./../commands/b.mjs"), false);
-  assert.equal(inDir("/x/lib", "/x/lib/a.mjs", "./b.mjs"), true);
+  const root = path.dirname(file);
+  const lib = path.join(root, "lib");
+  assert.equal(inDir(lib, path.join(root, "commands", "a.mjs"), "../lib/../commands/b.mjs"), false);
+  assert.equal(inDir(lib, path.join(lib, "a.mjs"), "./../commands/b.mjs"), false);
+  assert.equal(inDir(lib, path.join(lib, "a.mjs"), "./b.mjs"), true);
 });

@@ -252,19 +252,36 @@ test("exportReadPayload refuses an existing file untouched; other errors stay ra
   assert.throws(() => exportReadPayload({ a: 1 }, path.join("no-such-dir", "x.json"), dir), { code: "ENOENT" });
 });
 
-test("exportReadPayload refuses a symlink, live or dangling, and a directory", { skip: IS_WIN }, () => {
+test("exportReadPayload refuses a symlink, live or dangling", { skip: IS_WIN }, () => {
   const dir = makeTempDir();
   const target = path.join(dir, "target.json");
   fs.writeFileSync(target, "keep");
   fs.symlinkSync(target, path.join(dir, "live-link.json"));
   fs.symlinkSync(path.join(dir, "missing.json"), path.join(dir, "dangling-link.json"));
-  fs.mkdirSync(path.join(dir, "a-dir"));
-  for (const name of ["live-link.json", "dangling-link.json", "a-dir"]) {
+  for (const name of ["live-link.json", "dangling-link.json"]) {
     assert.throws(() => exportReadPayload({ a: 1 }, name, dir), /already exists; pass a new path\.$/, name);
   }
   assert.equal(fs.readFileSync(target, "utf8"), "keep");
   assert.equal(fs.existsSync(path.join(dir, "missing.json")), false, "a dangling link is never followed");
   assert.ok(fs.lstatSync(path.join(dir, "live-link.json")).isSymbolicLink());
+});
+
+test("exportReadPayload refuses an existing directory and leaves it untouched", () => {
+  const dir = makeTempDir();
+  const target = path.join(dir, "a-dir");
+  fs.mkdirSync(target);
+  assert.throws(() => exportReadPayload({ a: 1 }, "a-dir", dir), { message: `--output ${target} already exists; pass a new path.` });
+  assert.ok(fs.lstatSync(target).isDirectory());
+  assert.deepEqual(fs.readdirSync(target), []);
+});
+
+test("a non-numeric omittedJobs cannot inflate the printed view", () => {
+  const payload = { omittedJobs: "j".repeat(9000), body: "x".repeat(60_000) };
+  const json = boundedReadView(payload, { nextStep: NEXT });
+  assert.ok(bytes(json.text) <= PUBLIC_READ_BYTES, `${bytes(json.text)} bytes`);
+  assert.equal(typeof json.view.omissions.records, "number");
+  const text = boundedReadView(payload, { render: () => "x".repeat(9000), asJson: false, nextStep: NEXT });
+  assert.ok(bytes(text.text) <= PUBLIC_READ_BYTES, `${bytes(text.text)} bytes`);
 });
 
 test("exportReadPayload removes the file it created when the write fails", (t) => {

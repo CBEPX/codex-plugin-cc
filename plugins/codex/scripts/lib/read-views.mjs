@@ -98,7 +98,7 @@ function project(value, limits, summary, omissions, cuts, depth) {
 // (lists) start at 512-byte strings like the original, keeping 8 records; a
 // `result` preview starts at 4096 bytes.
 export function boundedReadView(payload, { summary = false, render = null, asJson = true, nextStep } = {}) {
-  const omittedRecords = payload?.omittedJobs ?? 0;
+  const omittedRecords = Number(payload?.omittedJobs) || 0;
   const asText = asJson === false && typeof render === "function";
   let limits = { string: Infinity, items: Infinity };
   for (;;) {
