@@ -48,3 +48,11 @@ test("job-control reaches codex.mjs for getSessionRuntimeStatus only", () => {
   assert.equal((src.match(/^import \{ getSessionRuntimeStatus \} from "\.\/codex\.mjs";$/m) ?? []).length, 1);
   assert.equal((src.match(/from "\.\/codex\.mjs"/g) ?? []).length, 1);
 });
+
+const COMMANDS = path.join(SCRIPTS, "commands");
+
+test("commands/shared.mjs imports only ../lib/**", () => {
+  const specs = imports(path.join(COMMANDS, "shared.mjs"));
+  assert.ok(specs.length >= 5, "import parser found nothing");
+  for (const spec of specs) assert.ok(spec.startsWith("../lib/"), `shared.mjs imports ${spec}`);
+});
