@@ -314,6 +314,10 @@ if (IGNORE_INTERRUPT) {
     saveState(closingState);
   });
 }
+// Test knob: answer but ignore only the first N turn/interrupt requests this
+// app-server sees (the turn keeps running); later ones are honoured.
+const IGNORE_FIRST_INTERRUPTS = Number(process.env.FAKE_CODEX_IGNORE_FIRST_INTERRUPTS || 0);
+let interruptsSeen = 0;
 if (CLOSE_DELAY_MS > 0) {
   process.on("SIGTERM", () => {});
   rl.on("close", () => {
@@ -755,7 +759,8 @@ rl.on("line", (line) => {
 	          setTimeout(() => process.exit(0), 10);
 	          break;
 	        }
-	        const pending = IGNORE_INTERRUPT ? null : interruptibleTurns.get(message.params.turnId);
+	        interruptsSeen += 1;
+	        const pending = IGNORE_INTERRUPT || interruptsSeen <= IGNORE_FIRST_INTERRUPTS ? null : interruptibleTurns.get(message.params.turnId);
 	        if (pending) {
 	          clearTimeout(pending.timer);
 	          interruptibleTurns.delete(message.params.turnId);

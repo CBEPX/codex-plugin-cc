@@ -153,11 +153,12 @@ test("close() bounds an app-server that ignores SIGTERM", { timeout: 8000, skip:
   });
 
   const started = Date.now();
-  await client.close();
+  const closed = await client.close();
   const elapsed = Date.now() - started;
 
   assert.ok(elapsed < 6000, `close() must be bounded, took ${elapsed} ms`);
   assert.equal(client.proc.signalCode, "SIGKILL", "a SIGTERM-immune app-server must be killed outright");
+  assert.deepEqual(closed, { exited: true }, "a killed child's exit is observed");
 });
 
 // The bound only ever applied to the first call: a second one took the "already
@@ -185,9 +186,9 @@ test("close() stays bounded when it is called twice", { timeout: 15000, skip: IS
   // swallowing the signals means even the SIGKILL escalation never lands.
   client.proc.kill = () => true;
 
-  await client.close();
+  assert.deepEqual(await client.close(), { exited: false });
   const started = Date.now();
-  await client.close();
+  assert.deepEqual(await client.close(), { exited: false }, "memoized");
 
   assert.ok(Date.now() - started < 1000, `a repeated close must not wait again, took ${Date.now() - started} ms`);
   assert.equal(client.proc.exitCode, null, "the test needs a child that never exits");
@@ -227,4 +228,11 @@ test("broker client connect times out with ETIMEDOUT instead of hanging", async 
   };
   const client = new BrokerCodexAppServerClient(process.cwd(), { brokerEndpoint: "unix:/nonexistent.sock", connectImpl, connectTimeoutMs: 200 });
   await assert.rejects(client.initialize(), (error) => error.code === "ETIMEDOUT");
+});
+
+test("a broker client's close() reports its connection released", async () => {
+  const client = new BrokerCodexAppServerClient(process.cwd(), { brokerEndpoint: "unix:/nonexistent.sock" });
+  client.handleExit(null);
+  assert.deepEqual(await client.close(), { exited: true });
+  assert.deepEqual(await client.close(), { exited: true }, "the closed branch answers the same");
 });

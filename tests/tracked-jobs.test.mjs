@@ -7,11 +7,12 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { makeTempDir, run } from "./helpers.mjs";
 import { getProcessIdentity } from "../plugins/codex/scripts/lib/process.mjs";
-import { reapDeadJobs, resetWin32ProbeMemo, runTrackedJob } from "../plugins/codex/scripts/lib/tracked-jobs.mjs";
+import { createJobProgressUpdater, reapDeadJobs, resetWin32ProbeMemo, runTrackedJob } from "../plugins/codex/scripts/lib/tracked-jobs.mjs";
 import {
   listJobs,
   readJobFile,
   recordWorkerPid,
+  removeJobPidFile,
   resolveJobFile,
   resolveJobPid,
   resolveJobPidFile,
@@ -426,6 +427,37 @@ test("runTrackedJob sets workerClosed only on its cooperative terminal write, af
   assert.equal(readJobFile(resolveJobFile(workspace, thrown.id)).workerClosed, undefined);
 });
 
+test("runTrackedJob records whether the app-server exit was observed; a silent runner records false", async () => {
+  const workspace = makeTempDir();
+  for (const [id, reported, expected] of [["job-exit-seen", true, true], ["job-exit-unseen", false, false], ["job-exit-unsaid", undefined, false]]) {
+    const job = { id, status: "queued", workspaceRoot: workspace, logFile: null };
+    seedJob(workspace, job);
+    await runTrackedJob(job, async () => ({ exitStatus: 0, payload: {}, rendered: "ok\n", summary: "ok", appServerExited: reported }));
+    assert.equal(readJobFile(resolveJobFile(workspace, id)).appServerExited, expected, id);
+    assert.equal(listJobs(workspace).find((entry) => entry.id === id).appServerExited, expected, id);
+  }
+});
+
+test("runTrackedJob keeps the transport the turn/started patch recorded on the final job file", async () => {
+  const workspace = makeTempDir();
+  const job = { id: "job-transport", status: "queued", workspaceRoot: workspace, logFile: null };
+  seedJob(workspace, job);
+  const onProgress = createJobProgressUpdater(workspace, job.id);
+  await runTrackedJob(job, async () => {
+    // The main thread's turn/started event lands while the runner is still going.
+    onProgress({ message: "Turn started.", phase: "running", threadId: "thr-1", turnId: "turn-1", transport: "broker" });
+    return { exitStatus: 0, payload: {}, rendered: "ok\n", summary: "ok", threadId: "thr-1", turnId: "turn-1" };
+  });
+  assert.equal(readJobFile(resolveJobFile(workspace, job.id)).transport, "broker");
+  assert.equal(listJobs(workspace).find((entry) => entry.id === job.id).transport, "broker");
+
+  // A job whose turn never started has no transport to keep.
+  const bare = { id: "job-transport-none", status: "queued", workspaceRoot: workspace, logFile: null };
+  seedJob(workspace, bare);
+  await runTrackedJob(bare, async () => ({ exitStatus: 0, payload: {}, rendered: "ok\n", summary: "ok" }));
+  assert.equal(readJobFile(resolveJobFile(workspace, bare.id)).transport ?? null, null);
+});
+
 // A live pid is not proof of a live worker: the OS may have handed the number to
 // something else (#743). The recorded identity tells them apart.
 test("reapDeadJobs fails a running job whose pid was recycled by another process", () => {
@@ -652,6 +684,23 @@ test("recordWorkerPid writes the pid sidecar before the identity probe runs", ()
   assert.deepEqual(resolveJobPid(workspace, { id: "job-spawned", status: "queued", pid: null }), { pid: 4242, identity: "win32:4242" });
   const indexed = listJobs(workspace).find((entry) => entry.id === "job-spawned");
   assert.deepEqual([indexed.pid, indexed.pidIdentity], [4242, "win32:4242"]);
+});
+
+// A cancel inside the (win32, seconds-long) identity probe removes the sidecar
+// and writes `cancelled`; the probe's second write must not bring the pid back.
+test("recordWorkerPid does not revive the sidecar of a job cancelled during the probe", () => {
+  const workspace = makeTempDir();
+  seedJob(workspace, { id: "job-mid-probe", status: "queued", pid: null, logFile: null });
+  recordWorkerPid(workspace, "job-mid-probe", 4244, {
+    getProcessIdentityImpl: (pid) => {
+      upsertJob(workspace, { id: "job-mid-probe", status: "cancelled", pid: null, pidIdentity: null });
+      removeJobPidFile(workspace, "job-mid-probe");
+      return `win32:${pid}`;
+    }
+  });
+  assert.equal(fs.existsSync(resolveJobPidFile(workspace, "job-mid-probe")), false, "a cancelled job must not get its sidecar back");
+  const indexed = listJobs(workspace).find((entry) => entry.id === "job-mid-probe");
+  assert.deepEqual([indexed.status, indexed.pid, indexed.pidIdentity], ["cancelled", null, null]);
 });
 
 // A cancel that landed between the spawn and the worker's start already wrote

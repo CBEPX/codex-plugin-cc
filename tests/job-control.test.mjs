@@ -8,7 +8,7 @@ import { saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle
 import { DEAD_WORKER_MESSAGE } from "../plugins/codex/scripts/lib/tracked-jobs.mjs";
 import assert from "node:assert/strict";
 
-import { brokerExclusion, brokerPresence, cancelDecision, commitCancel, emitCancelPending, isWorkerTerminalRecord, renderCancelPending } from "../plugins/codex/scripts/lib/job-control.mjs";
+import { brokerExclusion, brokerPresence, cancelDecision, commitCancel, emitCancelPending, isWorkerProvedRecord, isWorkerTerminalRecord, renderCancelPending } from "../plugins/codex/scripts/lib/job-control.mjs";
 
 const SURVIVORS = [{ pid: 4301, identity: "win32:7" }];
 
@@ -88,6 +88,21 @@ test("renderCancelPending says an unverifiable dead worker waits for the reaper"
   }
 });
 
+test("renderCancelPending says a brokered turn that did not end leaves the job running", () => {
+  const rendered = renderCancelPending({ pending: true, reason: "turn-not-interrupted", survivors: [] }, 4300, "job-1");
+  assert.deepEqual(rendered.json, { jobId: "job-1", status: "running", cancellationPending: true, reason: "turn-not-interrupted" });
+  assert.equal(rendered.logLine, "cancellation not confirmed: worker pid 4300 left running (turn-not-interrupted)");
+  assert.match(rendered.text, /the shared runtime has not ended the turn, so the worker was not stopped; the job stays running\. Re-run cancel or wait for result\./);
+  assert.equal(rendered.diagnostic, null);
+});
+
+test("renderCancelPending names no pid when there is none", () => {
+  const rendered = renderCancelPending({ pending: true, reason: "turn-not-interrupted", survivors: [] }, null, "job-1");
+  assert.equal(rendered.logLine, "cancellation not confirmed: worker left running (turn-not-interrupted)");
+  assert.match(rendered.text, /^cancellation not confirmed: worker left running \(turn-not-interrupted\)\n/);
+  assert.doesNotMatch(rendered.text, /null|undefined/);
+});
+
 test("renderCancelPending reports survivors on win32", () => {
   const rendered = renderCancelPending({ pending: true, reason: "kill-failed", survivors: SURVIVORS }, 4300, "job-1");
   assert.deepEqual(rendered.json.survivors, SURVIVORS);
@@ -150,6 +165,14 @@ test("isWorkerTerminalRecord requires the workerClosed marker on a terminal reco
   assert.equal(isWorkerTerminalRecord(null), false);
 });
 
+test("isWorkerProvedRecord also needs the app-server exit observed; a pre-1.4.2 record without the field counts", () => {
+  const done = { status: "failed", phase: "failed", workerClosed: true };
+  assert.equal(isWorkerProvedRecord({ ...done, appServerExited: true }), true);
+  assert.equal(isWorkerProvedRecord(done), true, "v1.4.1 record");
+  assert.equal(isWorkerProvedRecord({ ...done, appServerExited: false }), false, "close deadline passed, child alive");
+  assert.equal(isWorkerProvedRecord({ status: "failed", appServerExited: true }), false, "crash guard / reaper: no marker");
+});
+
 test("commitCancel writes cancelled over an active record and keeps a terminal one", () => {
   const workspace = makeTempDir();
   const job = { id: "task-1", status: "running", title: "T" };
@@ -169,7 +192,7 @@ test("commitCancel writes cancelled over an active record and keeps a terminal o
   log.length = 0;
   assert.deepEqual(commitCancel(workspace, job, next, {}, { leftRunning: "worker pid 5 left running: identity-mismatch", log: (line) => log.push(line) }), finished);
   assert.deepEqual(readJobFile(resolveJobFile(workspace, "task-1")), finished);
-  assert.deepEqual(log, ["cancel: record already failed, kept (interrupt not acknowledged)"]);
+  assert.deepEqual(log, ["cancel: record already failed, kept (not caused by this cancel)"]);
 
   // This cancel caused the finish (acknowledged interrupt, or delivered kill): cancelled wins (v1.4.0).
   log.length = 0;

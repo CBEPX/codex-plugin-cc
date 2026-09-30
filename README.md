@@ -235,6 +235,8 @@ On a job that already has a terminal record (completed, failed, or cancelled), `
 
 Cancels an active background Codex job.
 
+A job whose turn runs through the shared broker is cancelled by interrupting the turn: `/codex:cancel` waits up to 10 s for the job's own final record and then answers `cancelled`. If the turn does not end (the runtime ignored or refused the interrupt), it answers `cancellationPending` with `reason: turn-not-interrupted` and exit 1, stops nothing, and the job stays `running`; re-run the cancel or wait for the turn. A job that owns its app-server (a cold `--resume-last`, `transport: direct` in `status --json`) is stopped by stopping its worker, without a turn interrupt (`turnInterruptAttempted: false`).
+
 Examples:
 
 ```bash
@@ -374,7 +376,7 @@ If you need to point the built-in OpenAI provider at a different endpoint, set `
 
 ### Windows
 
-Requirements: `cmd.exe` and Windows PowerShell 5.1 (both ship with Windows; no Store `pwsh` needed); `codex` and `npm` on the Windows `PATH` as `.cmd`/`.exe`. Kills from stored records (`/codex:cancel`, `SessionEnd` cleanup, broker teardown) verify the process before killing it. `/codex:cancel` answers `cancelled`, or `cancellationPending` (the job stays running) with `survivors` (pid and identity) when part of the tree outlived the kill, or with `reason: identity-unavailable` when the process could not be verified (for example while the shared broker is still starting, or under PowerShell Constrained Language Mode); `SessionEnd` keeps a record whose kill outcome is unknown (`kept=true`) and re-judges it next time. Details, limits and the state-directory fallback: [docs/windows.md](docs/windows.md).
+Requirements: `cmd.exe` and Windows PowerShell 5.1 (both ship with Windows; no Store `pwsh` needed); `codex` and `npm` on the Windows `PATH` as `.cmd`/`.exe`. Kills from stored records (`/codex:cancel`, `SessionEnd` cleanup, broker teardown) verify the process before killing it. `/codex:cancel` answers `cancelled`, or `cancellationPending` (the job stays running) with `survivors` (pid and identity) when part of the tree outlived the kill, or with `reason: identity-unavailable` when the process could not be verified (for example while the shared broker is still starting, or under PowerShell Constrained Language Mode), or with `reason: turn-not-interrupted` while a brokered job's turn is still running (see `/codex:cancel` above); `SessionEnd` keeps a record whose kill outcome is unknown (`kept=true`), including a refused or failed kill whose worker has already exited, and re-judges it next time. Details, limits and the state-directory fallback: [docs/windows.md](docs/windows.md).
 
 ## Development
 

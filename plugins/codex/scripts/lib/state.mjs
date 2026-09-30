@@ -715,15 +715,19 @@ export function upsertJob(cwd, jobPatch) {
 // index patch, and readers fall back to the sidecar (`resolveJobPid`) only while
 // the job is still active.
 export function updateJobPid(cwd, jobId, pid, identity = null) {
-  writeJobPidFile(cwd, jobId, pid, identity);
-  // The index is patch-based, so it cannot lose a field — but a worker that
-  // already reported `running` wrote its own pid there, and that record is the
-  // newer one. A job that is gone from the index needs no pid at all. The read
-  // and the patch share one lock: between them the worker could otherwise report
-  // `running`, and the patch would put this stale pid over its own.
+  // Sidecar and index patch share one lock, and neither is written for a job
+  // that is no longer active: a cancel (or the worker's terminal write) that
+  // landed first removed the sidecar, and a rewrite would leave an orphan
+  // sidecar until the prune (readers ignore a terminal job's sidecar). Only
+  // `queued` gets the index patch — a worker that already reported `running`
+  // wrote its own pid there, the newer one.
   withStateLock(cwd, () => {
     const indexed = listJobs(cwd).find((job) => job.id === jobId);
-    if (indexed?.status === "queued") {
+    if (indexed?.status !== "queued" && indexed?.status !== "running") {
+      return;
+    }
+    writeJobPidFile(cwd, jobId, pid, identity);
+    if (indexed.status === "queued") {
       upsertJob(cwd, { id: jobId, pid, pidIdentity: identity });
     }
   });
@@ -762,7 +766,8 @@ export function writeJobFile(cwd, jobId, payload) {
 }
 
 export function readJobFile(jobFile) {
-  const record = JSON.parse(fs.readFileSync(jobFile, "utf8"));
+  // The worker's rename-over can race an unlocked reader (the cancel poll) on Windows.
+  const record = JSON.parse(retryOnWindows(() => fs.readFileSync(jobFile, "utf8"), ["EPERM", "EBUSY"]));
   if (!hasStoredConfigValues(record)) {
     return record;
   }

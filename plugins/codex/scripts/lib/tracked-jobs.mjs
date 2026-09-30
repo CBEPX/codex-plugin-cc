@@ -28,6 +28,7 @@ function normalizeProgressEvent(value) {
       phase: typeof value.phase === "string" && value.phase.trim() ? value.phase.trim() : null,
       threadId: typeof value.threadId === "string" && value.threadId.trim() ? value.threadId.trim() : null,
       turnId: typeof value.turnId === "string" && value.turnId.trim() ? value.turnId.trim() : null,
+      transport: value.transport === "broker" || value.transport === "direct" ? value.transport : null,
       resolved: value.resolved && typeof value.resolved === "object" && !Array.isArray(value.resolved) ? value.resolved : null,
       stderrMessage: value.stderrMessage == null ? null : String(value.stderrMessage).trim(),
       logTitle: typeof value.logTitle === "string" && value.logTitle.trim() ? value.logTitle.trim() : null,
@@ -40,6 +41,7 @@ function normalizeProgressEvent(value) {
     phase: null,
     threadId: null,
     turnId: null,
+    transport: null,
     resolved: null,
     stderrMessage: String(value ?? "").trim(),
     logTitle: null,
@@ -85,6 +87,7 @@ export function createJobProgressUpdater(workspaceRoot, jobId) {
   let lastPhase = null;
   let lastThreadId = null;
   let lastTurnId = null;
+  let lastTransport = null;
   let lastResolved = null;
 
   return (event) => {
@@ -107,6 +110,13 @@ export function createJobProgressUpdater(workspaceRoot, jobId) {
     if (normalized.turnId && normalized.turnId !== lastTurnId) {
       lastTurnId = normalized.turnId;
       patch.turnId = normalized.turnId;
+      changed = true;
+    }
+
+    // Arrives with `turnId` in the same event, so both land in one patch.
+    if (normalized.transport && normalized.transport !== lastTransport) {
+      lastTransport = normalized.transport;
+      patch.transport = normalized.transport;
       changed = true;
     }
 
@@ -217,8 +227,12 @@ export async function runTrackedJob(job, runner, options = {}) {
     const errorMessage = completionStatus === "failed" ? execution.errorMessage ?? null : null;
     const logFile = options.logFile ?? job.logFile ?? null;
     writeTerminalUnlessCancelled(job.workspaceRoot, job.id, logFile, () => {
+      // `runningRecord` predates `turn/started`, which is where the progress
+      // updater stored the transport; read it back so the final record keeps it.
+      const stored = readStoredJobOrNull(job.workspaceRoot, job.id);
       writeJobFile(job.workspaceRoot, job.id, {
         ...runningRecord,
+        transport: stored?.transport ?? runningRecord.transport ?? null,
         status: completionStatus,
         errorMessage,
         threadId: execution.threadId ?? null,
@@ -228,10 +242,14 @@ export async function runTrackedJob(job, runner, options = {}) {
         pidIdentity: null,
         phase: completionStatus === "completed" ? "done" : "failed",
         completedAt,
-        // `runner()` resolved, so withAppServer already awaited client.close():
-        // the direct child is gone or the broker socket released. Only this
-        // cooperative write proves it (crash guard and reaper never set it).
+        // `runner()` resolved, so withAppServer already awaited client.close().
+        // `workerClosed`: that close returned. `appServerExited`: it saw the
+        // direct child exit (a broker connection always counts); a close that hit
+        // its 5 s deadline with the child alive records false, and so does a
+        // runner that does not say. Only this cooperative write sets either
+        // (crash guard and reaper never do).
         workerClosed: true,
+        appServerExited: execution.appServerExited === true,
         result: execution.payload,
         rendered: execution.rendered
       });
@@ -247,6 +265,7 @@ export async function runTrackedJob(job, runner, options = {}) {
         pid: null,
         pidIdentity: null,
         workerClosed: true,
+        appServerExited: execution.appServerExited === true,
         completedAt
       });
       removeJobPidFile(job.workspaceRoot, job.id);

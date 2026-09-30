@@ -181,12 +181,14 @@ export function cleanupSessionJobs(cwd, sessionId, lockWaitMs, remainingMs, deps
         } catch {
           reason = "kill-failed";
         }
-        // A dead root settles it on posix. On win32 a tree with survivors, or a
-        // kill whose outcome is unknown, keeps the record whatever the root did:
-        // the next SessionEnd judges it again (no survivor records — spec §1).
-        // A refused kill (broker not excludable) is unresolved too: the worker's
-        // tree was never looked at, so a dead root proves nothing about it.
-        const unresolved = platform === "win32" && (refused || (outcome?.survivors?.length ?? 0) > 0 || outcome?.unverified === true);
+        // A dead root settles it on posix. On win32 an outcome that says nothing
+        // about the tree keeps the record whatever the root did — a refusal
+        // (broker not excludable, identity-unavailable), a kill that threw
+        // (kill-failed), survivors, an unverified kill — the broker teardown's
+        // rule; the next SessionEnd judges it again (no survivor records — spec
+        // §1). identity-mismatch and process-missing without survivors are
+        // settled once the root is dead.
+        const unresolved = platform === "win32" && (refused || ["identity-unavailable", "kill-failed"].includes(reason) || (outcome?.survivors?.length ?? 0) > 0 || outcome?.unverified === true);
         if (reason && isPidAlive(pid) === false && !unresolved) {
           reason = null;
         }
@@ -195,7 +197,7 @@ export function cleanupSessionJobs(cwd, sessionId, lockWaitMs, remainingMs, deps
           process.stderr.write(
             refused
               ? `[codex] SessionEnd left ${job.id} tree: refused (broker record unreadable or without identity)\n`
-              : `[codex] SessionEnd left ${job.id} tree survivors: ${(outcome?.survivors ?? []).map((s) => `${s.pid}:${s.identity ?? "unknown"}`).join(" ") || "unverified"}\n`
+              : `[codex] SessionEnd left ${job.id} tree survivors: ${(outcome?.survivors ?? []).map((s) => `${s.pid}:${s.identity ?? "unknown"}`).join(" ") || (outcome?.attempted ? "unverified" : "unknown")}\n`
           );
         }
       }

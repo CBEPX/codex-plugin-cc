@@ -348,6 +348,11 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
         clearTimeout(deadlineTimer);
       }
     }
+    // What close() saw, not what it asked for: `exitPromise` also settles on a
+    // spawn 'error' or a JSONL parse error while the child is still running.
+    // No proc: nothing to observe; never reaches a record (the catch path
+    // discards the close result).
+    return { exited: !this.proc || this.proc.exitCode !== null || this.proc.signalCode !== null };
   }
 
   sendMessage(message) {
@@ -408,17 +413,16 @@ export class BrokerCodexAppServerClient extends AppServerClientBase {
     this.notify("initialized", {});
   }
 
+  // A broker client owns no process: releasing the socket is its whole exit.
   async close() {
-    if (this.closed) {
-      await this.exitPromise;
-      return;
-    }
-
-    this.closed = true;
-    if (this.socket) {
-      this.socket.end();
+    if (!this.closed) {
+      this.closed = true;
+      if (this.socket) {
+        this.socket.end();
+      }
     }
     await this.exitPromise;
+    return { exited: true };
   }
 
   sendMessage(message) {

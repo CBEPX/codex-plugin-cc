@@ -334,6 +334,13 @@ export function isWorkerTerminalRecord(stored) {
   return isTerminalRecord(stored) && stored.workerClosed === true;
 }
 
+// The worker's own terminal record whose close also saw the app-server exit.
+// `false` = the close deadline passed with the child alive; a pre-1.4.2 record
+// has no field and counts (its `workerClosed` was the v1.4.1 proof).
+export function isWorkerProvedRecord(stored) {
+  return isWorkerTerminalRecord(stored) && stored.appServerExited !== false;
+}
+
 // The cancel's terminal write, one locked step: another process's `saveState`
 // prune works off a diff of the index, so a cancel split across the write can
 // have its record pruned away, or the payload it deleted counted as still owned.
@@ -349,7 +356,7 @@ export function commitCancel(workspaceRoot, job, nextJob, existing, { leftRunnin
     const terminal = isTerminalRecord(stored);
     const reaped = terminal && typeof stored.errorMessage === "string" && stored.errorMessage.startsWith(DEAD_WORKER_MESSAGE);
     if (terminal && (reaped || causedByCancel !== true)) {
-      log(`cancel: record already ${stored.status}, kept (${reaped ? "written by the reaper" : "interrupt not acknowledged"})`);
+      log(`cancel: record already ${stored.status}, kept (${reaped ? "written by the reaper" : "not caused by this cancel"})`);
       return stored;
     }
     if (leftRunning) {
@@ -438,7 +445,8 @@ export function brokerExclusion(broker) {
 // to v1.4.0 there; only win32 adds a survivors suffix and a stderr diagnostic.
 export function renderCancelPending(decision, pid, jobId) {
   const survivors = decision.survivors ?? [];
-  const pending = `cancellation not confirmed: worker pid ${pid} left running (${decision.reason})`;
+  // A brokered job may have no pid to name (its worker was never signalled).
+  const pending = `cancellation not confirmed: worker ${pid == null ? "" : `pid ${pid} `}left running (${decision.reason})`;
   const survivorText = survivors.map((s) => `${s.pid}:${s.identity ?? "unknown"}`).join(" ");
   const suffix = survivors.length > 0
     ? ` worker tree survivors: ${survivorText}`
@@ -447,6 +455,8 @@ export function renderCancelPending(decision, pid, jobId) {
   const rootGone = survivors.length > 0 && decision.rootAlive === false;
   const tail = rootGone
     ? `worker pid ${pid} exited but part of its tree is still running (survivors: ${survivorText}); the job stays running until the reaper judges it.`
+    : decision.reason === "turn-not-interrupted"
+    ? "the shared runtime has not ended the turn, so the worker was not stopped; the job stays running."
     : (decision.reason === "identity-unavailable" || decision.reason === "identity-mismatch" || decision.reason === "process-missing") && decision.rootAlive === false
     ? `worker pid ${pid} exited before it could be verified; the job stays running until the reaper judges it.`
     : "the job stays running until the worker exits.";
