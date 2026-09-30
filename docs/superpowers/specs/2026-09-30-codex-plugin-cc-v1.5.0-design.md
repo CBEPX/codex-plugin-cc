@@ -1,6 +1,6 @@
 # codex-plugin-cc v1.5.0 — companion split, bounded read views, review surface
 
-Date: 2026-09-30 (rev. 5, 2026-09-30)
+Date: 2026-09-30 (rev. 6, 2026-09-30)
 
 ## Goal
 
@@ -23,7 +23,7 @@ Success means all of the following:
 - **`--output <new-path>` (new, user-supplied).**
   - Relative paths resolve against the command cwd (`--cwd`, else the process cwd), like `--prompt-file` (`codex-companion.mjs:852`).
   - Created with `openSync(path, "wx", 0o600)`. `O_CREAT|O_EXCL` never overwrites and never follows a symlink: an existing file, directory or symlink (dangling too) gives `EEXIST`.
-  - On a write failure the file is removed only if `lstat` still shows the `dev`/`ino` the create returned.
+  - On a write failure nothing is removed: the partial file stays and the error names it — `--output <path> was not written completely (<reason>); the partial file was left in place: remove it or pass a new path.` (exit 1). Removing by path, even after comparing `dev`/`ino`, could delete an entry that replaced the file between the check and the unlink (the reference has that window).
   - The file holds exactly what the command's `--json` printed before 1.5.0. That is no new exposure: the same user already reads it on stdout. It includes `request` with its config values redacted.
   - Win32: the mode is ignored (the file inherits the directory ACL); `wx` stays exclusive.
 - **Review request file.** A background review uses the existing 0600 `jobs/<id>.request.json`, written by `writeJobRequestFile` and deleted by `consumeJobRequestFile` (both defined at `state.mjs:879-900`), and removed on cancel (`job-control.mjs:342`) and by the reaper and the terminal write (`tracked-jobs.mjs:274/306/351`). `--config` values live only there. The record carries `request` with `redactConfigValues` applied, exactly as task does (`codex-companion.mjs:909`).
@@ -281,7 +281,7 @@ Transport is decided per run by the existing `withAppServer`: broker when reacha
   - mode 0600 (posix);
   - `EEXIST` on an existing path;
   - a symlink is refused (`{ skip: win32 }`);
-  - an injected write failure (`t.mock.method(fs, "writeFileSync")`) removes the file;
+  - an injected write failure (`t.mock.method(fs, "writeFileSync")`) leaves the partial file and the error says so;
   - a path whose receipt would exceed 8192 bytes is refused and nothing is created.
 - `runtime-status.test.mjs`:
   - a background task with a 60 KB prompt:
@@ -360,7 +360,7 @@ Transport is decided per run by the existing `withAppServer`: broker when reacha
 - **A reply that only quotes a JSON object is read as that object.** If the quoted object has the review shape it is shown as the review; `--json` carries the raw final message in `rawOutput` for checking. In `--json`, a parsed object of the wrong shape appears as `result` with `parseError: null` (pre-existing for bare JSON).
 - **The sister's throwaway review worktree is not ported.** It contains a reviewer that can write; here the reviewer runs in Codex's read-only sandbox.
 - **`--output` must name a path that is free when the command starts.** `status <id> --wait --output` refuses an occupied path before waiting, even if it would be free by the end of the wait. A path so long that its receipt would exceed 8192 bytes is refused.
-- **`--output` has limits of its own.** Windows ignores the 0600 mode; the symlink-refusal test is posix-only; every export needs a new path. A crash between create and write can leave a partial file.
+- **`--output` has limits of its own.** Windows ignores the 0600 mode; the symlink-refusal test is posix-only; every export needs a new path. A crash or a failed write leaves a partial file, which the next export to that path refuses.
 - **Cancelling a foreground review is unchanged** (pre-existing): its pid is the companion itself, not a `task-worker`.
 
 ## Rollout
@@ -414,3 +414,4 @@ Transport is decided per run by the existing `withAppServer`: broker when reacha
 | 3 | 2026-09-30 | plan writers' code reading; controller rulings on S2 | first shrink step 4096 instead of 512; a summary drop alone prints no `Truncated:` block in text mode; `--output` is checked before a `status --wait` starts waiting; S1 residue, entry allow-list and exports corrected; test sites `runtime-task:955-966`, `:1081-1084` (via `--output`), `commands.test:213` added; line references corrected; limit "focus text is never cut" added |
 | 4 | 2026-09-30 | user: compare with the sister plugin; Codex (gpt-6.1-sol) read the plan against cc-plugin-codex 66846d9 | random heredoc delimiter in every command file; untracked symlinks skipped; inline diff read bounded; worker stdout/stderr to the job log and `worker could not start: …` (one spawn option changes, threat model walked); bottom-out view measured, receipt preflight, own-property projection; first shrink step 512 for summary views and 4096 only for the `result` preview; summary-dropped arrays counted; depth nulls count as shortened in text; mode flags only before the focus; sister regressions and the concurrent-review cancel test added; limits: prose-embedded JSON and the review worktree not ported, `--output` path free at start |
 | 5 | 2026-09-30 | user ruling at plan review | structured output is recovered as in the sister plugin (first fenced block, then the first JSON object in prose) instead of the strict whole-message fence; `Co-authored-by` with noreply addresses and the worker-diagnostics task confirmed |
+| 6 | 2026-09-30 | Codex (gpt-6.1-sol) compared the implemented S2 code with the sister: 0 blocking, 1 should-fix | a failed `--output` write leaves the partial file and names it instead of unlinking by path (check-then-unlink window, also in the reference); the bottom-out of the active-job hint gets a runtime test |

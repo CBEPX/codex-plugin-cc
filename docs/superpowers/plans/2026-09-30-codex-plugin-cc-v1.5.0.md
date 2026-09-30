@@ -8,7 +8,7 @@
 
 **Tech Stack:** Node 18.18+ ESM, zero runtime deps, `node:test`, the fake Codex fixture, `rg`.
 
-**Spec:** `docs/superpowers/specs/2026-09-30-codex-plugin-cc-v1.5.0-design.md` (rev. 5). Codex's comparison with the sister plugin: `docs/superpowers/reports/v1.5.0/` after the release; until then `.superpowers/sdd/2026-09-30-codex-plugin-cc-v1.5.0/codex-compare-{S2,S3}.md`
+**Spec:** `docs/superpowers/specs/2026-09-30-codex-plugin-cc-v1.5.0-design.md` (rev. 6). Codex's comparison with the sister plugin: `docs/superpowers/reports/v1.5.0/` after the release; until then `.superpowers/sdd/2026-09-30-codex-plugin-cc-v1.5.0/codex-compare-{S2,S3}.md`
 
 ## Global Constraints
 
@@ -29,7 +29,7 @@
 
 1. **Arguments are data, never shell.** A focus line equal to the heredoc delimiter, a focus that contains `--background` or `--model x`, apostrophes, quotes and line breaks all reach the prompt as typed and start nothing (S3a.1 runtime tests, S3b.6 scan test over every command file, the `investigate --background handling` test).
 2. **The await/rescue path stays unbounded, and everything else stays under 8192 bytes.** `task --await` and `result <id> --wait` print the full record as in 1.4.3; every other `status`/`result` output — the bottom-out view, the active-job hint, the `--output` receipt — is measured (S2.1 oversized `nextStep`/id/receipt tests; S2.4 `result --wait --timeout-ms 100 --json` keeps the full prompt; `task --await --json` has no `truncated` key).
-3. **`--output` never overwrites or follows.** An existing file, directory, symlink or dangling symlink is refused, before a wait starts; a failed write removes only the file this call created; exit codes 1 and 3 of the underlying command survive next to the receipt (S2.1 unit tests, S2.3/S2.4 runtime tests).
+3. **`--output` never overwrites or follows.** An existing file, directory, symlink or dangling symlink is refused, before a wait starts; a failed write removes nothing and names the partial file; exit codes 1 and 3 of the underlying command survive next to the receipt (S2.1 unit tests, S2.3/S2.4 runtime tests).
 4. **The split moved the paths, not the behaviour.** `ROOT_DIR` is one level deeper in `lib/cli.mjs`; `COMPANION_SCRIPT` must equal the path the reaper, the worker command line and the stop gate match on; `argvTokenizedFromStdin` stays in the module of both functions that use it (S1.1 `cli.test`, S1.3 proof a–f).
 5. **A background review leaves nothing behind and is cancelled by the task rules.** A bad `--base` or a missing `codex` records no job and starts no app-server; a queued-window cancel removes the request file holding `--config` values; a brokered cancel interrupts the turn and kills nothing, a direct-fallback one kills only its own worker; a worker that cannot start fails the job with its reason and never writes the request file's content to the log; a healthy worker's log still holds only timestamped lines (S3a.2, S3b.1, S3b.3, S3b.4, S3b.5).
 
@@ -5125,7 +5125,7 @@ outputs only (flags, JSON fields, exit codes, printed lines): no `scripts/lib/` 
 - Review context past the caps is only listed or cut; findings there depend on the model's own git reads; the built-in reviewer has no plugin-side cap (spec §Limits)
 - No wall-clock limit per job; use `--turn-timeout-ms` (spec §Limits)
 - The built-in reviewer never returns a schema-shaped `result` (spec §Limits)
-- `--output` on Windows does not set mode 0600; a crash between create and write can leave a partial file; the path must be free when the command starts (spec §Limits)
+- `--output` on Windows does not set mode 0600; a crash or a failed write leaves a partial file, named in the error, which the next export to that path refuses; the path must be free when the command starts (spec §Limits)
 - A review reply that only quotes a JSON object is read as that object; if it has the review shape it is shown as the review — `--json` carries the raw reply in `rawOutput` (spec §Limits)
 ```
 
