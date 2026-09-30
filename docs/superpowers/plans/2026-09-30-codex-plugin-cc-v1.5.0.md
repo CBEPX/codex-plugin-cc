@@ -8,7 +8,7 @@
 
 **Tech Stack:** Node 18.18+ ESM, zero runtime deps, `node:test`, the fake Codex fixture, `rg`.
 
-**Spec:** `docs/superpowers/specs/2026-09-30-codex-plugin-cc-v1.5.0-design.md` (rev. 4). Codex's comparison with the sister plugin: `docs/superpowers/reports/v1.5.0/` after the release; until then `.superpowers/sdd/2026-09-30-codex-plugin-cc-v1.5.0/codex-compare-{S2,S3}.md`
+**Spec:** `docs/superpowers/specs/2026-09-30-codex-plugin-cc-v1.5.0-design.md` (rev. 5). Codex's comparison with the sister plugin: `docs/superpowers/reports/v1.5.0/` after the release; until then `.superpowers/sdd/2026-09-30-codex-plugin-cc-v1.5.0/codex-compare-{S2,S3}.md`
 
 ## Global Constraints
 
@@ -2859,20 +2859,31 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
 MSG
 ```
 
-### Task S3a.3 (Sonnet): #583 structured output wrapped in one markdown fence
+### Task S3a.3 (Sonnet): #583 recover structured output from a fence or prose, as the sister plugin does
 
 **Files:**
-- Modify `plugins/codex/scripts/lib/codex.mjs` (`parseStructuredOutput`, L1469-1494).
+- Modify `plugins/codex/scripts/lib/codex.mjs` (`parseStructuredOutput`, L1469-1494). It stays in `codex.mjs`: that module is not a leaf (`module-boundaries.test.mjs:11` `LEAVES`), and its only production caller imports it from there. No new module.
 - Create `tests/codex-structured-output.test.mjs`.
 
 **Interfaces:**
-- Consumes: nothing new.
-- Produces: `parseStructuredOutput(rawOutput, fallback)` keeps its signature and return shape `{ parsed, parseError, rawOutput, ...fallback }`.
-  - When `JSON.parse(rawOutput)` fails, it tries `JSON.parse` on capture 1 of `/^\s*```[A-Za-z0-9_+-]*[ \t]*\r?\n([\s\S]*?)\r?\n?```\s*$/` (a fence around the whole message only).
-  - `rawOutput` stays the raw message.
-  - When the fenced body is malformed too, `parseError` is the error of the raw message's parse, as before. The test pins only `parsed === null` and a non-empty `parseError`.
-  - Prose, prose around a fence and empty output fail as today.
-- Probe of the regex on HEAD's Node: json/untagged/CRLF fences and a string with ``` inside all capture the JSON; prose around a fence does not match.
+- Consumes: nothing new. Port of `cc-plugin-codex/scripts/lib/structured-output.mjs` (HEAD 66846d9): `extractFirstJsonObject` L5-59 and the recovery chain of `parseStructuredOutput` L61-96. The sister's strings are not taken ("No output from Claude Code.", "Could not parse structured JSON output from Claude Code.").
+- Produces: `parseStructuredOutput(rawOutput, fallback)` keeps its signature, its return shape `{ parsed, parseError, rawOutput, ...fallback }` and its empty-output behaviour (`!rawOutput` → `fallback.failureMessage ?? "Codex did not return a final structured message."`). The recovery order on the trimmed message:
+  1. The whole message parsed as JSON.
+  2. The first fenced block anywhere in the message: `/```(?:json)?\s*\n([\s\S]*?)\r?\n```/`.
+     - This is the sister's regex, except the closing `\n` became `\r?\n`, so a CRLF block's `\r` is not captured.
+     - The sister's own regex also handles CRLF (its `\s*` eats the opening `\r`, and `JSON.parse` tolerates the captured trailing `\r`); the `\r?` just keeps the capture clean.
+     - The spec's anchored whole-message regex is dropped: every row of the spec table passes with the unanchored one (probe).
+  3. The first balanced `{…}` that parses (module-private `extractFirstJsonObject(text): object | null`).
+     - The scan knows JSON strings and `\` escapes, so braces inside strings do not count.
+     - A candidate that fails to parse moves the scan to the next `{`.
+  - `rawOutput` is always the raw, untrimmed message.
+  - When nothing parses, `parseError` is the whole message's `JSON.parse` error message, as today. Malformed JSON, prose without an object and empty output still fail.
+- Accepted risk, pinned by a test: a prose reply that quotes an object is parsed as that object. If the quoted object has the review shape, it is rendered as the review.
+- The consumer already guards against wrong shapes, so nothing is planned there. The only caller is `executeReviewRun` (today `codex-companion.mjs:594-632`), which stores `result: parsed.parsed`, `parseError` and `rawOutput` and renders with `renderReviewResult`.
+  - That renderer validates the shape (`render.mjs:26-43` `validateReviewResultShape`: string `verdict`, string `summary`, array `findings`, array `next_steps`). A wrong-shaped object gets `Codex returned JSON with an unexpected review shape.` with `- Validation error: …` and the raw final message (`render.mjs:237-255`, pinned by `tests/render.test.mjs:25`). It is never rendered as an empty or "no findings" review.
+  - `result` prints the stored `rendered` (`render.mjs:400`). The job summary falls back to `firstMeaningfulLine` when `summary` is missing (today `codex-companion.mjs:632`).
+  - The stop gate does not use `parseStructuredOutput` (it reads `ALLOW:`/`BLOCK:`, `stop-review-gate-hook.mjs:119-123`).
+  - One gap stays, and it predates this change for bare wrong-shaped JSON: in `--json`, a wrong-shaped object appears as `result` with `parseError: null`.
 
 - [ ] **Step 1: Failing test.** Create `tests/codex-structured-output.test.mjs`:
 
@@ -2884,30 +2895,38 @@ import { parseStructuredOutput } from "../plugins/codex/scripts/lib/codex.mjs";
 
 const REVIEW = { verdict: "approve", summary: "No material issues found.", findings: [], next_steps: [] };
 const BODY = JSON.stringify(REVIEW);
+const TICKS = { ...REVIEW, summary: "use ``` fences" };
 
-test("parseStructuredOutput accepts bare JSON and one fence around the whole message (#583)", () => {
+// Recovery chain ported from cc-plugin-codex (#583): whole message, first fenced
+// block, first balanced object that parses. rawOutput is always the raw message.
+test("parseStructuredOutput recovers JSON from the whole message, a fenced block or embedded prose (#583)", () => {
   const rows = [
-    ["bare", BODY],
-    ["json fence", "```json\n" + BODY + "\n```"],
-    ["untagged fence", "```\n" + BODY + "\n```"],
-    ["CRLF fence with surrounding whitespace", "\r\n```json\r\n" + BODY + "\r\n```\r\n"]
+    ["bare", BODY, REVIEW],
+    ["json fence", "```json\n" + BODY + "\n```", REVIEW],
+    ["untagged fence", "```\n" + BODY + "\n```", REVIEW],
+    ["CRLF fence with surrounding whitespace", "\r\n```json\r\n" + BODY + "\r\n```\r\n", REVIEW],
+    ["backticks inside a string", "```json\n" + JSON.stringify(TICKS) + "\n```", TICKS],
+    ["fenced block after a prose preface", "Here is my review:\n\n```json\n" + BODY + "\n```\nThanks.", REVIEW],
+    ["a fenced block wins over an earlier prose object", "Format: {\"verdict\":\"x\"}.\n```json\n" + BODY + "\n```", REVIEW],
+    ["prose with one embedded object", "Now I have all the evidence.\n\n" + BODY + "\n", REVIEW],
+    ["broken first object, valid later one", 'prefix {"bad": } middle {"ok":true}', { ok: true }],
+    ["braces inside a JSON string", 'noise {"message":"brace: \\"{\\"","nested":{"ok":true}} tail', { message: 'brace: "{"', nested: { ok: true } }],
+    ["nested objects", 'Intro\n\n{"ok":true,"nested":{"a":1}}\n', { ok: true, nested: { a: 1 } }]
   ];
-  for (const [label, raw] of rows) {
+  for (const [label, raw, expected] of rows) {
     const result = parseStructuredOutput(raw, { status: 0 });
-    assert.deepEqual(result.parsed, REVIEW, label);
+    assert.deepEqual(result.parsed, expected, label);
     assert.equal(result.parseError, null, label);
     assert.equal(result.rawOutput, raw, `${label}: rawOutput stays the raw message`);
     assert.equal(result.status, 0, `${label}: fallback fields still spread`);
   }
-  const ticks = { ...REVIEW, summary: "use ``` fences" };
-  assert.deepEqual(parseStructuredOutput("```json\n" + JSON.stringify(ticks) + "\n```").parsed, ticks, "backticks inside a string");
 });
 
-test("parseStructuredOutput still fails on malformed JSON, prose and empty output", () => {
+test("parseStructuredOutput still fails on malformed JSON, prose without an object and empty output", () => {
   const rows = [
     ["malformed inside a fence", "```json\n{not json}\n```"],
-    ["prose", "Looks good to me."],
-    ["prose around a fence", "Result:\n```json\n" + BODY + "\n```"]
+    ["truncated object", '{"verdict":"approve","summary":'],
+    ["prose without an object", "Looks good to me."]
   ];
   for (const [label, raw] of rows) {
     const result = parseStructuredOutput(raw);
@@ -2918,17 +2937,75 @@ test("parseStructuredOutput still fails on malformed JSON, prose and empty outpu
   const empty = parseStructuredOutput("", {});
   assert.deepEqual([empty.parsed, empty.parseError, empty.rawOutput], [null, "Codex did not return a final structured message.", ""]);
 });
+
+// Accepted risk (spec §Limits): a reply that only quotes an object is read as
+// that object. A quoted review-shaped object therefore renders as a review.
+test("parseStructuredOutput takes an object quoted in prose as the answer", () => {
+  const raw = `The expected format is ${BODY}, but I could not finish the review.`;
+  const result = parseStructuredOutput(raw);
+  assert.deepEqual(result.parsed, REVIEW);
+  assert.equal(result.parseError, null);
+  assert.equal(result.rawOutput, raw);
+});
 ```
 
-- [ ] **Step 2:** `node --import ./tests/test-env.mjs --test tests/codex-structured-output.test.mjs` → FAIL in the first test at `json fence` (`parsed` is `null`, expected the review object). The second test passes (a pin).
+- [ ] **Step 2:** `node --import ./tests/test-env.mjs --test tests/codex-structured-output.test.mjs` → FAIL: the first test at `json fence` (`parsed` is `null`, expected the review object); the third test (`null` instead of the review object). The second test passes: it pins behaviour that must not change.
 
 - [ ] **Step 3: Implement.** Replace L1469-1494 of `lib/codex.mjs` with:
 
 ```js
-// A whole message wrapped in one markdown fence (```json … ```), which models
-// sometimes return despite the output schema (#583). Only a fence around
-// everything matches; prose around it still fails.
-const FENCED_JSON_PATTERN = /^\s*```[A-Za-z0-9_+-]*[ \t]*\r?\n([\s\S]*?)\r?\n?```\s*$/;
+// Codex sometimes wraps its schema answer in a markdown fence or in prose (#583).
+// Recovery, ported from cc-plugin-codex: the whole message, else the first
+// fenced block, else the first balanced `{…}` that parses. A reply that only
+// quotes an object is therefore read as that object (spec §Limits).
+const FENCED_BLOCK_PATTERN = /```(?:json)?\s*\n([\s\S]*?)\r?\n```/;
+
+// First balanced `{…}` in `text` that parses. The scan knows JSON strings and
+// `\` escapes, so braces inside strings do not count; a candidate that fails to
+// parse moves the scan to the next `{`.
+function extractFirstJsonObject(text) {
+  for (let start = text.indexOf("{"); start !== -1; start = text.indexOf("{", start + 1)) {
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    for (let index = start; index < text.length; index += 1) {
+      const char = text[index];
+      if (inString) {
+        if (escaped) {
+          escaped = false;
+        } else if (char === "\\") {
+          escaped = true;
+        } else if (char === "\"") {
+          inString = false;
+        }
+        continue;
+      }
+      if (char === "\"") {
+        inString = true;
+      } else if (char === "{") {
+        depth += 1;
+      } else if (char === "}") {
+        depth -= 1;
+        if (depth === 0) {
+          try {
+            return JSON.parse(text.slice(start, index + 1));
+          } catch {
+            break;
+          }
+        }
+      }
+    }
+  }
+  return null;
+}
+
+function tryParseJson(text) {
+  try {
+    return { ok: true, value: JSON.parse(text) };
+  } catch (error) {
+    return { ok: false, error };
+  }
+}
 
 export function parseStructuredOutput(rawOutput, fallback = {}) {
   if (!rawOutput) {
@@ -2940,44 +3017,31 @@ export function parseStructuredOutput(rawOutput, fallback = {}) {
     };
   }
 
-  try {
-    return {
-      parsed: JSON.parse(rawOutput),
-      parseError: null,
-      rawOutput,
-      ...fallback
-    };
-  } catch (error) {
-    const fenced = FENCED_JSON_PATTERN.exec(rawOutput);
-    if (fenced) {
-      try {
-        return {
-          parsed: JSON.parse(fenced[1]),
-          parseError: null,
-          rawOutput,
-          ...fallback
-        };
-      } catch {
-        // Malformed inside the fence too: report the message's own error, as before.
-      }
-    }
-    return {
-      parsed: null,
-      parseError: error.message,
-      rawOutput,
-      ...fallback
-    };
+  const text = rawOutput.trim();
+  const whole = tryParseJson(text);
+  if (whole.ok) {
+    return { parsed: whole.value, parseError: null, rawOutput, ...fallback };
   }
+  const fenced = FENCED_BLOCK_PATTERN.exec(text);
+  const fromFence = fenced ? tryParseJson(fenced[1]) : null;
+  if (fromFence?.ok) {
+    return { parsed: fromFence.value, parseError: null, rawOutput, ...fallback };
+  }
+  const embedded = extractFirstJsonObject(text);
+  if (embedded !== null) {
+    return { parsed: embedded, parseError: null, rawOutput, ...fallback };
+  }
+  return { parsed: null, parseError: whole.error.message, rawOutput, ...fallback };
 }
 ```
 
-- [ ] **Step 4:** `node --import ./tests/test-env.mjs --test tests/codex-structured-output.test.mjs tests/runtime-review.test.mjs tests/render.test.mjs` → all pass.
+- [ ] **Step 4:** `node --import ./tests/test-env.mjs --test tests/codex-structured-output.test.mjs tests/runtime-review.test.mjs tests/render.test.mjs` → all pass (`render.test.mjs:25`, the unexpected-shape rendering, is unchanged). `lib/codex.mjs` is typechecked (`tsconfig.app-server.json`): the new functions use no typed API.
 
 - [ ] **Step 5: Commit** (gate chain):
 
 ```bash
 npm run check && sleep 10 && [ "$(pgrep -f codex-plugin-test- | wc -l | tr -d ' ')" = 0 ] && git add plugins/codex/scripts/lib/codex.mjs tests/codex-structured-output.test.mjs && git commit -F - <<'MSG'
-fix(review): parse structured output wrapped in one markdown code fence (#583)
+fix(review): recover structured output from a code fence or surrounding prose (#583)
 
 Co-authored-by: andyli953 <189941205+andyli953@users.noreply.github.com>
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
@@ -4992,7 +5056,7 @@ outputs only (flags, JSON fields, exit codes, printed lines): no `scripts/lib/` 
 
   Keep the line `It uses the same review target selection as \`/codex:review\`, including \`--base <ref>\` for branch review.` and the three examples unchanged (pinned). After `This command is read-only. It does not fix code.` add:
 
-  "Large inputs are capped: untracked files are inlined up to 262144 bytes in total (the rest are listed by name with an `untracked file(s) omitted` line; an untracked symlink is listed as `(skipped: symlink)` and never read through), and a prompt over 786432 characters is cut at a line boundary with a `[Repository context truncated at <N> characters: …]` marker, after which the reviewer is told to read the target itself with read-only git commands. A reply wrapped in a Markdown code fence is parsed as JSON like a bare one."
+  "Large inputs are capped: untracked files are inlined up to 262144 bytes in total (the rest are listed by name with an `untracked file(s) omitted` line; an untracked symlink is listed as `(skipped: symlink)` and never read through), and a prompt over 786432 characters is cut at a line boundary with a `[Repository context truncated at <N> characters: …]` marker, after which the reviewer is told to read the target itself with read-only git commands. The structured result is read from a bare JSON reply, from the first fenced code block in the reply, or else from the first complete JSON object in its text; a reply with none of these shows `Codex did not return valid structured JSON.` with the raw final message."
 
 - [ ] **Step 3: README `/codex:status`.** After the paragraph that starts `\`status <id> --wait [--timeout-ms <ms>]\` blocks until` add:
 
@@ -5038,7 +5102,7 @@ outputs only (flags, JSON fields, exit codes, printed lines): no `scripts/lib/` 
 - Focus text given to a review through `--args-stdin` reaches the prompt exactly as typed: apostrophes, quotes, backslashes and line breaks are no longer split or dropped (upstream #714).
 - `--base <ref>` that does not resolve to a commit, or that starts with `-`, fails with `Base ref "<ref>" not found in this repository; …` before a job is recorded, instead of reviewing a wide or empty diff (upstream #653, PR #658).
 - The adversarial review prompt is capped: untracked content past 262144 bytes is listed by name, and a prompt over 786432 characters is cut at a line boundary with a marker and the reviewer reads the target itself (upstream #405, PR #461).
-- A review reply wrapped in a Markdown code fence is parsed as structured output (upstream #583).
+- The adversarial review reads its structured result when Codex wraps the JSON in a code fence (with or without the `json` tag, LF or CRLF), puts prose before or after it, or embeds the object in prose: the first fenced block wins, otherwise the first complete JSON object in the text (upstream #583; recovery as in the sister plugin).
 - **Security:** every command file passed the slash-command arguments through a heredoc with the fixed delimiter `CODEX_ARGS`; an argument line equal to it ended the heredoc and ran the following lines on the host shell. The delimiter is now `CODEX_ARGS_` + 8 random hex characters chosen so that no argument line equals it (the rule `/codex:rescue` already used). Present since `--args-stdin` was introduced.
 - An untracked symlink is no longer read into the adversarial review context (a link to a file outside the repository put that file into the prompt); it is listed as `(skipped: symlink)`.
 - The inline diff of an adversarial review is read within the inline limit; a diff that grew past it between measuring and reading falls back to self-collection instead of failing with `ENOBUFS`.
@@ -5062,7 +5126,7 @@ outputs only (flags, JSON fields, exit codes, printed lines): no `scripts/lib/` 
 - No wall-clock limit per job; use `--turn-timeout-ms` (spec §Limits)
 - The built-in reviewer never returns a schema-shaped `result` (spec §Limits)
 - `--output` on Windows does not set mode 0600; a crash between create and write can leave a partial file; the path must be free when the command starts (spec §Limits)
-- A review reply with JSON embedded in prose is not parsed as structured output; only a bare object or a fence around the whole reply is (spec §Limits)
+- A review reply that only quotes a JSON object is read as that object; if it has the review shape it is shown as the review — `--json` carries the raw reply in `rawOutput` (spec §Limits)
 ```
 
   The gate's changelog check needs a section for the package version (still 1.4.3, present) and byte-equal copies, so it passes before the bump.

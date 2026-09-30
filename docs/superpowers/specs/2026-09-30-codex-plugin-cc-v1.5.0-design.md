@@ -1,6 +1,6 @@
 # codex-plugin-cc v1.5.0 — companion split, bounded read views, review surface
 
-Date: 2026-09-30 (rev. 4, 2026-09-30)
+Date: 2026-09-30 (rev. 5, 2026-09-30)
 
 ## Goal
 
@@ -9,7 +9,7 @@ v1.5.0 ships four scopes on `main` 0fa5e8d (v1.4.3):
 - **S0** two housekeeping fixes (AGENTS.md install rule, a Windows fixture race).
 - **S1** stage B split of `plugins/codex/scripts/codex-companion.mjs` (1496 lines at HEAD) with no runtime change.
 - **S2** bounded `status`/`result` output (port of cc-plugin-codex v1.7.5 `read-views`, adapted).
-- **S3** the review surface: #615 `--background`, #522 focus on `/codex:review`, #714 verbatim focus, #653 base validation, #529 persisted threads, #405 prompt caps, #583 fenced JSON, #679 built-in `--json` shape.
+- **S3** the review surface: #615 `--background`, #522 focus on `/codex:review`, #714 verbatim focus, #653 base validation, #529 persisted threads, #405 prompt caps, #583 structured output recovered from a fence or prose, #679 built-in `--json` shape.
 
 Success means all of the following:
 - `status --json` of a workspace whose index holds a 53.7 KB prompt prints ≤ 8192 bytes of valid JSON (controller's measurement: 53.7 KB of a 99 KB `state.json`).
@@ -225,7 +225,12 @@ Transport is decided per run by the existing `withAppServer`: broker when reacha
   - 256 KiB matches the inline-diff cap (`git.mjs:9`) and upstream #461. The worst inline case (256 KiB of diff plus 256 KiB of untracked content plus status) fits under the ceiling, so the ceiling fires only on huge status, log or file lists (a months-long `--base`, tens of thousands of untracked files).
   - The 25 % margin covers the template and schema. JS `length` counts UTF-16 units, which is ≥ code points, so the check errs on the safe side.
 
-**#583 fenced JSON.** `parseStructuredOutput` tries `JSON.parse` on the capture of `^\s*```[A-Za-z0-9_+-]*[ \t]*\r?\n([\s\S]*?)\r?\n?```\s*$`, which only matches a fence around the whole message (the upstream #583 rule). `rawOutput` stays the raw message. Prose, malformed JSON and empty output fail as today.
+**#583 structured output, recovered as the sister plugin does** (user ruling; the upstream #583 rule — a fence around the whole message — is a special case). `parseStructuredOutput` (`lib/codex.mjs`) tries, on the trimmed message, in order:
+1. the whole message as JSON;
+2. the first fenced block anywhere, `/```(?:json)?\s*\n([\s\S]*?)\r?\n```/` (LF or CRLF);
+3. the first balanced `{…}` that parses — a scan that knows JSON strings and `\` escapes and moves to the next `{` when a candidate fails.
+
+`rawOutput` stays the raw message. Malformed or truncated JSON, prose with no object and empty output fail as today, with today's texts. A parsed object that is not a review is already caught downstream: the renderer validates the shape and prints `Codex returned JSON with an unexpected review shape.` with the validation error and the raw final message (`render.mjs:26-43`, `:237-255`), so a wrong-shaped object is never shown as an empty review.
 
 **#679 built-in `--json` shape.**
 - `exitedReviewMode` delivers only a string (`codex.mjs:516`), so a result in the schema's shape is impossible without guessing.
@@ -317,7 +322,7 @@ Transport is decided per run by the existing `withAppServer`: broker when reacha
   - an untracked symlink to a file outside the repository is skipped and none of the target's content is in the context (both modes);
   - a diff larger than the bound at the read gives self-collect context, not an exception (working tree and branch).
 - Prompt ceiling: unit test of `buildAdversarialReviewPrompt` with a 1 MB context → ≤ 786432 characters, the marker line and the self-collect text.
-- New `codex-structured-output.test.mjs` (port of #583's table): bare, `json`-fenced, untagged fence, CRLF, backticks inside a string, malformed, prose, empty.
+- New `codex-structured-output.test.mjs`: bare, `json`-fenced, untagged fence, CRLF, backticks inside a string, empty; from the sister — a fenced block after a prose preface, a fenced block that wins over an earlier object in the prose, prose with one embedded object, a broken first object followed by a valid one, braces inside a JSON string, nested objects; still failing — malformed JSON inside a fence, a truncated object, prose without an object; and the accepted-risk row: a reply that only quotes a review-shaped object is parsed as that review.
 - `render.test.mjs`: the `Focus:` line; a stored built-in review with `parseError` renders `rendered`.
 - `runtime-cancel.test.mjs`, new tests:
   - brokered background built-in review (`FAKE_CODEX_REVIEW_DELAY_MS`) → interrupt, then `cancelled`, `transport: "broker"`, nothing killed (posix, `{ timeout: 90_000 }`);
@@ -352,7 +357,7 @@ Transport is decided per run by the existing `withAppServer`: broker when reacha
 - **No wall-clock limit per job** (#615 defect 3). Use `--turn-timeout-ms`.
 - **The built-in reviewer never returns a schema-shaped `result`** (#679). `parseError` says so.
 - **Persisted review threads write rollouts** to `~/.codex/sessions`. `codex resume <id>` now works for them; they are never `--resume-last` candidates.
-- **Structured output: only a fence around the whole message is unwrapped.** The sister also recovers a JSON object embedded in prose; that is not ported, because a prose reply that quotes an object would be taken for the review result.
+- **A reply that only quotes a JSON object is read as that object.** If the quoted object has the review shape it is shown as the review; `--json` carries the raw final message in `rawOutput` for checking. In `--json`, a parsed object of the wrong shape appears as `result` with `parseError: null` (pre-existing for bare JSON).
 - **The sister's throwaway review worktree is not ported.** It contains a reviewer that can write; here the reviewer runs in Codex's read-only sandbox.
 - **`--output` must name a path that is free when the command starts.** `status <id> --wait --output` refuses an occupied path before waiting, even if it would be free by the end of the wait. A path so long that its receipt would exceed 8192 bytes is refused.
 - **`--output` has limits of its own.** Windows ignores the 0600 mode; the symlink-refusal test is posix-only; every export needs a new path. A crash between create and write can leave a partial file.
@@ -378,7 +383,7 @@ Transport is decided per run by the existing `withAppServer`: broker when reacha
   - #714 focus mangling;
   - #653 unresolved `--base` (and a `-`-leading ref);
   - #405 unbounded adversarial prompt;
-  - #583 fenced JSON;
+  - #583 structured output in a fence or in prose;
   - the fixed heredoc delimiter in every command file (an argument line equal to it ran the rest on the host shell);
   - untracked symlinks followed into the review context; the unbounded inline diff read;
   - a detached worker's startup failure lost its reason.
@@ -408,3 +413,4 @@ Transport is decided per run by the existing `withAppServer`: broker when reacha
 | 2 | 2026-09-30 | user review of rev. 1; CI 36700963516 | `/codex:result` shows the preview and does not re-run with `--wait` on its own; `status <id> --wait` confirmed bounded; S0(a) is committed; S0(c) broker idle-timeout test added |
 | 3 | 2026-09-30 | plan writers' code reading; controller rulings on S2 | first shrink step 4096 instead of 512; a summary drop alone prints no `Truncated:` block in text mode; `--output` is checked before a `status --wait` starts waiting; S1 residue, entry allow-list and exports corrected; test sites `runtime-task:955-966`, `:1081-1084` (via `--output`), `commands.test:213` added; line references corrected; limit "focus text is never cut" added |
 | 4 | 2026-09-30 | user: compare with the sister plugin; Codex (gpt-6.1-sol) read the plan against cc-plugin-codex 66846d9 | random heredoc delimiter in every command file; untracked symlinks skipped; inline diff read bounded; worker stdout/stderr to the job log and `worker could not start: …` (one spawn option changes, threat model walked); bottom-out view measured, receipt preflight, own-property projection; first shrink step 512 for summary views and 4096 only for the `result` preview; summary-dropped arrays counted; depth nulls count as shortened in text; mode flags only before the focus; sister regressions and the concurrent-review cancel test added; limits: prose-embedded JSON and the review worktree not ported, `--output` path free at start |
+| 5 | 2026-09-30 | user ruling at plan review | structured output is recovered as in the sister plugin (first fenced block, then the first JSON object in prose) instead of the strict whole-message fence; `Co-authored-by` with noreply addresses and the worker-diagnostics task confirmed |
