@@ -8,7 +8,7 @@ import { saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle
 import { DEAD_WORKER_MESSAGE, filterJobsForSession, SESSION_ID_ENV } from "../plugins/codex/scripts/lib/tracked-jobs.mjs";
 import assert from "node:assert/strict";
 
-import { brokerExclusion, brokerPresence, cancelDecision, commitCancel, isWorkerProvedRecord, isWorkerTerminalRecord } from "../plugins/codex/scripts/lib/job-control.mjs";
+import { brokerExclusion, brokerPresence, buildStatusSnapshot, cancelDecision, commitCancel, isWorkerProvedRecord, isWorkerTerminalRecord } from "../plugins/codex/scripts/lib/job-control.mjs";
 import { emitCancelPending, renderCancelPending } from "../plugins/codex/scripts/lib/render.mjs";
 
 const SURVIVORS = [{ pid: 4301, identity: "win32:7" }];
@@ -241,4 +241,26 @@ test("filterJobsForSession: keeps the current session's jobs, or all jobs withou
   } finally {
     if (original !== undefined) process.env[SESSION_ID_ENV] = original;
   }
+});
+
+// Twelve finished jobs, newest first by `updatedAt`; the last two belong to another session.
+function seedFinishedJobs(workspace) {
+  const stateDir = resolveStateDir(workspace);
+  fs.mkdirSync(path.join(stateDir, "jobs"), { recursive: true });
+  const jobs = Array.from({ length: 12 }, (_, index) => {
+    const at = `2026-03-18T15:${String(59 - index).padStart(2, "0")}:00.000Z`;
+    return { id: `task-${String(index).padStart(2, "0")}`, status: "completed", jobClass: "task", sessionId: index < 10 ? "sess-a" : "sess-b", createdAt: at, updatedAt: at };
+  });
+  fs.writeFileSync(path.join(stateDir, "state.json"), `${JSON.stringify({ version: 1, config: {}, jobs }, null, 2)}\n`, "utf8");
+}
+
+test("buildStatusSnapshot counts the session's jobs and the finished ones past the list", () => {
+  const workspace = makeTempDir();
+  seedFinishedJobs(workspace);
+  const listed = buildStatusSnapshot(workspace, { env: {} });
+  assert.deepEqual([listed.totalJobs, listed.omittedJobs, listed.latestFinished.id, listed.recent.length], [12, 4, "task-00", 7]);
+  const all = buildStatusSnapshot(workspace, { env: {}, all: true });
+  assert.deepEqual([all.totalJobs, all.omittedJobs, all.recent.length], [12, 0, 11]);
+  const otherSession = buildStatusSnapshot(workspace, { env: { [SESSION_ID_ENV]: "sess-b" } });
+  assert.deepEqual([otherSession.totalJobs, otherSession.omittedJobs], [2, 0]);
 });
