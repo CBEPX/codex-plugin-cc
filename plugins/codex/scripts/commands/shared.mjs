@@ -92,9 +92,11 @@ function outputActiveJobHint(snapshot, leadIn, asJson, readView = null) {
   const resumeCommand = buildResumeWaitCommand(snapshot.job.id);
   const payload = { ...snapshot, resumeCommand };
   if (readView) {
-    // Rendered from the projection, never the captured strings, so a huge id or
-    // companion path shrinks with the view. Only `result` without --wait passes
-    // a read view, and its lead-in is exactly this line.
+    // Rendered from the projection, never the captured strings, so a long
+    // companion path shrinks with the view. A very long id does not: the next
+    // step repeats it unprojected, so that case ends in the measured bottom-out.
+    // Only `result` without --wait passes a read view, and its lead-in is
+    // exactly this line.
     outputReadView(
       payload,
       (view) => `Job ${view.job.id} is still ${view.job.status}. Re-run: ${view.resumeCommand}\n`,
@@ -123,8 +125,9 @@ export async function waitForTerminalJobOrHint(cwd, reference, options = {}) {
   return null;
 }
 
-// Prints exactly what `result <reference>` prints — the awaited task path reuses
+// Prints what `result <reference> --wait` prints — the awaited task path reuses
 // it so both commands stay on one rendering — and returns the resolved job.
+// Without a `readView` the output is exactly that full record.
 // `readView` (only `result` without `--wait` passes one) bounds the output to
 // PUBLIC_READ_BYTES or exports it (rows 3, 4, 7); `result --wait` and
 // `task --await` pass none and print the full record (rows 5, 6).

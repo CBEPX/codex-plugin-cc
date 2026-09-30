@@ -856,6 +856,29 @@ test("result on an active job with a 3000-character id stays bounded with exit 3
   }
 });
 
+test("result on an active job with a 5000-character id ends in the measured bottom-out with exit 3", () => {
+  const workspace = makeTempDir();
+  const stateDir = resolveStateDir(workspace);
+  fs.mkdirSync(path.join(stateDir, "jobs"), { recursive: true });
+  const id = `task-${"x".repeat(5000)}`;
+  const job = { id, kind: "task", jobClass: "task", status: "running", phase: "running", title: "Codex Task", summary: "long id", createdAt: "2026-03-18T15:30:00.000Z", updatedAt: "2026-03-18T15:30:02.000Z" };
+  fs.writeFileSync(path.join(stateDir, "state.json"), `${JSON.stringify({ version: 1, config: { stopReviewGate: false }, jobs: [job] }, null, 2)}\n`, "utf8");
+  const text = run(process.execPath, [SCRIPT, "result", id], { cwd: workspace });
+  assert.equal(text.status, 3, text.stderr);
+  assert.ok(bytes(text.stdout) <= READ_LIMIT, `${bytes(text.stdout)} bytes`);
+  assert.equal(text.stdout, `Truncated: output exceeds ${READ_LIMIT} bytes.\n${STATUS_NEXT}\n`);
+  const json = run(process.execPath, [SCRIPT, "result", id, "--json"], { cwd: workspace });
+  assert.equal(json.status, 3, json.stderr);
+  assert.ok(bytes(json.stdout) <= READ_LIMIT, `${bytes(json.stdout)} bytes`);
+  const view = JSON.parse(json.stdout);
+  assert.deepEqual(Object.keys(view).sort(), ["nextStep", "omissions", "truncated"]);
+  assert.equal(view.truncated, true);
+  assert.equal(view.nextStep, STATUS_NEXT);
+  for (const key of ["fields", "records", "strings"]) {
+    assert.equal(typeof view.omissions[key], "number", key);
+  }
+});
+
 test("result of a 20 KB answer prints a bounded preview; --wait prints it in full; --wait --output is refused", { timeout: 60_000 }, () => {
   const repo = seededRepo();
   const binDir = makeTempDir();

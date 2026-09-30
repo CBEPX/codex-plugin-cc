@@ -167,7 +167,9 @@ export function assertOutputPathFree(outputPath, cwd) {
 // `--output <new-path>`: the full payload, exactly what `--json` printed before
 // 1.5.0, in a new owner-only file. O_CREAT|O_EXCL never overwrites and never
 // follows a symlink (a dangling one too): all of them are EEXIST. On Windows the
-// mode is ignored (the directory ACL applies) and `wx` stays exclusive.
+// mode is ignored (the directory ACL applies) and `wx` stays exclusive. A failed
+// write leaves the partial file and says so: removing it by path could delete an
+// entry another writer put there after the failure.
 export function exportReadPayload(payload, outputPath, cwd) {
   const outputFile = path.resolve(cwd, outputPath);
   const bytes = Buffer.from(`${JSON.stringify(payload, null, 2)}\n`, "utf8");
@@ -186,23 +188,18 @@ export function exportReadPayload(payload, outputPath, cwd) {
     }
     throw error;
   }
-  let created = null;
   try {
-    created = fs.fstatSync(fd, { bigint: true });
     fs.writeFileSync(fd, bytes);
     fs.closeSync(fd);
   } catch (error) {
     try {
       fs.closeSync(fd);
     } catch {}
-    // Remove only the file this call created: the path may name another entry by now.
-    try {
-      const current = fs.lstatSync(outputFile, { bigint: true });
-      if (created && current.dev === created.dev && current.ino === created.ino) {
-        fs.unlinkSync(outputFile);
-      }
-    } catch {}
-    throw error;
+    const reason = error instanceof Error ? error.message : String(error);
+    throw new Error(
+      `--output ${outputFile} was not written completely (${reason}); the partial file was left in place: remove it or pass a new path.`,
+      { cause: error }
+    );
   }
   return receipt;
 }

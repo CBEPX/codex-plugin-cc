@@ -284,28 +284,22 @@ test("a non-numeric omittedJobs cannot inflate the printed view", () => {
   assert.ok(bytes(text.text) <= PUBLIC_READ_BYTES, `${bytes(text.text)} bytes`);
 });
 
-test("exportReadPayload removes the file it created when the write fails", (t) => {
+test("exportReadPayload leaves the partial file and says so when the write fails", (t) => {
   const dir = makeTempDir();
-  t.mock.method(fs, "writeFileSync", (fd) => {
-    fs.writeSync(fd, "partial");
-    throw new Error("injected disk full");
-  });
-  assert.throws(() => exportReadPayload({ a: 1 }, "partial.json", dir), /injected disk full/);
-  assert.equal(fs.existsSync(path.join(dir, "partial.json")), false);
-});
-
-test("exportReadPayload keeps an entry that replaced its file before the failure", { skip: IS_WIN }, (t) => {
-  const dir = makeTempDir();
-  const outputFile = path.join(dir, "raced.json");
+  const outputFile = path.join(dir, "partial.json");
+  const injected = new Error("injected disk full");
   t.mock.method(fs, "writeFileSync", () => {
-    fs.renameSync(outputFile, `${outputFile}.moved`);
-    const other = fs.openSync(outputFile, "w");
-    fs.writeSync(other, "someone else's");
-    fs.closeSync(other);
-    throw new Error("injected after replace");
+    throw injected;
   });
-  assert.throws(() => exportReadPayload({ a: 1 }, outputFile, dir), /injected after replace/);
-  assert.equal(fs.readFileSync(outputFile, "utf8"), "someone else's", "only the file this call created may be removed");
+  assert.throws(() => exportReadPayload({ a: 1 }, "partial.json", dir), (error) => {
+    assert.equal(
+      error.message,
+      `--output ${outputFile} was not written completely (injected disk full); the partial file was left in place: remove it or pass a new path.`
+    );
+    assert.equal(error.cause, injected);
+    return true;
+  });
+  assert.equal(fs.readFileSync(outputFile, "utf8"), "", "nothing removes a file by path after a failed write");
 });
 
 test("assertOutputPathFree refuses any existing entry before a long wait", () => {
