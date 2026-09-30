@@ -4,7 +4,7 @@ import process from "node:process";
 
 import { applyArgsStdin, printUsage } from "./lib/cli.mjs";
 import { handleCancel } from "./commands/cancel.mjs";
-import { handleReview, handleReviewCommand } from "./commands/review.mjs";
+import { REVIEW_ARG_SPEC, handleReview, handleReviewCommand } from "./commands/review.mjs";
 import { handleSetup } from "./commands/setup.mjs";
 import { handleTaskWorker } from "./commands/shared.mjs";
 import { handleResult, handleStatus } from "./commands/status.mjs";
@@ -18,7 +18,8 @@ async function main() {
     return;
   }
 
-  const argv = applyArgsStdin(rawArgv);
+  // Review commands keep their focus text verbatim (#714); the rest split shell-like.
+  const argv = applyArgsStdin(rawArgv, subcommand === "review" || subcommand === "adversarial-review" ? REVIEW_ARG_SPEC : null);
 
   switch (subcommand) {
     case "setup":
@@ -29,8 +30,7 @@ async function main() {
       break;
     case "adversarial-review":
       await handleReviewCommand(argv, {
-        reviewName: "Adversarial Review",
-        acceptsFocusText: true
+        reviewName: "Adversarial Review"
       });
       break;
     case "task":

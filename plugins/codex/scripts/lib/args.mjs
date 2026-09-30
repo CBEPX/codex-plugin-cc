@@ -103,14 +103,20 @@ export function parseArgs(argv, config = {}) {
   return { options, positionals };
 }
 
-export function splitRawArgumentString(raw) {
+// The shell-like splitter, with each token's start/end offset in `raw`, so a
+// caller can take the rest of the raw string verbatim from any token.
+function tokenizeRawArguments(raw) {
   const tokens = [];
   let current = "";
+  let start = -1;
   let quote = null;
   let escaping = false;
 
   for (let index = 0; index < raw.length; index += 1) {
     const character = raw[index];
+    if (start === -1 && !/\s/.test(character)) {
+      start = index;
+    }
     if (escaping) {
       current += character;
       escaping = false;
@@ -143,9 +149,10 @@ export function splitRawArgumentString(raw) {
 
     if (/\s/.test(character)) {
       if (current) {
-        tokens.push(current);
-        current = "";
+        tokens.push({ value: current, start, end: index });
       }
+      current = "";
+      start = -1;
       continue;
     }
 
@@ -153,8 +160,47 @@ export function splitRawArgumentString(raw) {
   }
 
   if (current) {
-    tokens.push(current);
+    tokens.push({ value: current, start, end: raw.length });
   }
 
   return tokens;
+}
+
+export function splitRawArgumentString(raw) {
+  return tokenizeRawArguments(raw).map((token) => token.value);
+}
+
+// Review focus text is free prose (#714): split flags shell-like up to the first
+// positional (or `--`), then hand the rest of the raw string over as ONE token,
+// trimmed, with quotes, apostrophes, backslashes and newlines untouched. `spec`
+// is the parseArgs config; only valueOptions, repeatableOptions and aliasMap
+// matter here — they say which flag swallows the next token as its value.
+export function splitArgsWithVerbatimTail(raw, spec = {}) {
+  const takesValue = new Set([...(spec.valueOptions ?? []), ...(spec.repeatableOptions ?? [])]);
+  const aliasMap = spec.aliasMap ?? {};
+  const tokens = tokenizeRawArguments(raw);
+  const argv = [];
+
+  for (let index = 0; index < tokens.length; index += 1) {
+    const { value, start, end } = tokens[index];
+    if (value === "--") {
+      const tail = raw.slice(end).trim();
+      return tail ? [...argv, "--", tail] : [...argv, "--"];
+    }
+    if (!value.startsWith("-") || value === "-") {
+      return [...argv, raw.slice(start).trim()];
+    }
+    argv.push(value);
+    const isLong = value.startsWith("--");
+    if (isLong && value.includes("=")) {
+      continue;
+    }
+    const name = value.slice(isLong ? 2 : 1);
+    if (takesValue.has(aliasMap[name] ?? name) && index + 1 < tokens.length) {
+      index += 1;
+      argv.push(tokens[index].value);
+    }
+  }
+
+  return argv;
 }

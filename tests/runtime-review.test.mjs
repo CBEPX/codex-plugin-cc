@@ -349,3 +349,64 @@ test("review accepts slash-command style single-string arguments", () => {
   const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
   assert.deepEqual(fakeState.lastThreadStart.config, { model_provider: "ollama", model_reasoning_effort: "xhigh" });
 });
+
+// A repo on `feature` one commit ahead of `main`, clean, for `--base main`.
+function featureBranchRepo() {
+  const repo = seededRepo();
+  run("git", ["checkout", "-b", "feature"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "README.md"), "hello feature\n");
+  run("git", ["commit", "-am", "feature"], { cwd: repo });
+  return repo;
+}
+
+function focusLine(prompt) {
+  return prompt.slice(prompt.indexOf("User focus:"), prompt.indexOf("</task>"));
+}
+
+test("adversarial-review --args-stdin passes the focus text verbatim (#714)", () => {
+  const repo = featureBranchRepo();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+
+  const result = run(process.execPath, [SCRIPT, "adversarial-review", "--args-stdin"], {
+    cwd: repo,
+    env: buildEnv(binDir),
+    input: "--base main don't mangle \"this\"\nline 2\n"
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const prompt = JSON.parse(fs.readFileSync(statePath, "utf8")).lastTurnStart.prompt;
+  assert.ok(prompt.includes("Target: branch diff against main\n"), "the flags before the focus still apply");
+  assert.ok(prompt.includes("User focus: don't mangle \"this\"\nline 2\n</task>"), focusLine(prompt));
+});
+
+test("adversarial-review --args-stdin keeps a focus-only heredoc in one piece and takes -- as the end of flags", () => {
+  const repo = featureBranchRepo();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+
+  // One token after splitting: normalizeArgv must not re-split it.
+  const only = run(process.execPath, [SCRIPT, "adversarial-review", "--args-stdin"], { cwd: repo, env: buildEnv(binDir), input: "don't stop\n" });
+  assert.equal(only.status, 0, only.stderr);
+  let turn = JSON.parse(fs.readFileSync(statePath, "utf8")).lastTurnStart;
+  assert.ok(turn.prompt.includes("User focus: don't stop\n</task>"), focusLine(turn.prompt));
+
+  const dashed = run(process.execPath, [SCRIPT, "adversarial-review", "--args-stdin"], { cwd: repo, env: buildEnv(binDir), input: "-- --model is wrong\n" });
+  assert.equal(dashed.status, 0, dashed.stderr);
+  turn = JSON.parse(fs.readFileSync(statePath, "utf8")).lastTurnStart;
+  assert.ok(turn.prompt.includes("User focus: --model is wrong\n</task>"), focusLine(turn.prompt));
+  assert.equal(turn.model, null, "--model after -- is focus text, not a flag");
+});
+
+test("review --args-stdin with flags only still runs the built-in reviewer", () => {
+  const repo = featureBranchRepo();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+
+  const result = run(process.execPath, [SCRIPT, "review", "--args-stdin"], { cwd: repo, env: buildEnv(binDir), input: "--base main\n" });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Reviewed changes against main/);
+});

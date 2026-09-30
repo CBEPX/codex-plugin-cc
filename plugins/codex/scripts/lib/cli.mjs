@@ -2,7 +2,7 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
-import { parseArgs, splitRawArgumentString } from "./args.mjs";
+import { parseArgs, splitArgsWithVerbatimTail, splitRawArgumentString } from "./args.mjs";
 import { readStdinIfPiped } from "./fs.mjs";
 import { loadModelCatalog, resolveModelAlias, supportedEfforts } from "./model-catalog.mjs";
 import { boundedReadView, exportReadPayload } from "./read-views.mjs";
@@ -128,7 +128,24 @@ const ARGS_STDIN_FLAG = "--args-stdin";
 export const PROMPT_STDIN_FLAG = "--prompt-stdin";
 let argvTokenizedFromStdin = false;
 
-export function applyArgsStdin(argv) {
+// The defaults every command parser shares. applyArgsStdin needs them too, so
+// `-C <dir>` and `-h` keep their meaning in front of a verbatim review focus.
+function withCommonOptions(config = {}) {
+  return {
+    rejectUnknownOptions: true,
+    ...config,
+    booleanOptions: ["help", ...(config.booleanOptions ?? [])],
+    aliasMap: {
+      C: "cwd",
+      h: "help",
+      ...(config.aliasMap ?? {})
+    }
+  };
+}
+
+// `spec` (the review commands' option table, passed in by main) keeps the focus
+// text after the flags verbatim (#714); without it stdin splits shell-like.
+export function applyArgsStdin(argv, spec = null) {
   const flagIndex = argv.indexOf(ARGS_STDIN_FLAG);
 
   // Decided before anything reads stdin: both flags consume it and it can only
@@ -146,12 +163,12 @@ export function applyArgsStdin(argv) {
   if (flagIndex === -1) {
     return argv;
   }
+  // Set on both paths: a focus-only heredoc is one token, and normalizeArgv must
+  // not re-split it as the single-string argv form.
   argvTokenizedFromStdin = true;
-  return [
-    ...argv.slice(0, flagIndex),
-    ...splitRawArgumentString(readStdinIfPiped()),
-    ...argv.slice(flagIndex + 1)
-  ];
+  const raw = readStdinIfPiped();
+  const tokens = spec ? splitArgsWithVerbatimTail(raw, withCommonOptions(spec)) : splitRawArgumentString(raw);
+  return [...argv.slice(0, flagIndex), ...tokens, ...argv.slice(flagIndex + 1)];
 }
 
 export function normalizeArgv(argv) {
@@ -166,16 +183,7 @@ export function normalizeArgv(argv) {
 }
 
 export function parseCommandInput(argv, config = {}) {
-  return parseArgs(normalizeArgv(argv), {
-    rejectUnknownOptions: true,
-    ...config,
-    booleanOptions: ["help", ...(config.booleanOptions ?? [])],
-    aliasMap: {
-      C: "cwd",
-      h: "help",
-      ...(config.aliasMap ?? {})
-    }
-  });
+  return parseArgs(normalizeArgv(argv), withCommonOptions(config));
 }
 
 export function maybePrintCommandHelp(options) {

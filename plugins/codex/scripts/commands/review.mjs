@@ -176,18 +176,20 @@ function buildReviewJobMetadata(reviewName, target) {
   };
 }
 
+// One option table for `review` and `adversarial-review`. main hands it to
+// applyArgsStdin so `--args-stdin` knows which flags take a value before the
+// verbatim focus (#714). Text after the first positional is focus even when
+// it looks like a flag (#547).
+export const REVIEW_ARG_SPEC = {
+  valueOptions: ["base", "scope", "model", "effort", "cwd", "turn-timeout-ms"],
+  booleanOptions: ["json", "background", "wait"],
+  repeatableOptions: ["config"],
+  stopAtFirstPositional: true,
+  aliasMap: { m: "model" }
+};
+
 export async function handleReviewCommand(argv, config) {
-  const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["base", "scope", "model", "effort", "cwd", "turn-timeout-ms"],
-    booleanOptions: ["json", "background", "wait"],
-    repeatableOptions: ["config"],
-    // Only the adversarial variant takes free-form focus text; stop option
-    // parsing there so option-looking prompt words survive (#547).
-    stopAtFirstPositional: Boolean(config.acceptsFocusText),
-    aliasMap: {
-      m: "model"
-    }
-  });
+  const { options, positionals } = parseCommandInput(argv, REVIEW_ARG_SPEC);
   if (maybePrintCommandHelp(options)) {
     return;
   }
