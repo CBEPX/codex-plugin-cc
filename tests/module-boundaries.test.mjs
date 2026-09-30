@@ -56,3 +56,22 @@ test("commands/shared.mjs imports only ../lib/**", () => {
   assert.ok(specs.length >= 5, "import parser found nothing");
   for (const spec of specs) assert.ok(spec.startsWith("../lib/"), `shared.mjs imports ${spec}`);
 });
+
+const COMMAND_MODULES = ["cancel", "review", "setup", "status", "task", "transfer"];
+
+test("command modules import only ../lib/** and ./shared.mjs", () => {
+  const present = fs.readdirSync(COMMANDS).filter((n) => n.endsWith(".mjs")).sort();
+  assert.deepEqual(present, [...COMMAND_MODULES, "shared"].map((n) => `${n}.mjs`).sort());
+  for (const name of COMMAND_MODULES) {
+    const specs = imports(path.join(COMMANDS, `${name}.mjs`));
+    assert.ok(specs.length >= 2, `${name}.mjs: import parser found nothing`);
+    for (const spec of specs) assert.ok(spec.startsWith("../lib/") || spec === "./shared.mjs", `${name}.mjs imports ${spec}`);
+  }
+});
+
+test("the companion entry imports only lib/cli.mjs and commands/*", () => {
+  const allowed = ["./lib/cli.mjs", ...[...COMMAND_MODULES, "shared"].map((n) => `./commands/${n}.mjs`)];
+  const specs = imports(path.join(SCRIPTS, "codex-companion.mjs"));
+  assert.ok(specs.includes("./lib/cli.mjs"), "import parser found nothing");
+  assert.deepEqual(specs.filter((s) => !allowed.includes(s)), [], "codex-companion.mjs imports outside its allow-list");
+});
