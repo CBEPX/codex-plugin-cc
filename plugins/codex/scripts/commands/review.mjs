@@ -13,7 +13,7 @@ import {
 import { parseStructuredOutput, readOutputSchema, runAppServerReview, runAppServerTurn } from "../lib/codex.mjs";
 import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "../lib/git.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "../lib/prompts.mjs";
-import { renderNativeReviewResult, renderReviewResult } from "../lib/render.mjs";
+import { renderNativeReviewResult, renderReviewResult, validateReviewResultShape } from "../lib/render.mjs";
 import { createCompanionJob, ensureCodexAvailable, firstMeaningfulLine, runForegroundCommand } from "./shared.mjs";
 
 function buildAdversarialReviewPrompt(context, focusText) {
@@ -127,6 +127,13 @@ async function executeReviewRun(request) {
     status: result.status,
     failureMessage: result.error?.message ?? result.stderr
   });
+  if (parsed.parseError === null) {
+    const validationError = validateReviewResultShape(parsed.parsed);
+    if (validationError) {
+      parsed.parsed = null;
+      parsed.parseError = `Invalid review shape: ${validationError}`;
+    }
+  }
   const payload = {
     review: reviewName,
     target,

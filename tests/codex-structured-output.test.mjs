@@ -57,3 +57,71 @@ test("parseStructuredOutput takes an object quoted in prose as the answer", () =
   assert.equal(result.parseError, null);
   assert.equal(result.rawOutput, raw);
 });
+
+const FINDING = {
+  severity: "high",
+  title: "Missing guard",
+  body: "The change assumes data is present.",
+  file: "src/app.js",
+  line_start: 1,
+  line_end: 2,
+  confidence: 0.9,
+  recommendation: "Guard it."
+};
+
+function assertParseFailure(label, raw) {
+  const result = parseStructuredOutput(raw);
+  assert.equal(result.parsed, null, label);
+  assert.ok(result.parseError, label);
+  assert.equal(result.rawOutput, raw, label);
+}
+
+function assertParsed(label, raw, expected) {
+  const result = parseStructuredOutput(raw);
+  assert.deepEqual(result.parsed, expected, label);
+  assert.equal(result.parseError, null, label);
+  assert.equal(result.rawOutput, raw, label);
+}
+
+test("parseStructuredOutput fails on a truncated review even when one finding inside it is complete", () => {
+  assertParseFailure("truncated after a complete finding", '{"verdict":"needs-attention","summary":"s","findings":[' + JSON.stringify(FINDING));
+  assertParseFailure("truncated inside the next finding", '{"verdict":"needs-attention","summary":"s","findings":[' + JSON.stringify(FINDING) + ',{"severity":"hi');
+});
+
+test("parseStructuredOutput skips a fenced JSON primitive and fails when nothing follows it", () => {
+  for (const primitive of ["null", "0", "false", '""', '"text"', "1"]) {
+    const fence = "```json\n" + primitive + "\n```";
+    assertParsed(`fenced ${primitive} then a review`, fence + "\n" + BODY, REVIEW);
+    assertParseFailure(`fenced ${primitive} alone`, "Answer:\n" + fence);
+  }
+});
+
+test("parseStructuredOutput keeps a fenced array as the parsed value", () => {
+  assertParsed("fenced [] then a review", "```json\n[]\n```\n" + BODY, []);
+  assertParsed("fenced [review] then a review", "```json\n[" + BODY + "]\n```\n" + BODY, [REVIEW]);
+});
+
+test("parseStructuredOutput rejects a complete malformed outer candidate and recovers a later object", () => {
+  assertParseFailure("malformed outer candidate alone", 'prefix {bad {"ok":true}}');
+  assertParsed("malformed outer candidate then a review", 'prefix {bad {"ok":true}} ' + BODY, REVIEW);
+});
+
+// ponytail limit (deviation from cc-plugin-codex): the scan is linear, so
+// candidates nested inside a `{` that never closes are not recovered.
+test("parseStructuredOutput does not recover an object after an unclosed `{` (documented deviation)", () => {
+  assertParseFailure("unclosed brace then a review", "prefix { " + BODY);
+});
+
+test("parseStructuredOutput recovers a review with escaped quotes and braces in strings, and a large CRLF fenced review", () => {
+  const tricky = { ...REVIEW, summary: 'He wrote "{" and \\"}\\" then } {' };
+  assertParsed("escaped quotes and string braces", "Result:\n" + JSON.stringify(tricky) + "\nDone.", tricky);
+  const large = { ...REVIEW, summary: "x".repeat(1024 * 1024 + 1) };
+  assertParsed("CRLF fenced review over 1 MiB", "Review:\r\n```json\r\n" + JSON.stringify(large) + "\r\n```\r\n", large);
+});
+
+// Result only; the timing rule forbids a wall-clock assertion.
+test("parseStructuredOutput fails on hostile inputs", () => {
+  assertParseFailure("786,432 opening braces", "{".repeat(786432));
+  assertParseFailure("unterminated fence then long whitespace", "```json" + " \n".repeat(393216));
+  assertParseFailure("many {x} candidates", "{x} ".repeat(100000));
+});

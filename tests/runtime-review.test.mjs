@@ -455,3 +455,33 @@ test("review and adversarial-review refuse an unresolvable --base before any job
     }
   }
 });
+
+// A reply that parses but is not a review object is a parse failure at the
+// caller (#583): --json gives result null and the shape error, the exit code
+// stays the Codex turn's, and the text output shows the raw message.
+test("adversarial-review reports a parsed non-review reply as an invalid review shape (#583)", () => {
+  const rows = [
+    ["bare {}", "{}", "Invalid review shape: Missing string `verdict`."],
+    ["fenced []", "```json\n[]\n```", "Invalid review shape: Expected a top-level JSON object."]
+  ];
+  for (const [label, answer, parseError] of rows) {
+    const repo = seededRepo();
+    const binDir = makeTempDir();
+    installFakeCodex(binDir);
+    fs.writeFileSync(path.join(repo, "README.md"), "hello again\n");
+    const env = buildEnv(binDir, { FAKE_CODEX_REVIEW_ANSWER_TEXT: answer });
+
+    const json = run(process.execPath, [SCRIPT, "adversarial-review", "--json"], { cwd: repo, env });
+    assert.equal(json.status, 0, `${label}: ${json.stderr}`);
+    const payload = JSON.parse(json.stdout);
+    assert.equal(payload.result, null, label);
+    assert.equal(payload.parseError, parseError, label);
+    assert.equal(payload.rawOutput, answer, label);
+
+    const text = run(process.execPath, [SCRIPT, "adversarial-review"], { cwd: repo, env });
+    assert.equal(text.status, 0, `${label}: ${text.stderr}`);
+    assert.ok(text.stdout.includes("Codex did not return valid structured JSON."), `${label}: ${text.stdout}`);
+    assert.ok(text.stdout.includes(`- Parse error: ${parseError}`), `${label}: ${text.stdout}`);
+    assert.ok(text.stdout.includes("Raw final message:\n\n```text\n" + answer + "\n```"), `${label}: ${text.stdout}`);
+  }
+});

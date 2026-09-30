@@ -1468,42 +1468,55 @@ export function buildPersistentTaskThreadName(prompt) {
 
 // Codex sometimes wraps its schema answer in a markdown fence or in prose (#583).
 // Recovery, ported from cc-plugin-codex: the whole message, else the first
-// fenced block, else the first balanced `{…}` that parses. A reply that only
-// quotes an object is therefore read as that object (spec §Limits).
-const FENCED_BLOCK_PATTERN = /```(?:json)?\s*\n([\s\S]*?)\r?\n```/;
+// fenced block when it holds an object or array, else the first depth-zero
+// `{…}` that parses. A reply that only quotes an object is therefore read as
+// that object (spec §Limits). The caller checks the review shape.
 
-// First balanced `{…}` in `text` that parses. The scan knows JSON strings and
-// `\` escapes, so braces inside strings do not count; a candidate that fails to
-// parse moves the scan to the next `{`.
+// Match only the opening line; find the closing marker without backtracking.
+const FENCE_OPEN_PATTERN = /```(?:json)?[^\S\r\n]*\r?\n/;
+
+function extractFirstFencedBlock(text) {
+  const opening = FENCE_OPEN_PATTERN.exec(text);
+  if (!opening) return null;
+  const start = opening.index + opening[0].length;
+  const end = text.indexOf("\n```", start);
+  return end === -1 ? null : text.slice(start, end);
+}
+
+// Try complete depth-zero objects; do not recover inside broken containers.
+// The scan knows JSON strings and `\` escapes, so braces inside strings do not count.
+// ponytail: candidates nested inside a broken outer `{` (one that never closes or
+// does not parse) are not recovered, a deviation from cc-plugin-codex that keeps
+// the scan linear; add a bounded rescan if real replies need that recovery.
 function extractFirstJsonObject(text) {
-  for (let start = text.indexOf("{"); start !== -1; start = text.indexOf("{", start + 1)) {
-    let depth = 0;
-    let inString = false;
-    let escaped = false;
-    for (let index = start; index < text.length; index += 1) {
-      const char = text[index];
-      if (inString) {
-        if (escaped) {
-          escaped = false;
-        } else if (char === "\\") {
-          escaped = true;
-        } else if (char === "\"") {
-          inString = false;
-        }
-        continue;
-      }
-      if (char === "\"") {
-        inString = true;
-      } else if (char === "{") {
-        depth += 1;
-      } else if (char === "}") {
-        depth -= 1;
-        if (depth === 0) {
-          try {
-            return JSON.parse(text.slice(start, index + 1));
-          } catch {
-            break;
-          }
+  let start = -1;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index];
+    if (depth === 0) {
+      if (char !== "{") continue;
+      start = index;
+    }
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === "\"") inString = false;
+      continue;
+    }
+    if (char === "\"") {
+      inString = true;
+    } else if (char === "{") {
+      depth += 1;
+    } else if (char === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        try {
+          return JSON.parse(text.slice(start, index + 1));
+        } catch {
+          // Continue with the next depth-zero candidate.
         }
       }
     }
@@ -1534,9 +1547,9 @@ export function parseStructuredOutput(rawOutput, fallback = {}) {
   if (whole.ok) {
     return { parsed: whole.value, parseError: null, rawOutput, ...fallback };
   }
-  const fenced = FENCED_BLOCK_PATTERN.exec(text);
-  const fromFence = fenced ? tryParseJson(fenced[1]) : null;
-  if (fromFence?.ok) {
+  const fenced = extractFirstFencedBlock(text);
+  const fromFence = fenced === null ? null : tryParseJson(fenced);
+  if (fromFence?.ok && fromFence.value !== null && typeof fromFence.value === "object") {
     return { parsed: fromFence.value, parseError: null, rawOutput, ...fallback };
   }
   const embedded = extractFirstJsonObject(text);
