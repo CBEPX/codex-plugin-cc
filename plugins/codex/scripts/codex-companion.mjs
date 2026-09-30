@@ -683,18 +683,11 @@ async function executeTaskRun(request) {
   const failureMessage =
     result.error?.message ??
     (result.status !== 0 ? (result.stderr || `Codex turn ended with status "${turnStatus ?? "failed"}"`) : "");
-  const rendered = renderTaskResult(
-    {
-      rawOutput,
-      failureMessage,
-      reasoningSummary: result.reasoningSummary
-    },
-    {
-      title: taskMetadata.title,
-      jobId: request.jobId ?? null,
-      write: Boolean(request.write)
-    }
-  );
+  const rendered = renderTaskResult({
+    rawOutput,
+    failureMessage,
+    reasoningSummary: result.reasoningSummary
+  });
   const payload = {
     status: result.status,
     threadId: result.threadId,

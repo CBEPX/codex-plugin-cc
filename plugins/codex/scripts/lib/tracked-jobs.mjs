@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import process from "node:process";
 
-import { isActiveJobStatus, isTerminalRecord, JOB_STATUS } from "./job-status.mjs";
+import { isActiveJobStatus, isTerminalRecord } from "./job-status.mjs";
 import { getProcessIdentities, getProcessIdentity, isPidAlive, processCommandLine } from "./process.mjs";
 
 import {
@@ -320,8 +320,7 @@ function markJobDead(workspaceRoot, jobSummary, errorMessage, lockWaitMs = undef
 }
 
 function markJobDeadLocked(workspaceRoot, jobSummary, errorMessage) {
-  const jobFile = resolveJobFile(workspaceRoot, jobSummary.id);
-  const stored = fs.existsSync(jobFile) ? readJobFile(jobFile) : null;
+  const stored = readStoredJob(workspaceRoot, jobSummary.id);
   const base = stored ?? jobSummary;
   if (!isActiveJobStatus(base.status)) {
     // The job finished between the caller's read and now — keep the real result,
@@ -393,7 +392,7 @@ const QUEUED_WITHOUT_PID_GRACE_MS = 30000;
 // cannot tell that apart from a record that was written microseconds ago, so age
 // decides it.
 function isQueuedWithoutWorker(job, pid) {
-  if (job.status !== JOB_STATUS.QUEUED || pid != null) {
+  if (job.status !== "queued" || pid != null) {
     return false;
   }
   const createdAt = Date.parse(job.createdAt ?? "");

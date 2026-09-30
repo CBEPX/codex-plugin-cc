@@ -3,7 +3,7 @@ import fs from "node:fs";
 import { BROKER_ENDPOINT_ENV } from "./app-server.mjs";
 import { loadBrokerSession, resolveBrokerStateFile } from "./broker-lifecycle.mjs";
 import { getSessionRuntimeStatus } from "./codex.mjs";
-import { isActiveJobStatus, isTerminalRecord, JOB_STATUS } from "./job-status.mjs";
+import { isActiveJobStatus, isTerminalRecord } from "./job-status.mjs";
 import { looksLikeVerificationCommand } from "./render.mjs";
 import { getConfig, listJobs, readStoredJob, removeJobPidFile, removeJobRequestFile, upsertJob, withStateLock, writeJobFile } from "./state.mjs";
 import { DEAD_WORKER_MESSAGE, filterJobsForSession, getCurrentSessionId, reapDeadJobs } from "./tracked-jobs.mjs";
@@ -150,7 +150,7 @@ export function enrichJob(job, options = {}) {
     ...job,
     kindLabel: getJobTypeLabel(job),
     progressPreview:
-      isActiveJobStatus(job.status) || job.status === JOB_STATUS.FAILED
+      isActiveJobStatus(job.status) || job.status === "failed"
         ? readJobProgressPreview(job.logFile, maxProgressLines)
         : [],
     elapsed: formatElapsedDuration(job.startedAt ?? job.createdAt, job.completedAt ?? null),

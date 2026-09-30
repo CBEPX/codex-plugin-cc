@@ -23,6 +23,7 @@ function imports(file) {
 const libName = (spec) => path.basename(spec).replace(/\.mjs$/, "");
 
 test("lib modules import only siblings, never ../", () => {
+  assert.ok(imports(path.join(LIB, "job-control.mjs")).length >= 8, "import parser found nothing");
   for (const f of fs.readdirSync(LIB).filter((n) => n.endsWith(".mjs"))) {
     for (const spec of imports(path.join(LIB, f))) assert.ok(spec.startsWith("./"), `${f} imports ${spec}`);
   }

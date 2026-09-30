@@ -5,7 +5,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { readJsonOrNull } from "./fs.mjs";
-import { isActiveJobStatus, JOB_STATUS } from "./job-status.mjs";
+import { isActiveJobStatus } from "./job-status.mjs";
 import { getProcessIdentity, isPidAlive } from "./process.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
@@ -721,7 +721,7 @@ export function updateJobPid(cwd, jobId, pid, identity = null) {
       return;
     }
     writeJobPidFile(cwd, jobId, pid, identity);
-    if (indexed.status === JOB_STATUS.QUEUED) {
+    if (indexed.status === "queued") {
       upsertJob(cwd, { id: jobId, pid, pidIdentity: identity });
     }
   });
@@ -784,7 +784,7 @@ export function readJobFile(jobFile) {
       // `runTrackedJob` flips the status to `running`, so staging one for a
       // running job would write plaintext `--config` values that nothing reads
       // and nothing deletes.
-      const active = current.status === JOB_STATUS.QUEUED;
+      const active = current.status === "queued";
       const migrated = withRedactedRequest(current);
       if (active && !fs.existsSync(requestFile)) {
         // Same shape and mode as `writeJobRequestFile`: the temp file carries the
@@ -817,7 +817,7 @@ export function resolveJobFile(cwd, jobId) {
   return path.join(resolveJobsDir(cwd), `${jobId}.json`);
 }
 
-// The job file, or null when the job has none yet (queued, never started).
+// The job file, or null when none exists for the id.
 export function readStoredJob(cwd, jobId) {
   const jobFile = resolveJobFile(cwd, jobId);
   if (!fs.existsSync(jobFile)) {
