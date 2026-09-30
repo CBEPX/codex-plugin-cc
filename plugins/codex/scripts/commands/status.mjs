@@ -2,19 +2,19 @@ import process from "node:process";
 
 import {
   maybePrintCommandHelp,
-  outputCommandResult,
-  outputResult,
+  outputReadView,
   parseCommandInput,
   parseTimeoutOption,
   resolveCommandCwd
 } from "../lib/cli.mjs";
 import { buildSingleJobSnapshot, buildStatusSnapshot } from "../lib/job-control.mjs";
+import { assertOutputPathFree, statusNextStep } from "../lib/read-views.mjs";
 import { renderJobStatusReport, renderStatusReport } from "../lib/render.mjs";
 import { outputJobResult, waitForSingleJobSnapshot, waitForTerminalJobOrHint } from "./shared.mjs";
 
 export async function handleStatus(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["cwd", "timeout-ms", "poll-interval-ms"],
+    valueOptions: ["cwd", "timeout-ms", "poll-interval-ms", "output"],
     booleanOptions: ["json", "all", "wait"]
   });
   if (maybePrintCommandHelp(options)) {
@@ -22,6 +22,13 @@ export async function handleStatus(argv) {
   }
 
   const cwd = resolveCommandCwd(options);
+  // Rows 1, 2 and 7: every status read is a bounded summary (no `request`,
+  // `result`, `rendered`), or the full payload exported with `--output`.
+  const readView = { asJson: options.json, summary: true, outputPath: options.output ?? null, cwd };
+  if (readView.outputPath != null) {
+    // Fail before a --wait that may last minutes; exportReadPayload's `wx` open stays the guard.
+    assertOutputPathFree(readView.outputPath, cwd);
+  }
   const reference = positionals[0] ?? "";
   if (reference) {
     const snapshot = options.wait
@@ -32,15 +39,15 @@ export async function handleStatus(argv) {
       : buildSingleJobSnapshot(cwd, reference);
     if (snapshot.waitTimedOut) {
       const seconds = Math.max(1, Math.round(snapshot.timeoutMs / 1000));
-      outputCommandResult(
+      outputReadView(
         snapshot,
-        `${renderJobStatusReport(snapshot.job)}\nTimed out after ${seconds}s while the job was still running.\n`,
-        options.json
+        (view) => `${renderJobStatusReport(view.job)}\nTimed out after ${seconds}s while the job was still running.\n`,
+        { ...readView, nextStep: statusNextStep(0) }
       );
       process.exitCode = 1;
       return;
     }
-    outputCommandResult(snapshot, renderJobStatusReport(snapshot.job), options.json);
+    outputReadView(snapshot, (view) => renderJobStatusReport(view.job), { ...readView, nextStep: statusNextStep(0) });
     return;
   }
 
@@ -49,7 +56,7 @@ export async function handleStatus(argv) {
   }
 
   const report = buildStatusSnapshot(cwd, { all: options.all });
-  outputResult(options.json ? report : renderStatusReport(report), options.json);
+  outputReadView(report, renderStatusReport, { ...readView, nextStep: statusNextStep(report.omittedJobs) });
 }
 
 export async function handleResult(argv) {

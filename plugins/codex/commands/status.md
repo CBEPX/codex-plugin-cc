@@ -1,6 +1,6 @@
 ---
 description: Show active and recent Codex jobs for this repository, including review-gate status
-argument-hint: '[job-id] [--wait] [--timeout-ms <ms>] [--all]'
+argument-hint: '[job-id] [--wait] [--timeout-ms <ms>] [--all] [--output <new-path>]'
 disable-model-invocation: true
 allowed-tools: Bash(node:*)
 ---
@@ -21,3 +21,5 @@ If the user did not pass a job ID:
 If the user did pass a job ID:
 - Present the full command output to the user.
 - Do not summarize or condense it.
+
+If the output ends with a `Truncated:` line, keep that line and the next-step line after it as printed, below the table or the output. Do not re-run the command on your own.

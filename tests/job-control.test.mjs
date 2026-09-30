@@ -264,3 +264,18 @@ test("buildStatusSnapshot counts the session's jobs and the finished ones past t
   const otherSession = buildStatusSnapshot(workspace, { env: { [SESSION_ID_ENV]: "sess-b" } });
   assert.deepEqual([otherSession.totalJobs, otherSession.omittedJobs], [2, 0]);
 });
+
+test("buildStatusSnapshot never counts active jobs or the latest finished job as omitted", () => {
+  const workspace = makeTempDir();
+  const stateDir = resolveStateDir(workspace);
+  fs.mkdirSync(path.join(stateDir, "jobs"), { recursive: true });
+  const at = (minute) => `2026-03-18T15:${String(minute).padStart(2, "0")}:00.000Z`;
+  // `running` without a pid: the dead-job reaper cannot judge it and leaves it active (a queued record this old would be reaped).
+  const active = Array.from({ length: 9 }, (_, index) => ({ id: `task-active-${index}`, status: "running", jobClass: "task", createdAt: at(59 - index), updatedAt: at(59 - index) }));
+  const finished = Array.from({ length: 3 }, (_, index) => ({ id: `task-done-${index}`, status: "completed", jobClass: "task", createdAt: at(40 - index), updatedAt: at(40 - index) }));
+  fs.writeFileSync(path.join(stateDir, "state.json"), `${JSON.stringify({ version: 1, config: {}, jobs: [...active, ...finished] }, null, 2)}\n`, "utf8");
+  const listed = buildStatusSnapshot(workspace, { env: {} });
+  assert.deepEqual([listed.totalJobs, listed.omittedJobs], [12, 2]);
+  const all = buildStatusSnapshot(workspace, { env: {}, all: true });
+  assert.deepEqual([all.totalJobs, all.omittedJobs], [12, 0]);
+});

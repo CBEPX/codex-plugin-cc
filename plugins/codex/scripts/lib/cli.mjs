@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { parseArgs, splitRawArgumentString } from "./args.mjs";
 import { readStdinIfPiped } from "./fs.mjs";
 import { loadModelCatalog, resolveModelAlias, supportedEfforts } from "./model-catalog.mjs";
+import { boundedReadView, exportReadPayload } from "./read-views.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
 export const ROOT_DIR = path.resolve(fileURLToPath(new URL("../..", import.meta.url)));
@@ -31,7 +32,7 @@ export function printUsage() {
       "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model|spark|astra|sol|luna|terra|mini>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [--turn-timeout-ms <ms>] [--config key=value]... [focus text]",
       "  node scripts/codex-companion.mjs task [--background|--await [--await-timeout-ms <ms>]] [--prompt-stdin] [--write] [--resume-last|--resume|--fresh] [--model <model|spark|astra|sol|luna|terra|mini>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [--turn-timeout-ms <ms>] [--config key=value]... [prompt]",
       "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
-      "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
+      "  node scripts/codex-companion.mjs status [job-id] [--all] [--json] [--output <new-path>]",
       "  node scripts/codex-companion.mjs result [job-id] [--wait [--timeout-ms <ms>]] [--json]",
       "  node scripts/codex-companion.mjs cancel [job-id] [--json]",
       "",
@@ -57,6 +58,19 @@ export function outputResult(value, asJson) {
 
 export function outputCommandResult(payload, rendered, asJson) {
   outputResult(asJson ? payload : rendered, asJson);
+}
+
+// Rows 1–4 of the read-view table (spec §3.2): the bounded view — at most
+// PUBLIC_READ_BYTES — on stdout or, with `--output`, the full payload in a new
+// 0600 file and its receipt, always JSON, on stdout. `render` gets the projected
+// view, never the original, so text mode is bounded too. `asJson === true`:
+// without `--json` the option is undefined, and boundedReadView defaults to JSON.
+export function outputReadView(payload, render, { asJson, summary, nextStep, outputPath = null, cwd }) {
+  if (outputPath != null) {
+    outputResult(exportReadPayload(payload, outputPath, cwd), true);
+    return;
+  }
+  process.stdout.write(boundedReadView(payload, { summary, render, asJson: asJson === true, nextStep }).text);
 }
 
 export function normalizeRequestedModel(model) {

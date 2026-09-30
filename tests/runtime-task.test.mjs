@@ -955,7 +955,6 @@ test("task --background keeps secret --config values out of every job record", (
   const exposures = {
     "state index": fs.readFileSync(path.join(stateDir, "state.json"), "utf8"),
     "job file": fs.readFileSync(path.join(stateDir, "jobs", `${jobId}.json`), "utf8"),
-    "status --json stdout": waited.stdout,
     "result --json stdout": resultRun.stdout
   };
   for (const [label, text] of Object.entries(exposures)) {
@@ -964,6 +963,11 @@ test("task --background keeps secret --config values out of every job record", (
     assert.equal(text.includes("model_provider"), true, `${label} should still record which config keys were set`);
     assert.equal(text.includes("ollama"), false, `${label} stored a --config value; keys are recorded, values never are`);
   }
+
+  // `status` is a summary since 1.5.0: it drops `request`, so only the values' absence can be checked there.
+  assert.equal(waited.stdout.includes("SECRET_SENTINEL_42"), false, "status --json stdout leaked the secret --config value");
+  assert.equal(waited.stdout.includes("ollama"), false, "status --json stdout leaked a --config value");
+  assert.ok(JSON.parse(waited.stdout).omissions.fieldNames.includes("request"), "status --json drops the request");
 
   // The one-shot payload file is deleted by the worker once it has read it.
   assert.equal(fs.existsSync(path.join(stateDir, "jobs", `${jobId}.request.json`)), false);
@@ -1021,8 +1025,10 @@ test("a v1.1.1 record's --config values never reach status/result and are redact
   const result = run(process.execPath, [SCRIPT, "result", "task-legacy", "--json"], { cwd: repo, env });
   assert.equal(result.status, 0, result.stderr);
 
+  // `status` is a summary since 1.5.0 (no `request`): only the value's absence is checked there.
+  assert.equal(status.stdout.includes("SESSION_SECRET_FROM_1_1_1"), false, "status --json stdout leaked a legacy --config value");
+  assert.ok(JSON.parse(status.stdout).omissions.fieldNames.includes("request"), "status --json drops the request");
   const exposures = {
-    "status --json stdout": status.stdout,
     "result --json stdout": result.stdout,
     "state index": fs.readFileSync(statePath, "utf8"),
     "job file": fs.readFileSync(legacyJobFile, "utf8")
@@ -1081,7 +1087,14 @@ test("an active v1.1.1 record keeps its real --config for the worker while outpu
   const status = run(process.execPath, [SCRIPT, "status", "task-legacy-queued", "--json"], { cwd: repo, env });
   assert.equal(status.status, 0, status.stderr);
   assert.equal(status.stdout.includes("SESSION_SECRET_FROM_1_1_1"), false, "status --json leaked a legacy --config value");
-  assert.equal(status.stdout.includes("[redacted]"), true);
+  // The summary drops `request` (and `result --json` of an active job is a summary too):
+  // the full export is where the redacted request is visible.
+  const exportFile = path.join(makeTempDir(), "legacy-queued.json");
+  const exported = run(process.execPath, [SCRIPT, "status", "task-legacy-queued", "--output", exportFile], { cwd: repo, env });
+  assert.equal(exported.status, 0, exported.stderr);
+  const exportedText = fs.readFileSync(exportFile, "utf8");
+  assert.equal(exportedText.includes("SESSION_SECRET_FROM_1_1_1"), false, "status --output leaked a legacy --config value");
+  assert.equal(JSON.parse(exportedText).job.request.config["model_providers.x.http_headers.Cookie"], "[redacted]");
 
   // The worker's own read path (`readStoredJob` → `readJobFile`).
   const workerView = readJobFile(legacyJobFile);
