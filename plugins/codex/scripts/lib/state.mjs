@@ -4,6 +4,8 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { readJsonOrNull } from "./fs.mjs";
+import { isActiveJobStatus } from "./job-status.mjs";
 import { getProcessIdentity, isPidAlive } from "./process.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
@@ -14,7 +16,7 @@ const STATE_FILE_NAME = "state.json";
 const JOBS_DIR_NAME = "jobs";
 const MAX_JOBS = 50;
 
-function nowIso() {
+export function nowIso() {
   return new Date().toISOString();
 }
 
@@ -135,14 +137,6 @@ function withRedactedRequest(record) {
   return hasStoredConfigValues(record)
     ? { ...record, request: { ...record.request, config: redactConfigValues(record.request.config) } }
     : record;
-}
-
-function readJsonOrNull(filePath) {
-  try {
-    return JSON.parse(fs.readFileSync(filePath, "utf8"));
-  } catch {
-    return null;
-  }
 }
 
 // Records written before values were redacted (1.1.1 and earlier) carry the raw
@@ -723,7 +717,7 @@ export function updateJobPid(cwd, jobId, pid, identity = null) {
   // wrote its own pid there, the newer one.
   withStateLock(cwd, () => {
     const indexed = listJobs(cwd).find((job) => job.id === jobId);
-    if (indexed?.status !== "queued" && indexed?.status !== "running") {
+    if (!isActiveJobStatus(indexed?.status)) {
       return;
     }
     writeJobPidFile(cwd, jobId, pid, identity);
@@ -823,6 +817,15 @@ export function resolveJobFile(cwd, jobId) {
   return path.join(resolveJobsDir(cwd), `${jobId}.json`);
 }
 
+// The job file, or null when none exists for the id.
+export function readStoredJob(cwd, jobId) {
+  const jobFile = resolveJobFile(cwd, jobId);
+  if (!fs.existsSync(jobFile)) {
+    return null;
+  }
+  return readJobFile(jobFile);
+}
+
 export function resolveJobPidFile(cwd, jobId) {
   ensureStateDir(cwd);
   return path.join(resolveJobsDir(cwd), `${jobId}.pid`);
@@ -859,7 +862,7 @@ export function resolveJobPid(cwd, job) {
   if (job?.pid != null) {
     return { pid: job.pid, identity: typeof job.pidIdentity === "string" ? job.pidIdentity : null };
   }
-  if (job?.status !== "queued" && job?.status !== "running") {
+  if (!isActiveJobStatus(job?.status)) {
     return { pid: null, identity: null };
   }
   return readJobPidSidecar(cwd, job.id) ?? { pid: null, identity: null };

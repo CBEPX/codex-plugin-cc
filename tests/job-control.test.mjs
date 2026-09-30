@@ -5,10 +5,11 @@ import { makeTempDir } from "./helpers.mjs";
 import { readJobFile, resolveJobFile, resolveStateDir, writeJobFile } from "../plugins/codex/scripts/lib/state.mjs";
 import { BROKER_ENDPOINT_ENV } from "../plugins/codex/scripts/lib/app-server.mjs";
 import { saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
-import { DEAD_WORKER_MESSAGE } from "../plugins/codex/scripts/lib/tracked-jobs.mjs";
+import { DEAD_WORKER_MESSAGE, filterJobsForSession, SESSION_ID_ENV } from "../plugins/codex/scripts/lib/tracked-jobs.mjs";
 import assert from "node:assert/strict";
 
-import { brokerExclusion, brokerPresence, cancelDecision, commitCancel, emitCancelPending, isWorkerProvedRecord, isWorkerTerminalRecord, renderCancelPending } from "../plugins/codex/scripts/lib/job-control.mjs";
+import { brokerExclusion, brokerPresence, cancelDecision, commitCancel, isWorkerProvedRecord, isWorkerTerminalRecord } from "../plugins/codex/scripts/lib/job-control.mjs";
+import { emitCancelPending, renderCancelPending } from "../plugins/codex/scripts/lib/render.mjs";
 
 const SURVIVORS = [{ pid: 4301, identity: "win32:7" }];
 
@@ -227,5 +228,17 @@ test("commitCancel keeps a reaper-written failure even when this cancel's interr
     const label = `${errorMessage} workerClosed=${workerClosed} causedByCancel=${causedByCancel}`;
     assert.deepEqual(result, kept ? stored : null, label);
     assert.equal(readJobFile(resolveJobFile(workspace, "task-1")).status, kept ? "failed" : "cancelled", label);
+  }
+});
+
+test("filterJobsForSession: keeps the current session's jobs, or all jobs without a session", () => {
+  const jobs = [{ sessionId: "a" }, { sessionId: "b" }];
+  assert.deepEqual(filterJobsForSession(jobs, { [SESSION_ID_ENV]: "a" }), [{ sessionId: "a" }]);
+  const original = process.env[SESSION_ID_ENV];
+  delete process.env[SESSION_ID_ENV];
+  try {
+    assert.deepEqual(filterJobsForSession(jobs, {}), jobs);
+  } finally {
+    if (original !== undefined) process.env[SESSION_ID_ENV] = original;
   }
 });

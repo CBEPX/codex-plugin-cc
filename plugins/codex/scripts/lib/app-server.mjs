@@ -42,7 +42,7 @@ const DEFAULT_CAPABILITIES = {
   ]
 };
 
-function buildJsonRpcError(code, message, data) {
+export function buildJsonRpcError(code, message, data) {
   return data === undefined ? { code, message } : { code, message, data };
 }
 

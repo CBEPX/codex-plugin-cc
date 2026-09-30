@@ -25,6 +25,7 @@ import {
 import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
 import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
+import { isActiveJobStatus, isTerminalRecord } from "./lib/job-status.mjs";
 import { loadModelCatalog, resolveModelAlias, supportedEfforts } from "./lib/model-catalog.mjs";
 import { binaryAvailable, isPidAlive, terminateRecordedProcess, workerCommandLine } from "./lib/process.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
@@ -33,8 +34,9 @@ import {
   generateJobId,
   getConfig,
   listJobs,
+  nowIso,
+  readStoredJob,
   recordWorkerPid,
-  removeJobPidFile,
   redactConfigValues,
   removeJobRequestFile,
   resolveJobPid,
@@ -51,10 +53,8 @@ import {
   buildStatusSnapshot,
   cancelDecision,
   commitCancel,
-  emitCancelPending,
   isWorkerProvedRecord,
   isWorkerTerminalRecord,
-  readStoredJob,
   resolveCancelableJob,
   resolveResultJob,
   sortJobsNewestFirst
@@ -65,14 +65,15 @@ import {
   createJobProgressUpdater,
   createJobRecord,
   createProgressReporter,
-  nowIso,
+  filterJobsForSession,
+  getCurrentSessionId,
   reapDeadJobs,
   registerWorkerCrashGuard,
-  runTrackedJob,
-  SESSION_ID_ENV
+  runTrackedJob
 } from "./lib/tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 import {
+  emitCancelPending,
   renderNativeReviewResult,
   renderReviewResult,
   renderStoredJobResult,
@@ -80,7 +81,8 @@ import {
   renderJobStatusReport,
   renderSetupReport,
   renderStatusReport,
-  renderTaskResult
+  renderTaskResult,
+  shorten
 } from "./lib/render.mjs";
 
 const ROOT_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
@@ -266,17 +268,6 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function shorten(text, limit = 96) {
-  const normalized = String(text ?? "").trim().replace(/\s+/g, " ");
-  if (!normalized) {
-    return "";
-  }
-  if (normalized.length <= limit) {
-    return normalized;
-  }
-  return `${normalized.slice(0, limit - 3)}...`;
-}
-
 function firstMeaningfulLine(text, fallback) {
   const line = String(text ?? "")
     .split(/\r?\n/)
@@ -426,30 +417,13 @@ function renderStatusPayload(report, asJson) {
   return asJson ? report : renderStatusReport(report);
 }
 
-function isActiveJobStatus(status) {
-  return status === "queued" || status === "running";
-}
-
-function getCurrentClaudeSessionId() {
-  return process.env[SESSION_ID_ENV] ?? null;
-}
-
-function filterJobsForCurrentClaudeSession(jobs) {
-  const sessionId = getCurrentClaudeSessionId();
-  if (!sessionId) {
-    return jobs;
-  }
-  return jobs.filter((job) => job.sessionId === sessionId);
-}
-
 function findLatestResumableTaskJob(jobs) {
   return (
     jobs.find(
       (job) =>
         job.jobClass === "task" &&
         job.threadId &&
-        job.status !== "queued" &&
-        job.status !== "running"
+        !isActiveJobStatus(job.status)
     ) ?? null
   );
 }
@@ -528,10 +502,10 @@ function outputJobResult(cwd, reference, asJson) {
 
 async function resolveLatestTrackedTaskThread(cwd, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const sessionId = getCurrentClaudeSessionId();
+  const sessionId = getCurrentSessionId();
   const jobs = sortJobsNewestFirst(reapDeadJobs(workspaceRoot, listJobs(workspaceRoot))).filter((job) => job.id !== options.excludeJobId);
-  const visibleJobs = filterJobsForCurrentClaudeSession(jobs);
-  const activeTask = visibleJobs.find((job) => job.jobClass === "task" && (job.status === "queued" || job.status === "running"));
+  const visibleJobs = filterJobsForSession(jobs);
+  const activeTask = visibleJobs.find((job) => job.jobClass === "task" && isActiveJobStatus(job.status));
   if (activeTask) {
     throw new Error(`Task ${activeTask.id} is still running. Use /codex:status before continuing it.`);
   }
@@ -709,18 +683,11 @@ async function executeTaskRun(request) {
   const failureMessage =
     result.error?.message ??
     (result.status !== 0 ? (result.stderr || `Codex turn ended with status "${turnStatus ?? "failed"}"`) : "");
-  const rendered = renderTaskResult(
-    {
-      rawOutput,
-      failureMessage,
-      reasoningSummary: result.reasoningSummary
-    },
-    {
-      title: taskMetadata.title,
-      jobId: request.jobId ?? null,
-      write: Boolean(request.write)
-    }
-  );
+  const rendered = renderTaskResult({
+    rawOutput,
+    failureMessage,
+    reasoningSummary: result.reasoningSummary
+  });
   const payload = {
     status: result.status,
     threadId: result.threadId,
@@ -768,7 +735,7 @@ function buildTaskRunMetadata({ prompt, resumeLast = false }) {
   const fallbackSummary = resumeLast ? DEFAULT_CONTINUE_PROMPT : "Task";
   return {
     title,
-    summary: shorten(prompt || fallbackSummary)
+    summary: shorten(prompt || fallbackSummary, 96)
   };
 }
 
@@ -1175,7 +1142,6 @@ async function handleTaskWorker(argv) {
     throw new Error("Missing required --job-id for task-worker.");
   }
 
-  const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
   const storedJob = readStoredJob(workspaceRoot, options["job-id"]);
   if (!storedJob) {
@@ -1294,10 +1260,9 @@ function handleTaskResumeCandidate(argv) {
     return;
   }
 
-  const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
-  const sessionId = getCurrentClaudeSessionId();
-  const jobs = filterJobsForCurrentClaudeSession(sortJobsNewestFirst(reapDeadJobs(workspaceRoot, listJobs(workspaceRoot))));
+  const sessionId = getCurrentSessionId();
+  const jobs = filterJobsForSession(sortJobsNewestFirst(reapDeadJobs(workspaceRoot, listJobs(workspaceRoot))));
   const candidate = findLatestResumableTaskJob(jobs);
 
   const payload = {
@@ -1399,7 +1364,7 @@ async function waitForTerminalRecord(workspaceRoot, jobId, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     const stored = readStoredJob(workspaceRoot, jobId);
-    if (stored && stored.status !== "queued" && stored.status !== "running") {
+    if (isTerminalRecord(stored)) {
       return stored;
     }
     if (Date.now() >= deadline) {

@@ -5,10 +5,9 @@ import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { fileURLToPath } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
-import { IS_WIN, makeTempDir, run, waitFor } from "./helpers.mjs";
+import { deadPid, IS_WIN, makeTempDir, ROOT, run, SCRIPT, SESSION_HOOK, waitFor, waitForExit, waitUntil } from "./helpers.mjs";
 import { createBrokerEndpoint, parseBrokerEndpoint } from "../plugins/codex/scripts/lib/broker-endpoint.mjs";
 import {
   clearBrokerSession,
@@ -27,28 +26,7 @@ import { getProcessIdentity, terminateProcessTree } from "../plugins/codex/scrip
 import { brokerExclusion } from "../plugins/codex/scripts/lib/job-control.mjs";
 import { resolveStateDir, STATE_LOCK_TIMEOUT_CODE } from "../plugins/codex/scripts/lib/state.mjs";
 
-const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const BROKER_SCRIPT = path.join(ROOT, "plugins", "codex", "scripts", "app-server-broker.mjs");
-const SESSION_HOOK = path.join(ROOT, "plugins", "codex", "scripts", "session-lifecycle-hook.mjs");
-const SCRIPT = path.join(ROOT, "plugins", "codex", "scripts", "codex-companion.mjs");
-
-function waitForExit(child, { timeoutMs = 10000 } = {}) {
-  return new Promise((resolve, reject) => {
-    if (child.exitCode !== null || child.signalCode !== null) {
-      resolve({ code: child.exitCode, signal: child.signalCode });
-      return;
-    }
-    const timer = setTimeout(() => {
-      child.removeListener("exit", onExit);
-      reject(new Error("Timed out waiting for broker process to exit."));
-    }, timeoutMs);
-    function onExit(code, signal) {
-      clearTimeout(timer);
-      resolve({ code, signal });
-    }
-    child.once("exit", onExit);
-  });
-}
 
 function isAlive(pid) {
   try {
@@ -200,18 +178,6 @@ function runSessionEndHookAsync(workspace, { env = process.env, sessionId = null
   // `close`, not `exit`: the process can exit before its stdio is drained, and
   // callers assert on what it logged.
   return new Promise((resolve) => child.on("close", (status) => resolve({ status, stdout, stderr })));
-}
-
-async function waitUntil(predicate, { timeoutMs = 8000, intervalMs = 100 } = {}) {
-  const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
-    const value = await predicate();
-    if (value) {
-      return value;
-    }
-    await new Promise((resolve) => setTimeout(resolve, intervalMs));
-  }
-  return null;
 }
 
 // Regression cover for the graceful path: the session that owns the broker ends,
@@ -1054,12 +1020,6 @@ function recordingKill(killed) {
       terminateProcessTree(pid);
     }
   };
-}
-
-function deadPid() {
-  const result = run(process.execPath, ["-e", ""]);
-  assert.equal(result.status, 0);
-  return result.pid;
 }
 
 test("ensureBrokerSession kills a live unreachable broker before replacing it (#753/#762)", async () => {

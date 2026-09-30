@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-import { IS_WIN, makeTempDir, run } from "./helpers.mjs";
+import { deadPid, IS_WIN, makeTempDir, run } from "./helpers.mjs";
 import { getProcessIdentity } from "../plugins/codex/scripts/lib/process.mjs";
 import {
   consumeJobRequestFile,
@@ -21,7 +21,6 @@ import {
   retryOnWindows,
   saveState,
   STATE_LOCK_TIMEOUT_CODE,
-  upsertJob,
   withStateLock,
   writeJobRequestFile
 } from "../plugins/codex/scripts/lib/state.mjs";
@@ -112,7 +111,6 @@ test("saveState prunes dropped job artifacts when indexed jobs exceed the cap", 
   });
 
   const prunedJobFile = resolveJobFile(workspace, "job-0");
-  const prunedLogFile = resolveJobLogFile(workspace, "job-0");
   const retainedJobFile = resolveJobFile(workspace, "job-50");
   const retainedLogFile = resolveJobLogFile(workspace, "job-50");
   const jobsDir = path.dirname(prunedJobFile);
@@ -313,12 +311,6 @@ function seedLockEntry(lockDir, name, pid, startedAt = new Date().toISOString(),
   const entry = path.join(lockDir, name);
   fs.writeFileSync(entry, `${JSON.stringify({ pid, startedAt, identity })}\n`, "utf8");
   return entry;
-}
-
-function deadPid() {
-  const finished = run(process.execPath, ["-e", "process.exit(0)"], { env: process.env });
-  assert.equal(finished.status, 0);
-  return finished.pid;
 }
 
 // The property the whole lock exists for, checked the only way that means

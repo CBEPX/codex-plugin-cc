@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 
 import { getCodexAvailability } from "./lib/codex.mjs";
 import { readHookInput } from "./lib/hook-input.mjs";
+import { isActiveJobStatus } from "./lib/job-status.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import { getConfig, setConfig, listJobs, resolveStateFile, retryOnWindows } from "./lib/state.mjs";
 import { sortJobsNewestFirst } from "./lib/job-control.mjs";
@@ -23,7 +24,6 @@ const ESCAPE_HATCH = "Disable with /codex:setup --disable-review-gate.";
 const MANUAL_HINT = `Run /codex:review --wait manually. ${ESCAPE_HATCH}`;
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = path.resolve(SCRIPT_DIR, "..");
-const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
 const GATE_ROUNDS_CONFIG_KEY = "stopReviewGateRoundsBySession";
 
 function emitDecision(payload) {
@@ -234,7 +234,7 @@ async function main() {
   const config = getConfig(workspaceRoot);
 
   const jobs = sortJobsNewestFirst(filterJobsForCurrentSession(reapDeadJobs(workspaceRoot, listJobs(workspaceRoot)), input));
-  const runningJob = jobs.find((job) => job.status === "queued" || job.status === "running");
+  const runningJob = jobs.find((job) => isActiveJobStatus(job.status));
   const runningTaskNote = runningJob
     ? `Codex task ${runningJob.id} is still running. Check /codex:status and use /codex:cancel ${runningJob.id} if you want to stop it before ending the session.`
     : null;

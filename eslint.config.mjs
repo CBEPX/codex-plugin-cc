@@ -4,7 +4,6 @@ import globals from "globals";
 export default [
   {
     ignores: [
-      ".claude/**",
       ".githooks/**",
       ".stryker-tmp/**",
       ".worktrees/**",
@@ -27,7 +26,7 @@ export default [
     },
     rules: {
       "no-empty": "off",
-      "no-unused-vars": "off",
+      "no-unused-vars": ["error", { argsIgnorePattern: "^_", varsIgnorePattern: "^_", caughtErrors: "none" }],
       "no-useless-assignment": "off",
       "no-useless-escape": "off",
       "preserve-caught-error": "off",

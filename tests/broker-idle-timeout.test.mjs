@@ -7,7 +7,7 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
-import { IS_WIN, makeTempDir, run } from "./helpers.mjs";
+import { delay, IS_WIN, makeTempDir, run, waitForExit } from "./helpers.mjs";
 import { createBrokerEndpoint, parseBrokerEndpoint } from "../plugins/codex/scripts/lib/broker-endpoint.mjs";
 import { clearBrokerSession, loadBrokerSession, saveBrokerSession, waitForBrokerEndpoint } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
 
@@ -23,24 +23,6 @@ function spawnBroker({ cwd, endpoint, env, idleTimeoutMs }) {
     cwd,
     env,
     stdio: ["ignore", "pipe", "pipe"]
-  });
-}
-
-function waitForExit(child, { timeoutMs = 5000 } = {}) {
-  return new Promise((resolve, reject) => {
-    if (child.exitCode !== null || child.signalCode !== null) {
-      resolve({ code: child.exitCode, signal: child.signalCode });
-      return;
-    }
-    const timer = setTimeout(() => {
-      child.removeListener("exit", onExit);
-      reject(new Error("Timed out waiting for broker process to exit."));
-    }, timeoutMs);
-    function onExit(code, signal) {
-      clearTimeout(timer);
-      resolve({ code, signal });
-    }
-    child.once("exit", onExit);
   });
 }
 
@@ -62,10 +44,6 @@ async function waitFor(predicate, timeoutMs, message) {
     await delay(25);
   }
   throw new Error(message);
-}
-
-function delay(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 // Connect and try one `initialize`, reporting whether the broker served it.

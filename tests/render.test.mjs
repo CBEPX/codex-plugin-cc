@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { renderJobStatusReport, renderReviewResult, renderStoredJobResult } from "../plugins/codex/scripts/lib/render.mjs";
+import { looksLikeVerificationCommand, renderJobStatusReport, renderReviewResult, renderStoredJobResult, shorten } from "../plugins/codex/scripts/lib/render.mjs";
 
 test("renderReviewResult degrades gracefully when JSON is missing required review fields", () => {
   const output = renderReviewResult(
@@ -66,4 +66,17 @@ test("renderJobStatusReport prints Error only for failed jobs whose error adds t
   assert.match(distinct, /^ {2}Error: Quota exhausted$/m);
   const completed = renderJobStatusReport({ ...base, status: "completed", summary: "Done", errorMessage: "stale" });
   assert.doesNotMatch(completed, /Error:/);
+});
+
+test("shorten: collapses whitespace, truncates with an ellipsis, tolerates null", () => {
+  const long = shorten("a".repeat(100), 96);
+  assert.equal(long.length, 96);
+  assert.ok(long.endsWith("..."));
+  assert.equal(shorten(" a \n b ", 96), "a b");
+  assert.equal(shorten(null, 96), "");
+});
+
+test("looksLikeVerificationCommand: test runners yes, plain shell no", () => {
+  for (const command of ["npm test", "pytest -q", "tsc"]) assert.equal(looksLikeVerificationCommand(command), true, command);
+  for (const command of ["git status", "ls -la"]) assert.equal(looksLikeVerificationCommand(command), false, command);
 });
