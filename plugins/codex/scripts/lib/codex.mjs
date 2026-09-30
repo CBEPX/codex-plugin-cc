@@ -150,6 +150,12 @@ function buildTaskThreadName(prompt) {
   return excerpt ? `${TASK_THREAD_PREFIX}: ${excerpt}` : TASK_THREAD_PREFIX;
 }
 
+// Review threads persist like task threads (#529) but never carry the task
+// prefix, so findLatestTaskThread and `--resume-last` cannot pick one.
+export function buildReviewThreadName(reviewName, label) {
+  return `Codex Companion ${reviewName}: ${shorten(label, 56)}`;
+}
+
 function extractThreadId(message) {
   return message?.params?.threadId ?? null;
 }
@@ -1235,7 +1241,7 @@ export async function runAppServerReview(cwd, options = {}) {
       config: options.config,
       reviewModel: options.model,
       sandbox: "read-only",
-      ephemeral: true,
+      ephemeral: false,
       threadName: options.threadName
     });
     const sourceThreadId = response.thread.id;

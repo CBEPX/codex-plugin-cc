@@ -485,3 +485,33 @@ test("adversarial-review reports a parsed non-review reply as an invalid review 
     assert.ok(text.stdout.includes("Raw final message:\n\n```text\n" + answer + "\n```"), `${label}: ${text.stdout}`);
   }
 });
+
+test("review and adversarial-review persist named threads that --resume-last never picks (#529)", () => {
+  const repo = seededRepo();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello again\n");
+  const env = buildEnv(binDir);
+  const lastThread = () => {
+    const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+    return { start: state.lastThreadStart, thread: state.threads.find((entry) => entry.id === state.lastThreadStart.threadId) };
+  };
+
+  const review = run(process.execPath, [SCRIPT, "review"], { cwd: repo, env });
+  assert.equal(review.status, 0, review.stderr);
+  let { start, thread } = lastThread();
+  assert.equal(start.ephemeral, false, "built-in review thread persists");
+  assert.equal(thread.name, "Codex Companion Review: working tree diff");
+
+  const adversarial = run(process.execPath, [SCRIPT, "adversarial-review", "check auth"], { cwd: repo, env });
+  assert.equal(adversarial.status, 0, adversarial.stderr);
+  ({ start, thread } = lastThread());
+  assert.equal(start.ephemeral, false, "adversarial review thread persists");
+  assert.equal(thread.name, "Codex Companion Adversarial Review: check auth");
+
+  // No session id in tests (test-env.mjs), so --resume-last falls through to findLatestTaskThread.
+  const resume = run(process.execPath, [SCRIPT, "task", "--resume-last", "follow up"], { cwd: repo, env });
+  assert.notEqual(resume.status, 0, resume.stdout);
+  assert.match(resume.stderr, /No previous Codex task thread was found for this repository\./);
+});

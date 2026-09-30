@@ -10,7 +10,7 @@ import {
   REVIEW_SCHEMA,
   ROOT_DIR
 } from "../lib/cli.mjs";
-import { parseStructuredOutput, readOutputSchema, runAppServerReview, runAppServerTurn } from "../lib/codex.mjs";
+import { buildReviewThreadName, parseStructuredOutput, readOutputSchema, runAppServerReview, runAppServerTurn } from "../lib/codex.mjs";
 import { buildAdversarialCollectionGuidance, collectReviewContext, ensureGitRepository, resolveReviewTarget } from "../lib/git.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "../lib/prompts.mjs";
 import { renderNativeReviewResult, renderReviewResult, validateReviewResultShape } from "../lib/render.mjs";
@@ -96,6 +96,7 @@ async function executeReviewRun(request) {
       effort: request.effort,
       config: request.config,
       turnTimeoutMs: request.turnTimeoutMs,
+      threadName: buildReviewThreadName(reviewName, focusText || target.label),
       onProgress: request.onProgress
     });
     const payload = {
@@ -145,6 +146,8 @@ async function executeReviewRun(request) {
     sandbox: "read-only",
     outputSchema: readOutputSchema(REVIEW_SCHEMA),
     turnTimeoutMs: request.turnTimeoutMs,
+    persistThread: true,
+    threadName: buildReviewThreadName(reviewName, focusText || context.target.label),
     onProgress: request.onProgress
   });
   const parsed = parseStructuredOutput(result.finalMessage, {
