@@ -3,7 +3,7 @@ import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { collectReviewContext, resolveReviewTarget } from "../plugins/codex/scripts/lib/git.mjs";
+import { collectReviewContext, detectDefaultBranch, resolveReviewTarget } from "../plugins/codex/scripts/lib/git.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 
 test("resolveReviewTarget prefers working tree when repo is dirty", () => {
@@ -241,4 +241,41 @@ test("resolveReviewTarget accepts a branch, tag, sha and remote-tracking base", 
   for (const ref of ["main", "v1", "va", sha, "origin/main"]) {
     assert.deepEqual(resolveReviewTarget(cwd, { base: ref }), { mode: "branch", label: `branch diff against ${ref}`, baseRef: ref, explicit: true }, ref);
   }
+});
+
+// origin/HEAD points at `head`; `main` is committed, mirrored as origin/main, optionally deleted
+// locally, and the checkout sits on a feature branch one commit ahead.
+function originHeadRepo({ head = "main", keepLocalMain = true } = {}) {
+  const cwd = baseRefRepo();
+  run("git", ["symbolic-ref", "refs/remotes/origin/HEAD", `refs/remotes/origin/${head}`], { cwd });
+  fs.writeFileSync(path.join(cwd, "app.js"), "console.log('feature');\n");
+  run("git", ["commit", "-am", "feature"], { cwd });
+  if (!keepLocalMain) {
+    run("git", ["branch", "-D", "main"], { cwd });
+  }
+  return cwd;
+}
+
+test("detectDefaultBranch returns the origin/HEAD branch when it exists locally (#653)", () => {
+  assert.equal(detectDefaultBranch(originHeadRepo()), "main");
+});
+
+test("detectDefaultBranch returns origin/<name> when the origin/HEAD branch exists only as a remote-tracking ref (#653)", () => {
+  assert.equal(detectDefaultBranch(originHeadRepo({ keepLocalMain: false })), "origin/main");
+});
+
+test("detectDefaultBranch falls through to the candidates when the origin/HEAD branch resolves nowhere (#653)", () => {
+  const cwd = originHeadRepo({ head: "gone" });
+  run("git", ["branch", "master", "main"], { cwd });
+  run("git", ["branch", "-D", "main"], { cwd });
+  run("git", ["update-ref", "-d", "refs/remotes/origin/main"], { cwd });
+  assert.equal(detectDefaultBranch(cwd), "master");
+});
+
+test("resolveReviewTarget uses a base that resolves locally when origin/HEAD names a remote-only branch (#653)", () => {
+  const cwd = originHeadRepo({ keepLocalMain: false });
+  const target = resolveReviewTarget(cwd, {});
+  assert.equal(target.mode, "branch");
+  assert.equal(target.baseRef, "origin/main");
+  assert.equal(run("git", ["merge-base", "HEAD", target.baseRef], { cwd }).status, 0);
 });

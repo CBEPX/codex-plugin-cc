@@ -96,7 +96,13 @@ export function detectDefaultBranch(cwd) {
   if (symbolic.status === 0) {
     const remoteHead = symbolic.stdout.trim();
     if (remoteHead.startsWith("refs/remotes/origin/")) {
-      return remoteHead.replace("refs/remotes/origin/", "");
+      const name = remoteHead.replace("refs/remotes/origin/", "");
+      if (git(cwd, ["show-ref", "--verify", "--quiet", `refs/heads/${name}`]).status === 0) {
+        return name;
+      }
+      if (git(cwd, ["show-ref", "--verify", "--quiet", `refs/remotes/origin/${name}`]).status === 0) {
+        return `origin/${name}`;
+      }
     }
   }
 
