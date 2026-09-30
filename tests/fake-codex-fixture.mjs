@@ -200,6 +200,10 @@ function nativeReviewText(target) {
 }
 
 function structuredReviewPayload(prompt) {
+  // FAKE_CODEX_REVIEW_ANSWER_TEXT: the structured review's final answer verbatim.
+  if (process.env.FAKE_CODEX_REVIEW_ANSWER_TEXT) {
+    return process.env.FAKE_CODEX_REVIEW_ANSWER_TEXT;
+  }
   if (prompt.includes("adversarial software review")) {
     if (BEHAVIOR === "adversarial-clean") {
       return JSON.stringify({

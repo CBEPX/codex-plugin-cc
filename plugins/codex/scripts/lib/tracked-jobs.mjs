@@ -382,7 +382,7 @@ function markJobDeadLocked(workspaceRoot, jobSummary, errorMessage) {
 export const DEAD_WORKER_MESSAGE = "worker exited before completing";
 
 // How long a queued job may sit without a recorded pid before it counts as dead.
-// `enqueueBackgroundTask` patches the pid in immediately after the spawn, so the
+// `enqueueBackgroundJob` patches the pid in immediately after the spawn, so the
 // window is milliseconds wide in practice; the grace period only has to outlast
 // a heavily loaded machine.
 const QUEUED_WITHOUT_PID_GRACE_MS = 30000;

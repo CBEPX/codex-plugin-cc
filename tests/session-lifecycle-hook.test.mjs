@@ -1,10 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 
-import { makeTempDir } from "./helpers.mjs";
+import { deadPid as deadPidOf, makeTempDir } from "./helpers.mjs";
 import { loadState, resolveStateDir, upsertJob } from "../plugins/codex/scripts/lib/state.mjs";
 import { cleanupSessionJobs, killStepMs } from "../plugins/codex/scripts/session-lifecycle-hook.mjs";
 
@@ -27,9 +26,10 @@ test("SessionEnd keeps a job whose tree left survivors and drops one whose kill 
     ["win32", { attempted: false, delivered: false, method: "handle", reason: "identity-mismatch" }, false, null],
     ["win32", { attempted: false, delivered: false, method: "handle", reason: "process-missing" }, false, null]
   ];
-  // A pid that is provably dead: a child that has already exited (reaped by
-  // spawnSync), so no table row depends on which pids the host happens to use.
-  const deadPid = spawnSync(process.execPath, ["-e", "0"]).pid;
+  // Every row judges a dead root. The pid comes from an exited child, and the
+  // liveness answer is injected: the host may hand that pid to a new process
+  // between rows, which flipped a row on a Windows runner.
+  const deadPid = deadPidOf();
   for (const [platform, outcome, keptExpected, stderrPattern] of cases) {
     const repo = makeTempDir();
     const sessionId = "session-1";
@@ -38,7 +38,7 @@ test("SessionEnd keeps a job whose tree left survivors and drops one whose kill 
     const original = process.stderr.write;
     process.stderr.write = (chunk) => { written.push(String(chunk)); return true; };
     try {
-      cleanupSessionJobs(repo, sessionId, 1000, () => 8000, { platform, terminateRecordedProcessImpl: typeof outcome === "function" ? outcome : () => outcome, broker: { pid: 555, pidIdentity: "win32:1" } });
+      cleanupSessionJobs(repo, sessionId, 1000, () => 8000, { platform, isPidAliveImpl: () => false, terminateRecordedProcessImpl: typeof outcome === "function" ? outcome : () => outcome, broker: { pid: 555, pidIdentity: "win32:1" } });
     } finally {
       process.stderr.write = original;
     }
@@ -52,7 +52,7 @@ test("SessionEnd keeps a job whose tree left survivors and drops one whose kill 
 
 test("SessionEnd passes the verified broker as the excluded subtree and refuses without its identity", () => {
   const repo = makeTempDir();
-  const deadPid = spawnSync(process.execPath, ["-e", "0"]).pid;
+  const deadPid = deadPidOf();
   upsertJob(repo, { id: "job-1", status: "running", sessionId: "s", background: false, pid: deadPid, pidIdentity: "win32:1" });
   let seen = null;
   cleanupSessionJobs(repo, "s", 1000, () => 8000, { platform: "win32", broker: { pid: 555, pidIdentity: "win32:1" }, terminateRecordedProcessImpl: (pid, options) => { seen = options; return { attempted: true, delivered: true, method: "handle", reason: "identity-match" }; } });
@@ -76,7 +76,7 @@ test("SessionEnd passes the verified broker as the excluded subtree and refuses 
 
 test("SessionEnd keeps the job untouched when the broker presence is unknown", () => {
   const repo = makeTempDir();
-  const deadPid = spawnSync(process.execPath, ["-e", "0"]).pid;
+  const deadPid = deadPidOf();
   upsertJob(repo, { id: "job-1", status: "running", sessionId: "s", background: false, pid: deadPid, pidIdentity: "win32:1" });
   const written = [];
   const original = process.stderr.write;
@@ -92,7 +92,7 @@ test("SessionEnd keeps the job untouched when the broker presence is unknown", (
 
 test("SessionEnd without a recorded broker still kills the worker, excluding nothing", () => {
   const repo = makeTempDir();
-  const deadPid = spawnSync(process.execPath, ["-e", "0"]).pid;
+  const deadPid = deadPidOf();
   upsertJob(repo, { id: "job-1", status: "running", sessionId: "s", background: false, pid: deadPid, pidIdentity: "win32:1" });
   let seen = null;
   cleanupSessionJobs(repo, "s", 1000, () => 8000, { platform: "win32", broker: null, terminateRecordedProcessImpl: (pid, options) => { seen = options; return { attempted: true, delivered: true, method: "handle", reason: "identity-match" }; } });
@@ -120,7 +120,7 @@ test("SessionEnd drops a pid-less job even when the broker presence is unknown",
 
 test("SessionEnd reads the broker presence for worker kills under the cleanup lock", () => {
   const repo = makeTempDir();
-  const deadPid = spawnSync(process.execPath, ["-e", "0"]).pid;
+  const deadPid = deadPidOf();
   upsertJob(repo, { id: "job-1", status: "running", sessionId: "s", background: false, pid: deadPid, pidIdentity: "win32:1" });
   let tickets = null;
   let seen = null;

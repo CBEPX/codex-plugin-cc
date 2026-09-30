@@ -150,6 +150,12 @@ function buildTaskThreadName(prompt) {
   return excerpt ? `${TASK_THREAD_PREFIX}: ${excerpt}` : TASK_THREAD_PREFIX;
 }
 
+// Review threads persist like task threads (#529) but never carry the task
+// prefix, so findLatestTaskThread and `--resume-last` cannot pick one.
+export function buildReviewThreadName(reviewName, label) {
+  return `Codex Companion ${reviewName}: ${shorten(label, 56)}`;
+}
+
 function extractThreadId(message) {
   return message?.params?.threadId ?? null;
 }
@@ -1235,7 +1241,7 @@ export async function runAppServerReview(cwd, options = {}) {
       config: options.config,
       reviewModel: options.model,
       sandbox: "read-only",
-      ephemeral: true,
+      ephemeral: false,
       threadName: options.threadName
     });
     const sourceThreadId = response.thread.id;
@@ -1466,6 +1472,72 @@ export function buildPersistentTaskThreadName(prompt) {
   return buildTaskThreadName(prompt);
 }
 
+// Codex sometimes wraps its schema answer in a markdown fence or in prose (#583).
+// Recovery, ported from cc-plugin-codex: the whole message, else the first
+// fenced block when it holds an object or array, else the first depth-zero
+// `{…}` that parses. A reply that only quotes an object is therefore read as
+// that object (spec §Limits). The caller checks the review shape.
+
+// Match only the opening line; find the closing marker without backtracking.
+const FENCE_OPEN_PATTERN = /```(?:json)?[^\S\r\n]*\r?\n/;
+
+function extractFirstFencedBlock(text) {
+  const opening = FENCE_OPEN_PATTERN.exec(text);
+  if (!opening) return null;
+  const start = opening.index + opening[0].length;
+  const end = text.indexOf("\n```", start);
+  return end === -1 ? null : text.slice(start, end);
+}
+
+// Try complete depth-zero objects; do not recover inside broken containers.
+// The scan knows JSON strings and `\` escapes, so braces inside strings do not count.
+// ponytail: candidates nested inside a broken outer `{` (one that never closes or
+// does not parse) are not recovered, a deviation from cc-plugin-codex that keeps
+// the scan linear; add a bounded rescan if real replies need that recovery.
+function extractFirstJsonObject(text) {
+  let start = -1;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index];
+    if (depth === 0) {
+      if (char !== "{") continue;
+      start = index;
+    }
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === "\"") inString = false;
+      continue;
+    }
+    if (char === "\"") {
+      inString = true;
+    } else if (char === "{") {
+      depth += 1;
+    } else if (char === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        try {
+          return JSON.parse(text.slice(start, index + 1));
+        } catch {
+          // Continue with the next depth-zero candidate.
+        }
+      }
+    }
+  }
+  return null;
+}
+
+function tryParseJson(text) {
+  try {
+    return { ok: true, value: JSON.parse(text) };
+  } catch (error) {
+    return { ok: false, error };
+  }
+}
+
 export function parseStructuredOutput(rawOutput, fallback = {}) {
   if (!rawOutput) {
     return {
@@ -1476,21 +1548,21 @@ export function parseStructuredOutput(rawOutput, fallback = {}) {
     };
   }
 
-  try {
-    return {
-      parsed: JSON.parse(rawOutput),
-      parseError: null,
-      rawOutput,
-      ...fallback
-    };
-  } catch (error) {
-    return {
-      parsed: null,
-      parseError: error.message,
-      rawOutput,
-      ...fallback
-    };
+  const text = rawOutput.trim();
+  const whole = tryParseJson(text);
+  if (whole.ok) {
+    return { parsed: whole.value, parseError: null, rawOutput, ...fallback };
   }
+  const fenced = extractFirstFencedBlock(text);
+  const fromFence = fenced === null ? null : tryParseJson(fenced);
+  if (fromFence?.ok && fromFence.value !== null && typeof fromFence.value === "object") {
+    return { parsed: fromFence.value, parseError: null, rawOutput, ...fallback };
+  }
+  const embedded = extractFirstJsonObject(text);
+  if (embedded !== null) {
+    return { parsed: embedded, parseError: null, rawOutput, ...fallback };
+  }
+  return { parsed: null, parseError: whole.error.message, rawOutput, ...fallback };
 }
 
 export function readOutputSchema(schemaPath) {

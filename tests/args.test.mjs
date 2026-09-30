@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 
-import { parseArgs, splitRawArgumentString } from "../plugins/codex/scripts/lib/args.mjs";
+import { parseArgs, splitArgsWithVerbatimTail, splitRawArgumentString } from "../plugins/codex/scripts/lib/args.mjs";
 import { makeTempDir, run, initGitRepo } from "./helpers.mjs";
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import fs from "node:fs";
@@ -134,4 +134,63 @@ test("splitRawArgumentString keeps the old escape semantics for quotes, backslas
   assert.deepEqual(splitRawArgumentString("say \\\"q\\\" a\\ b back\\\\slash it\\'s"), ["say", "\"q\"", "a b", "back\\slash", "it's"]);
   assert.deepEqual(splitRawArgumentString("'it\\'s'"), ["it's"]); // old behaviour, kept
   assert.deepEqual(splitRawArgumentString("\\\\server\\share"), ["\\server\\share"]); // documented limitation
+});
+
+// The review commands' option table as applyArgsStdin hands it over:
+// REVIEW_ARG_SPEC plus the shared help flag and -C/-h aliases.
+const REVIEW_SPLIT_SPEC = {
+  valueOptions: ["base", "scope", "model", "effort", "cwd", "turn-timeout-ms"],
+  booleanOptions: ["help", "json", "background", "wait"],
+  repeatableOptions: ["config"],
+  aliasMap: { C: "cwd", h: "help", m: "model" }
+};
+
+test("splitArgsWithVerbatimTail keeps everything from the first positional as one verbatim token (#714)", () => {
+  const cases = [
+    ["don't mangle this", ["don't mangle this"]],
+    ["--base main don't mangle \"this\"\nline 2\n", ["--base", "main", "don't mangle \"this\"\nline 2"]],
+    ["focus \"quoted\" and 'single' C:\\dir\\x \\n", ["focus \"quoted\" and 'single' C:\\dir\\x \\n"]],
+    ["--json\n  line 1\n\n  line 2  \n", ["--json", "line 1\n\n  line 2"]],
+    ["--model sol check --model x please", ["--model", "sol", "check --model x please"]],
+    ["-m sol focus", ["-m", "sol", "focus"]],
+    ["-C /tmp/x focus", ["-C", "/tmp/x", "focus"]],
+    ["--config k=v --config=a=b focus", ["--config", "k=v", "--config=a=b", "focus"]],
+    ["--model=sol focus", ["--model=sol", "focus"]],
+    ["--config 'a b=c d' focus", ["--config", "a b=c d", "focus"]],
+    ["-- -x y", ["--", "-x y"]],
+    ["--base main -- --model is wrong\n", ["--base", "main", "--", "--model is wrong"]],
+    ["--", ["--"]],
+    ["--base main --json", ["--base", "main", "--json"]],
+    ["--bogus focus", ["--bogus", "focus"]],
+    ["--base", ["--base"]],
+    ["--base -x focus", ["--base", "-x", "focus"]],
+    ["- check auth\n- check races\n", ["--", "- check auth\n- check races"]],
+    ["--base main - check auth", ["--base", "main", "--", "- check auth"]],
+    ["\"quoted focus\" more", ["\"quoted focus\" more"]],
+    ["check\n--\nmore", ["check\n--\nmore"]],
+    ["--config --json focus", ["--config", "--json", "focus"]],
+    ["--base main\r\nfix the\r\nthing\r\n", ["--base", "main", "fix the\r\nthing"]],
+    ["", []],
+    ["  \n\t", []]
+  ];
+  for (const [raw, expected] of cases) {
+    assert.deepEqual(splitArgsWithVerbatimTail(raw, REVIEW_SPLIT_SPEC), expected, JSON.stringify(raw));
+  }
+});
+
+test("splitArgsWithVerbatimTail output parses to the same options and one focus string", () => {
+  const parse = (raw) =>
+    parseArgs(splitArgsWithVerbatimTail(raw, REVIEW_SPLIT_SPEC), { ...REVIEW_SPLIT_SPEC, rejectUnknownOptions: true, stopAtFirstPositional: true });
+  const { options, positionals } = parse("--model sol -C /tmp/x --config a=1 check --model x, don't \"stop\"\n");
+  assert.equal(options.model, "sol");
+  assert.equal(options.cwd, "/tmp/x");
+  assert.deepEqual(options.config, ["a=1"]);
+  assert.deepEqual(positionals, ["check --model x, don't \"stop\""]);
+  assert.deepEqual(parse("-- --model is wrong").positionals, ["--model is wrong"]);
+  assert.deepEqual(parse("- check auth\n- check races\n").positionals, ["- check auth\n- check races"]);
+  const dashValue = parse("--config --json focus");
+  assert.deepEqual(dashValue.options.config, ["--json"]);
+  assert.deepEqual(dashValue.positionals, ["focus"]);
+  assert.throws(() => parse("--base"), /Missing value for --base/);
+  assert.throws(() => parse("--bogus focus"), /Unknown option: --bogus/);
 });

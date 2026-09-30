@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { buildThreadConfig } from "../plugins/codex/scripts/lib/codex.mjs";
+import { buildReviewThreadName, buildThreadConfig, TASK_THREAD_PREFIX } from "../plugins/codex/scripts/lib/codex.mjs";
 
 test("buildThreadConfig returns null when nothing is set", () => {
   assert.equal(buildThreadConfig({}), null);
@@ -23,4 +23,14 @@ test("buildThreadConfig lets dedicated flags win over generic overrides and pars
     }),
     { "sandbox_workspace_write.network_access": true, model_provider: "ollama", n: 3, model_reasoning_effort: "max" }
   );
+});
+
+test("buildReviewThreadName names review threads outside the task prefix (#529)", () => {
+  assert.equal(buildReviewThreadName("Review", "working tree diff"), "Codex Companion Review: working tree diff");
+  const long = buildReviewThreadName("Adversarial Review", `check ${"the auth flow ".repeat(10)}`);
+  assert.equal(long.length, "Codex Companion Adversarial Review: ".length + 56);
+  assert.ok(long.endsWith("..."), long);
+  for (const name of [long, buildReviewThreadName("Review", "branch diff against main")]) {
+    assert.equal(name.startsWith(TASK_THREAD_PREFIX), false, name);
+  }
 });

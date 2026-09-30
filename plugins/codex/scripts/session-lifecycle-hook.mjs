@@ -104,7 +104,7 @@ function appendEnvVar(name, value) {
 }
 
 export function cleanupSessionJobs(cwd, sessionId, lockWaitMs, remainingMs, deps = {}) {
-  const { platform = process.platform, terminateRecordedProcessImpl = terminateRecordedProcess } = deps;
+  const { platform = process.platform, terminateRecordedProcessImpl = terminateRecordedProcess, isPidAliveImpl = isPidAlive } = deps;
   // Read under the lock below: a broker cannot start between this read and the kills.
   const loadBroker = deps.loadBroker ?? (() => deps.broker ?? null);
   if (!cwd || !sessionId) {
@@ -189,7 +189,7 @@ export function cleanupSessionJobs(cwd, sessionId, lockWaitMs, remainingMs, deps
         // §1). identity-mismatch and process-missing without survivors are
         // settled once the root is dead.
         const unresolved = platform === "win32" && (refused || ["identity-unavailable", "kill-failed"].includes(reason) || (outcome?.survivors?.length ?? 0) > 0 || outcome?.unverified === true);
-        if (reason && isPidAlive(pid) === false && !unresolved) {
+        if (reason && isPidAliveImpl(pid) === false && !unresolved) {
           reason = null;
         }
         if (unresolved) {

@@ -210,6 +210,12 @@ export function buildStatusSnapshot(cwd, options = {}) {
     .filter((job) => !isActiveJobStatus(job.status) && job.id !== latestFinished?.id)
     .map((job) => enrichJob(job, { maxProgressLines }));
 
+  // Finished jobs past the list's cut, other than the one shown as latest
+  // finished: what `--all` would add. Active jobs are always listed.
+  const omittedJobs = options.all
+    ? 0
+    : jobs.slice(maxJobs).filter((job) => !isActiveJobStatus(job.status) && job.id !== latestFinished?.id).length;
+
   return {
     workspaceRoot,
     config,
@@ -217,7 +223,9 @@ export function buildStatusSnapshot(cwd, options = {}) {
     running,
     latestFinished,
     recent,
-    needsReview: Boolean(config.stopReviewGate)
+    needsReview: Boolean(config.stopReviewGate),
+    totalJobs: jobs.length,
+    omittedJobs
   };
 }
 

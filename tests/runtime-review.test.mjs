@@ -14,6 +14,7 @@ import {
   SCRIPT,
   seededRepo
 } from "./helpers.mjs";
+import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
 
 
 test("review renders a no-findings result from app-server review/start", () => {
@@ -348,4 +349,169 @@ test("review accepts slash-command style single-string arguments", () => {
   assert.equal(result.status, 0, result.stderr);
   const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
   assert.deepEqual(fakeState.lastThreadStart.config, { model_provider: "ollama", model_reasoning_effort: "xhigh" });
+});
+
+// A repo on `feature` one commit ahead of `main`, clean, for `--base main`.
+function featureBranchRepo() {
+  const repo = seededRepo();
+  run("git", ["checkout", "-b", "feature"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "README.md"), "hello feature\n");
+  run("git", ["commit", "-am", "feature"], { cwd: repo });
+  return repo;
+}
+
+function focusLine(prompt) {
+  return prompt.slice(prompt.indexOf("User focus:"), prompt.indexOf("</task>"));
+}
+
+test("adversarial-review --args-stdin passes the focus text verbatim (#714)", () => {
+  const repo = featureBranchRepo();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+
+  const result = run(process.execPath, [SCRIPT, "adversarial-review", "--args-stdin"], {
+    cwd: repo,
+    env: buildEnv(binDir),
+    input: "--base main don't mangle \"this\"\nline 2\n"
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const prompt = JSON.parse(fs.readFileSync(statePath, "utf8")).lastTurnStart.prompt;
+  assert.ok(prompt.includes("Target: branch diff against main\n"), "the flags before the focus still apply");
+  assert.ok(prompt.includes("User focus: don't mangle \"this\"\nline 2\n</task>"), focusLine(prompt));
+});
+
+test("adversarial-review --args-stdin keeps a focus-only heredoc in one piece and takes -- as the end of flags", () => {
+  const repo = featureBranchRepo();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+
+  // One token after splitting: normalizeArgv must not re-split it.
+  const only = run(process.execPath, [SCRIPT, "adversarial-review", "--args-stdin"], { cwd: repo, env: buildEnv(binDir), input: "don't stop\n" });
+  assert.equal(only.status, 0, only.stderr);
+  let turn = JSON.parse(fs.readFileSync(statePath, "utf8")).lastTurnStart;
+  assert.ok(turn.prompt.includes("User focus: don't stop\n</task>"), focusLine(turn.prompt));
+
+  const dashed = run(process.execPath, [SCRIPT, "adversarial-review", "--args-stdin"], { cwd: repo, env: buildEnv(binDir), input: "-- --model is wrong\n" });
+  assert.equal(dashed.status, 0, dashed.stderr);
+  turn = JSON.parse(fs.readFileSync(statePath, "utf8")).lastTurnStart;
+  assert.ok(turn.prompt.includes("User focus: --model is wrong\n</task>"), focusLine(turn.prompt));
+  assert.equal(turn.model, null, "--model after -- is focus text, not a flag");
+});
+
+test("adversarial-review --args-stdin accepts a bullet-led focus", () => {
+  const repo = featureBranchRepo();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+
+  const result = run(process.execPath, [SCRIPT, "adversarial-review", "--args-stdin"], {
+    cwd: repo,
+    env: buildEnv(binDir),
+    input: "- check auth\n- check races\n"
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const prompt = JSON.parse(fs.readFileSync(statePath, "utf8")).lastTurnStart.prompt;
+  assert.ok(prompt.includes("User focus: - check auth\n- check races\n</task>"), focusLine(prompt));
+});
+
+test("review --args-stdin with flags only still runs the built-in reviewer", () => {
+  const repo = featureBranchRepo();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+
+  const result = run(process.execPath, [SCRIPT, "review", "--args-stdin"], { cwd: repo, env: buildEnv(binDir), input: "--base main\n" });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Reviewed changes against main/);
+});
+
+test("review and adversarial-review refuse an unresolvable --base before any job or Codex start (#653)", () => {
+  for (const command of ["review", "adversarial-review"]) {
+    for (const ref of ["nope", "-x", "^main"]) {
+      const repo = seededRepo();
+      const binDir = makeTempDir();
+      installFakeCodex(binDir);
+      fs.writeFileSync(path.join(repo, "README.md"), "hello again\n");
+      const label = `${command} --base ${ref}`;
+
+      const result = run(process.execPath, [SCRIPT, command, "--base", ref], { cwd: repo, env: buildEnv(binDir) });
+
+      assert.equal(result.status, 1, `${label}: ${result.stdout}${result.stderr}`);
+      assert.ok(
+        result.stderr.includes(`Base ref "${ref}" not found in this repository; pass a branch, tag or commit that resolves locally (git fetch it first for a remote ref).`),
+        `${label}: ${result.stderr}`
+      );
+      // Failing before the job means no state was written at all.
+      const indexPath = path.join(resolveStateDir(repo), "state.json");
+      assert.deepEqual(fs.existsSync(indexPath) ? readStateIndex(repo).jobs : [], [], `${label}: no job record`);
+      // The fake bumps appServerStarts on every `codex app-server` launch (fake-codex-fixture.mjs:288).
+      const fakeStatePath = path.join(binDir, "fake-codex-state.json");
+      const starts = fs.existsSync(fakeStatePath) ? JSON.parse(fs.readFileSync(fakeStatePath, "utf8")).appServerStarts : 0;
+      assert.equal(starts, 0, `${label}: no app-server start`);
+    }
+  }
+});
+
+// A reply that parses but is not a review object is a parse failure at the
+// caller (#583): --json gives result null and the shape error, the exit code
+// stays the Codex turn's, and the text output shows the raw message.
+test("adversarial-review reports a parsed non-review reply as an invalid review shape (#583)", () => {
+  const rows = [
+    ["bare {}", "{}", "Invalid review shape: Missing string `verdict`."],
+    ["fenced []", "```json\n[]\n```", "Invalid review shape: Expected a top-level JSON object."]
+  ];
+  for (const [label, answer, parseError] of rows) {
+    const repo = seededRepo();
+    const binDir = makeTempDir();
+    installFakeCodex(binDir);
+    fs.writeFileSync(path.join(repo, "README.md"), "hello again\n");
+    const env = buildEnv(binDir, { FAKE_CODEX_REVIEW_ANSWER_TEXT: answer });
+
+    const json = run(process.execPath, [SCRIPT, "adversarial-review", "--json"], { cwd: repo, env });
+    assert.equal(json.status, 0, `${label}: ${json.stderr}`);
+    const payload = JSON.parse(json.stdout);
+    assert.equal(payload.result, null, label);
+    assert.equal(payload.parseError, parseError, label);
+    assert.equal(payload.rawOutput, answer, label);
+
+    const text = run(process.execPath, [SCRIPT, "adversarial-review"], { cwd: repo, env });
+    assert.equal(text.status, 0, `${label}: ${text.stderr}`);
+    assert.ok(text.stdout.includes("Codex did not return valid structured JSON."), `${label}: ${text.stdout}`);
+    assert.ok(text.stdout.includes(`- Parse error: ${parseError}`), `${label}: ${text.stdout}`);
+    assert.ok(text.stdout.includes("Raw final message:\n\n```text\n" + answer + "\n```"), `${label}: ${text.stdout}`);
+  }
+});
+
+test("review and adversarial-review persist named threads that --resume-last never picks (#529)", () => {
+  const repo = seededRepo();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello again\n");
+  const env = buildEnv(binDir);
+  const lastThread = () => {
+    const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+    return { start: state.lastThreadStart, thread: state.threads.find((entry) => entry.id === state.lastThreadStart.threadId) };
+  };
+
+  const review = run(process.execPath, [SCRIPT, "review"], { cwd: repo, env });
+  assert.equal(review.status, 0, review.stderr);
+  let { start, thread } = lastThread();
+  assert.equal(start.ephemeral, false, "built-in review thread persists");
+  assert.equal(thread.name, "Codex Companion Review: working tree diff");
+
+  const adversarial = run(process.execPath, [SCRIPT, "adversarial-review", "check auth"], { cwd: repo, env });
+  assert.equal(adversarial.status, 0, adversarial.stderr);
+  ({ start, thread } = lastThread());
+  assert.equal(start.ephemeral, false, "adversarial review thread persists");
+  assert.equal(thread.name, "Codex Companion Adversarial Review: check auth");
+
+  // No session id in tests (test-env.mjs), so --resume-last falls through to findLatestTaskThread.
+  const resume = run(process.execPath, [SCRIPT, "task", "--resume-last", "follow up"], { cwd: repo, env });
+  assert.notEqual(resume.status, 0, resume.stdout);
+  assert.match(resume.stderr, /No previous Codex task thread was found for this repository\./);
 });

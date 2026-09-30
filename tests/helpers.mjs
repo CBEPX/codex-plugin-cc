@@ -105,9 +105,20 @@ export function delay(ms) {
 
 // A pid that has certainly exited (a finished child), for stale-record fixtures.
 export function deadPid() {
-  const finished = run(process.execPath, ["-e", ""]);
-  if (finished.status !== 0) throw new Error(`deadPid: helper child exited ${finished.status}`);
-  return finished.pid;
+  // Windows can report a just-exited pid as alive for a moment (its handle is
+  // still open) or hand the number to a new process: wait until the liveness
+  // probe the plugin uses says "gone", and take another child if it never does.
+  const pause = new Int32Array(new SharedArrayBuffer(4));
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const finished = run(process.execPath, ["-e", ""]);
+    if (finished.status !== 0) throw new Error(`deadPid: helper child exited ${finished.status}`);
+    const deadline = Date.now() + 5000;
+    while (isPidAlive(finished.pid) !== false && Date.now() < deadline) {
+      Atomics.wait(pause, 0, 0, 50);
+    }
+    if (isPidAlive(finished.pid) === false) return finished.pid;
+  }
+  throw new Error("deadPid: no exited child's pid stayed dead");
 }
 
 export function waitForExit(child, { timeoutMs = 10000 } = {}) {
