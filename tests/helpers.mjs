@@ -118,7 +118,7 @@ export function waitForExit(child, { timeoutMs = 10000 } = {}) {
     }
     const timer = setTimeout(() => {
       child.removeListener("exit", onExit);
-      reject(new Error("Timed out waiting for broker process to exit."));
+      reject(new Error("Timed out waiting for the process to exit."));
     }, timeoutMs);
     function onExit(code, signal) {
       clearTimeout(timer);

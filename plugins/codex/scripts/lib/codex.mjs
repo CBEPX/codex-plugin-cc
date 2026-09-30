@@ -48,9 +48,9 @@ import { readJsonFile } from "./fs.mjs";
 import { BROKER_BUSY_RPC_CODE, BROKER_ENDPOINT_ENV, CodexAppServerClient } from "./app-server.mjs";
 import { loadBrokerSession } from "./broker-lifecycle.mjs";
 import { binaryAvailable } from "./process.mjs";
+import { isActiveJobStatus } from "./job-status.mjs";
 import { looksLikeVerificationCommand, shorten } from "./render.mjs";
 import { listJobs } from "./state.mjs";
-import { isActiveJobStatus } from "./job-status.mjs";
 import { reapDeadJobs } from "./tracked-jobs.mjs";
 
 const SERVICE_NAME = "claude_code_codex_plugin";

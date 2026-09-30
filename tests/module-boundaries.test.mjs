@@ -18,7 +18,7 @@ const ENTRY_ALLOW = {
 // Static import statements only; JSDoc `import("./x")` types do not count.
 function imports(file) {
   const src = fs.readFileSync(file, "utf8");
-  return [...src.matchAll(/^(?:import\b(?:[^;]*? from)?|\})\s*"(\.[^"]+)";/gm)].map((m) => m[1]);
+  return [...src.matchAll(/^import\b(?:[^;]*? from)?\s*"(\.[^"]+)";/gm)].map((m) => m[1]);
 }
 const libName = (spec) => path.basename(spec).replace(/\.mjs$/, "");
 

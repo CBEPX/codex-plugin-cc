@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.4.3 — 2026-09-30
+
+### Internal
+- No behaviour change. Duplicate helpers in `plugins/codex/scripts` consolidated (`nowIso`, `readStoredJob`, `readJsonOrNull`, `shorten`, `looksLikeVerificationCommand`, the pending-cancel text, the session filter, `buildJsonRpcError`); job status comparisons go through `lib/job-status.mjs`; dead `fs.mjs` exports removed.
+- Tests: shared harness helpers in `tests/helpers.mjs`; `tests/runtime.test.mjs` split by command family (`runtime-setup`, `-review`, `-task`, `-status`, `-cancel`, `-transfer`, `-hooks`), which roughly halves the local suite's wall time; new `module-boundaries` and `job-status` unit tests; eslint `no-unused-vars` enabled (unused imports and locals removed, no logic changes).
+
 ## 1.4.2 — 2026-09-30
 
 ### Fixed

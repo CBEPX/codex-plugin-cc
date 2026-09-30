@@ -73,7 +73,7 @@ export function readStoredJob(cwd, jobId) {
 
 **Files:** Create `plugins/codex/scripts/lib/job-status.mjs`, `tests/job-status.test.mjs`. Modify `lib/state.mjs`, `lib/tracked-jobs.mjs`, `lib/job-control.mjs`, `lib/codex.mjs`, `lib/render.mjs`, `session-lifecycle-hook.mjs`, `stop-review-gate-hook.mjs`, `codex-companion.mjs`.
 
-Count on 1f91ec2: `rg -n 'status\s*(===|!==)\s*"(queued|running)"' plugins/codex/scripts` → 33 lines (companion L451–452 is one comparison): tracked-jobs 7, state 4, codex 1, render 6, session hook 2, job-control 7, stop hook 1, companion 4 (+ the private `isActiveJobStatus` L429–431, `isActiveStatus` tracked-jobs L165–167, `isTerminalRecord` job-control L326–328). Phase strings (`"queued"` as a phase, `status: "running"` literals in records, comments, tests) stay.
+Count on 1f91ec2: `rg -n 'status\s*(===|!==)\s*"(queued|running)"' plugins/codex/scripts` → 32 comparisons on 33 lines (companion L451–452 is one comparison): tracked-jobs 7, state 4, codex 1, render 6, session hook 2, job-control 7, stop hook 1, companion 4 (+ the private `isActiveJobStatus` L429–431, `isActiveStatus` tracked-jobs L165–167, `isTerminalRecord` job-control L326–328). Phase strings (`"queued"` as a phase, `status: "running"` literals in records, comments, tests) stay.
 
 - [ ] **Step 1: Create `plugins/codex/scripts/lib/job-status.mjs`** (zero imports):
 
