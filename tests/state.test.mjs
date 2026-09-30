@@ -21,7 +21,6 @@ import {
   retryOnWindows,
   saveState,
   STATE_LOCK_TIMEOUT_CODE,
-  upsertJob,
   withStateLock,
   writeJobRequestFile
 } from "../plugins/codex/scripts/lib/state.mjs";
@@ -112,7 +111,6 @@ test("saveState prunes dropped job artifacts when indexed jobs exceed the cap", 
   });
 
   const prunedJobFile = resolveJobFile(workspace, "job-0");
-  const prunedLogFile = resolveJobLogFile(workspace, "job-0");
   const retainedJobFile = resolveJobFile(workspace, "job-50");
   const retainedLogFile = resolveJobLogFile(workspace, "job-50");
   const jobsDir = path.dirname(prunedJobFile);

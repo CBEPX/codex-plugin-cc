@@ -390,7 +390,7 @@ async function ensureBrokerSessionLocked(cwd, options, attempt) {
       }
       identity = post;
     }
-    const { replacer, replacingAt, ...rest } = current;
+    const { replacer: _replacer, replacingAt: _replacingAt, ...rest } = current;
     const promoted = { ...rest, state: "ready", pidIdentity: identity };
     return writeBrokerSessionIf(cwd, (latest) => sameClaim(latest, current), promoted) ? promoted : await retryClaim("the broker record kept changing");
   };

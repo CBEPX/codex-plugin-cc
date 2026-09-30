@@ -71,7 +71,7 @@ test("loadModelCatalog falls back from the env catalogue to models_cache.json, t
   writeCatalog(dir, "models_cache.json", { models: [{ slug: "gpt-cache" }] });
   const empty = writeCatalog(dir, "empty.json", { models: [] });
   const calls = [];
-  const bundled = (cmd, args, opts) => {
+  const bundled = (cmd, args) => {
     calls.push([cmd, args]);
     return { status: 0, stdout: JSON.stringify({ models: [{ slug: "gpt-bundled" }] }), error: null };
   };

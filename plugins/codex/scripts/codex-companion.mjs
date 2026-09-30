@@ -37,7 +37,6 @@ import {
   nowIso,
   readStoredJob,
   recordWorkerPid,
-  removeJobPidFile,
   redactConfigValues,
   removeJobRequestFile,
   resolveJobPid,
@@ -1150,7 +1149,6 @@ async function handleTaskWorker(argv) {
     throw new Error("Missing required --job-id for task-worker.");
   }
 
-  const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
   const storedJob = readStoredJob(workspaceRoot, options["job-id"]);
   if (!storedJob) {
@@ -1269,7 +1267,6 @@ function handleTaskResumeCandidate(argv) {
     return;
   }
 
-  const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
   const sessionId = getCurrentSessionId();
   const jobs = filterJobsForSession(sortJobsNewestFirst(reapDeadJobs(workspaceRoot, listJobs(workspaceRoot))));

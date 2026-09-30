@@ -24,7 +24,6 @@ const ESCAPE_HATCH = "Disable with /codex:setup --disable-review-gate.";
 const MANUAL_HINT = `Run /codex:review --wait manually. ${ESCAPE_HATCH}`;
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = path.resolve(SCRIPT_DIR, "..");
-const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
 const GATE_ROUNDS_CONFIG_KEY = "stopReviewGateRoundsBySession";
 
 function emitDecision(payload) {

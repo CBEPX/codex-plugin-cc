@@ -319,7 +319,7 @@ export function renderNativeReviewResult(result, meta) {
   return `${lines.join("\n").trimEnd()}\n`;
 }
 
-export function renderTaskResult(parsedResult, meta) {
+export function renderTaskResult(parsedResult, _meta) {
   const rawOutput = typeof parsedResult?.rawOutput === "string" ? parsedResult.rawOutput : "";
   if (rawOutput) {
     return rawOutput.endsWith("\n") ? rawOutput : `${rawOutput}\n`;
