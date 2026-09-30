@@ -1466,6 +1466,59 @@ export function buildPersistentTaskThreadName(prompt) {
   return buildTaskThreadName(prompt);
 }
 
+// Codex sometimes wraps its schema answer in a markdown fence or in prose (#583).
+// Recovery, ported from cc-plugin-codex: the whole message, else the first
+// fenced block, else the first balanced `{…}` that parses. A reply that only
+// quotes an object is therefore read as that object (spec §Limits).
+const FENCED_BLOCK_PATTERN = /```(?:json)?\s*\n([\s\S]*?)\r?\n```/;
+
+// First balanced `{…}` in `text` that parses. The scan knows JSON strings and
+// `\` escapes, so braces inside strings do not count; a candidate that fails to
+// parse moves the scan to the next `{`.
+function extractFirstJsonObject(text) {
+  for (let start = text.indexOf("{"); start !== -1; start = text.indexOf("{", start + 1)) {
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    for (let index = start; index < text.length; index += 1) {
+      const char = text[index];
+      if (inString) {
+        if (escaped) {
+          escaped = false;
+        } else if (char === "\\") {
+          escaped = true;
+        } else if (char === "\"") {
+          inString = false;
+        }
+        continue;
+      }
+      if (char === "\"") {
+        inString = true;
+      } else if (char === "{") {
+        depth += 1;
+      } else if (char === "}") {
+        depth -= 1;
+        if (depth === 0) {
+          try {
+            return JSON.parse(text.slice(start, index + 1));
+          } catch {
+            break;
+          }
+        }
+      }
+    }
+  }
+  return null;
+}
+
+function tryParseJson(text) {
+  try {
+    return { ok: true, value: JSON.parse(text) };
+  } catch (error) {
+    return { ok: false, error };
+  }
+}
+
 export function parseStructuredOutput(rawOutput, fallback = {}) {
   if (!rawOutput) {
     return {
@@ -1476,21 +1529,21 @@ export function parseStructuredOutput(rawOutput, fallback = {}) {
     };
   }
 
-  try {
-    return {
-      parsed: JSON.parse(rawOutput),
-      parseError: null,
-      rawOutput,
-      ...fallback
-    };
-  } catch (error) {
-    return {
-      parsed: null,
-      parseError: error.message,
-      rawOutput,
-      ...fallback
-    };
+  const text = rawOutput.trim();
+  const whole = tryParseJson(text);
+  if (whole.ok) {
+    return { parsed: whole.value, parseError: null, rawOutput, ...fallback };
   }
+  const fenced = FENCED_BLOCK_PATTERN.exec(text);
+  const fromFence = fenced ? tryParseJson(fenced[1]) : null;
+  if (fromFence?.ok) {
+    return { parsed: fromFence.value, parseError: null, rawOutput, ...fallback };
+  }
+  const embedded = extractFirstJsonObject(text);
+  if (embedded !== null) {
+    return { parsed: embedded, parseError: null, rawOutput, ...fallback };
+  }
+  return { parsed: null, parseError: whole.error.message, rawOutput, ...fallback };
 }
 
 export function readOutputSchema(schemaPath) {
