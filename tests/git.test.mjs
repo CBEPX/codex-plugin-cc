@@ -279,3 +279,75 @@ test("resolveReviewTarget uses a base that resolves locally when origin/HEAD nam
   assert.equal(target.baseRef, "origin/main");
   assert.equal(run("git", ["merge-base", "HEAD", target.baseRef], { cwd }).status, 0);
 });
+
+test("collectReviewContext caps aggregate untracked content in both modes and counts what it left out (#405)", () => {
+  const cwd = makeTempDir();
+  initGitRepo(cwd);
+  fs.writeFileSync(path.join(cwd, "app.js"), "console.log('v1');\n");
+  run("git", ["add", "app.js"], { cwd });
+  run("git", ["commit", "-m", "init"], { cwd });
+  const body = `${"x".repeat(99)}\n`.repeat(200); // 20,000 bytes of text, under the 24 KiB per-file limit
+  for (let index = 0; index < 300; index += 1) {
+    fs.writeFileSync(path.join(cwd, `untracked-${String(index).padStart(3, "0")}.txt`), body);
+  }
+  const target = resolveReviewTarget(cwd, { scope: "working-tree" });
+  const header = "## Untracked Files\n\n";
+  const notice = /\n\((\d+) untracked file\(s\) omitted: aggregate untracked content exceeds the 262144 byte limit; see Git Status for the full list and inspect them directly\.\)\n/;
+
+  for (const includeDiff of [false, true]) {
+    const context = collectReviewContext(cwd, target, { includeDiff });
+    const mode = context.inputMode;
+    const section = context.content.slice(context.content.indexOf(header));
+    const match = notice.exec(section);
+    assert.ok(match, `${mode}: omission notice missing`);
+    const inlined = section.slice(header.length, match.index - 1);
+    assert.ok(Buffer.byteLength(inlined, "utf8") <= 262144, `${mode}: ${Buffer.byteLength(inlined, "utf8")} bytes inlined`);
+    const kept = (inlined.match(/^### /gm) ?? []).length;
+    assert.ok(kept > 0, `${mode}: some files still inlined`);
+    assert.equal(kept + Number(match[1]), 300, `${mode}: every file is inlined or counted`);
+    assert.match(context.content, /untracked-299\.txt/, `${mode}: Git Status still lists every file`);
+  }
+});
+
+// Ported from cc-plugin-codex tests/git.test.mjs:85, with the target outside the repository.
+// No win32 skip: the broken-symlink test above already creates symlinks on windows-latest.
+test("collectReviewContext never inlines an untracked symlink's target, even outside the repository", () => {
+  const outside = makeTempDir();
+  fs.writeFileSync(path.join(outside, "secret.txt"), "OUTSIDE_SECRET_MARKER\n");
+  const cwd = makeTempDir();
+  initGitRepo(cwd);
+  fs.writeFileSync(path.join(cwd, "app.js"), "console.log('v1');\n");
+  run("git", ["add", "app.js"], { cwd });
+  run("git", ["commit", "-m", "init"], { cwd });
+  fs.symlinkSync(path.join(outside, "secret.txt"), path.join(cwd, "outside-link"));
+
+  const target = resolveReviewTarget(cwd, { scope: "working-tree" });
+  for (const includeDiff of [false, true]) {
+    const context = collectReviewContext(cwd, target, { includeDiff });
+    assert.doesNotMatch(context.content, /OUTSIDE_SECRET_MARKER/, `${context.inputMode}: the link target leaked into the prompt`);
+    assert.match(context.content, /### outside-link\n\(skipped: symlink\)/, context.inputMode);
+  }
+});
+
+// `includeDiff: true` overrides the probe's decision: it stands in for a diff
+// that measured small and grew before collection. The collection read itself
+// must stay within the cap and fall back to self-collect, never throw ENOBUFS.
+test("collectReviewContext falls back to self-collect when the inline diff read outgrows the cap", () => {
+  const cwd = makeTempDir();
+  initGitRepo(cwd);
+  fs.writeFileSync(path.join(cwd, "app.js"), "export const value = 'v1';\n");
+  run("git", ["add", "app.js"], { cwd });
+  run("git", ["commit", "-m", "init"], { cwd });
+  fs.writeFileSync(path.join(cwd, "app.js"), `export const value = '${"x".repeat(512)}';\n`);
+  const working = collectReviewContext(cwd, resolveReviewTarget(cwd, { scope: "working-tree" }), { includeDiff: true, maxInlineDiffBytes: 128 });
+  run("git", ["checkout", "-b", "feature/grow"], { cwd });
+  run("git", ["commit", "-am", "grow"], { cwd });
+  const branch = collectReviewContext(cwd, resolveReviewTarget(cwd, { base: "main" }), { includeDiff: true, maxInlineDiffBytes: 128 });
+  for (const context of [working, branch]) {
+    const mode = context.target.mode;
+    assert.equal(context.inputMode, "self-collect", mode);
+    assert.match(context.collectionGuidance, /lightweight summary/i, mode);
+    assert.doesNotMatch(context.content, /xxx/, mode);
+    assert.match(context.content, /## Changed Files/, mode);
+  }
+});

@@ -7,6 +7,8 @@ import { formatCommandFailure, runCommand, runCommandChecked } from "./process.m
 const MAX_UNTRACKED_BYTES = 24 * 1024;
 const DEFAULT_INLINE_DIFF_MAX_FILES = 2;
 const DEFAULT_INLINE_DIFF_MAX_BYTES = 256 * 1024;
+// The whole untracked section's budget, in both input modes (#405).
+export const MAX_UNTRACKED_TOTAL_BYTES = 262144;
 
 // Git is directly executable on Windows. Repository-derived arguments must never pass through a shell.
 function git(cwd, args, options = {}) {
@@ -218,9 +220,15 @@ function formatUntrackedFile(cwd, relativePath) {
   const absolutePath = path.join(cwd, relativePath);
   let stat;
   try {
-    stat = fs.statSync(absolutePath);
+    stat = fs.lstatSync(absolutePath);
   } catch {
     return `### ${relativePath}\n(skipped: broken symlink or unreadable file)`;
+  }
+  // Never follow a link: its target may live outside the repository.
+  if (stat.isSymbolicLink()) {
+    return fs.existsSync(absolutePath)
+      ? `### ${relativePath}\n(skipped: symlink)`
+      : `### ${relativePath}\n(skipped: broken symlink or unreadable file)`;
   }
   if (stat.isDirectory()) {
     return `### ${relativePath}\n(skipped: directory)`;
@@ -242,16 +250,62 @@ function formatUntrackedFile(cwd, relativePath) {
   return [`### ${relativePath}`, "```", buffer.toString("utf8").trimEnd(), "```"].join("\n");
 }
 
+// Past the budget the remaining files are only listed in Git Status: they are
+// counted, never stat'ed or read.
+function formatUntrackedBody(cwd, files) {
+  const entries = [];
+  let totalBytes = 0;
+  for (const [index, file] of files.entries()) {
+    const entry = formatUntrackedFile(cwd, file);
+    const entryBytes = Buffer.byteLength(entry, "utf8") + (entries.length > 0 ? 2 : 0);
+    if (totalBytes + entryBytes > MAX_UNTRACKED_TOTAL_BYTES) {
+      entries.push(
+        `(${files.length - index} untracked file(s) omitted: aggregate untracked content exceeds the ${MAX_UNTRACKED_TOTAL_BYTES} byte limit; see Git Status for the full list and inspect them directly.)`
+      );
+      break;
+    }
+    entries.push(entry);
+    totalBytes += entryBytes;
+  }
+  return entries.join("\n\n");
+}
+
+// The inline read carries the probe's bound itself: a diff that grew past it
+// after it was measured gives null (self-collect) instead of ENOBUFS from
+// spawnSync's 1 MiB default or an unbounded prompt.
+function readGitOutputWithin(cwd, args, maxBytes) {
+  const result = git(cwd, args, { maxBuffer: Math.max(0, maxBytes) + 1 });
+  if (result.error && /** @type {NodeJS.ErrnoException} */ (result.error).code === "ENOBUFS") {
+    return null;
+  }
+  if (result.error) {
+    throw result.error;
+  }
+  if (result.status !== 0) {
+    throw new Error(formatCommandFailure(result));
+  }
+  return Buffer.byteLength(result.stdout, "utf8") > maxBytes ? null : result.stdout;
+}
+
 function collectWorkingTreeContext(cwd, state, options = {}) {
-  const includeDiff = options.includeDiff !== false;
+  const maxDiffBytes = options.maxInlineDiffBytes ?? DEFAULT_INLINE_DIFF_MAX_BYTES;
   const status = gitChecked(cwd, ["status", "--short", "--untracked-files=all"]).stdout.trim();
   const changedFiles = listUniqueFiles(state.staged, state.unstaged, state.untracked);
 
+  let stagedDiff = null;
+  let unstagedDiff = null;
+  if (options.includeDiff !== false) {
+    stagedDiff = readGitOutputWithin(cwd, ["diff", "--cached", "--binary", "--no-ext-diff", "--submodule=diff"], maxDiffBytes);
+    unstagedDiff =
+      stagedDiff === null
+        ? null
+        : readGitOutputWithin(cwd, ["diff", "--binary", "--no-ext-diff", "--submodule=diff"], maxDiffBytes - Buffer.byteLength(stagedDiff, "utf8"));
+  }
+  const inlined = unstagedDiff !== null;
+
   let parts;
-  if (includeDiff) {
-    const stagedDiff = gitChecked(cwd, ["diff", "--cached", "--binary", "--no-ext-diff", "--submodule=diff"]).stdout;
-    const unstagedDiff = gitChecked(cwd, ["diff", "--binary", "--no-ext-diff", "--submodule=diff"]).stdout;
-    const untrackedBody = state.untracked.map((file) => formatUntrackedFile(cwd, file)).join("\n\n");
+  if (inlined) {
+    const untrackedBody = formatUntrackedBody(cwd, state.untracked);
     parts = [
       formatSection("Git Status", status),
       formatSection("Staged Diff", stagedDiff),
@@ -261,7 +315,7 @@ function collectWorkingTreeContext(cwd, state, options = {}) {
   } else {
     const stagedStat = gitChecked(cwd, ["diff", "--shortstat", "--cached"]).stdout.trim();
     const unstagedStat = gitChecked(cwd, ["diff", "--shortstat"]).stdout.trim();
-    const untrackedBody = state.untracked.map((file) => formatUntrackedFile(cwd, file)).join("\n\n");
+    const untrackedBody = formatUntrackedBody(cwd, state.untracked);
     parts = [
       formatSection("Git Status", status),
       formatSection("Staged Diff Stat", stagedStat),
@@ -275,29 +329,31 @@ function collectWorkingTreeContext(cwd, state, options = {}) {
     mode: "working-tree",
     summary: `Reviewing ${state.staged.length} staged, ${state.unstaged.length} unstaged, and ${state.untracked.length} untracked file(s).`,
     content: parts.join("\n"),
-    changedFiles
+    changedFiles,
+    inlined
   };
 }
 
 function collectBranchContext(cwd, baseRef, options = {}) {
-  const includeDiff = options.includeDiff !== false;
+  const maxDiffBytes = options.maxInlineDiffBytes ?? DEFAULT_INLINE_DIFF_MAX_BYTES;
   const comparison = options.comparison ?? buildBranchComparison(cwd, baseRef);
   const currentBranch = getCurrentBranch(cwd);
   const changedFiles = gitChecked(cwd, ["diff", "--name-only", comparison.commitRange]).stdout.trim().split("\n").filter(Boolean);
   const logOutput = gitChecked(cwd, ["log", "--oneline", "--decorate", comparison.commitRange]).stdout.trim();
   const diffStat = gitChecked(cwd, ["diff", "--stat", comparison.commitRange]).stdout.trim();
+  const branchDiff =
+    options.includeDiff === false
+      ? null
+      : readGitOutputWithin(cwd, ["diff", "--binary", "--no-ext-diff", "--submodule=diff", comparison.commitRange], maxDiffBytes);
 
   return {
     mode: "branch",
     summary: `Reviewing branch ${currentBranch} against ${baseRef} from merge-base ${comparison.mergeBase}.`,
-    content: includeDiff
+    content: branchDiff !== null
       ? [
           formatSection("Commit Log", logOutput),
           formatSection("Diff Stat", diffStat),
-          formatSection(
-            "Branch Diff",
-            gitChecked(cwd, ["diff", "--binary", "--no-ext-diff", "--submodule=diff", comparison.commitRange]).stdout
-          )
+          formatSection("Branch Diff", branchDiff)
         ].join("\n")
       : [
           formatSection("Commit Log", logOutput),
@@ -305,11 +361,12 @@ function collectBranchContext(cwd, baseRef, options = {}) {
           formatSection("Changed Files", changedFiles.join("\n"))
         ].join("\n"),
     changedFiles,
-    comparison
+    comparison,
+    inlined: branchDiff !== null
   };
 }
 
-function buildAdversarialCollectionGuidance(options = {}) {
+export function buildAdversarialCollectionGuidance(options = {}) {
   if (options.includeDiff !== false) {
     return "Use the repository context below as primary evidence.";
   }
@@ -340,7 +397,7 @@ export function collectReviewContext(cwd, target, options = {}) {
       options.includeDiff ??
       (listUniqueFiles(state.staged, state.unstaged, state.untracked).length <= maxInlineFiles &&
         diffBytes <= maxInlineDiffBytes);
-    details = collectWorkingTreeContext(repoRoot, state, { includeDiff });
+    details = collectWorkingTreeContext(repoRoot, state, { includeDiff, maxInlineDiffBytes });
   } else {
     const comparison = buildBranchComparison(repoRoot, target.baseRef);
     const fileCount = gitChecked(repoRoot, ["diff", "--name-only", comparison.commitRange]).stdout.trim().split("\n").filter(Boolean).length;
@@ -350,18 +407,19 @@ export function collectReviewContext(cwd, target, options = {}) {
       maxInlineDiffBytes
     );
     includeDiff = options.includeDiff ?? (fileCount <= maxInlineFiles && diffBytes <= maxInlineDiffBytes);
-    details = collectBranchContext(repoRoot, target.baseRef, { includeDiff, comparison });
+    details = collectBranchContext(repoRoot, target.baseRef, { includeDiff, comparison, maxInlineDiffBytes });
   }
 
+  const { inlined, ...collected } = details;
   return {
     cwd: repoRoot,
     repoRoot,
     branch: currentBranch,
     target,
-    fileCount: details.changedFiles.length,
+    fileCount: collected.changedFiles.length,
     diffBytes,
-    inputMode: includeDiff ? "inline-diff" : "self-collect",
-    collectionGuidance: buildAdversarialCollectionGuidance({ includeDiff }),
-    ...details
+    inputMode: inlined ? "inline-diff" : "self-collect",
+    collectionGuidance: buildAdversarialCollectionGuidance({ includeDiff: inlined }),
+    ...collected
   };
 }

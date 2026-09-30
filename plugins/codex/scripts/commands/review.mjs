@@ -11,20 +11,44 @@ import {
   ROOT_DIR
 } from "../lib/cli.mjs";
 import { parseStructuredOutput, readOutputSchema, runAppServerReview, runAppServerTurn } from "../lib/codex.mjs";
-import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "../lib/git.mjs";
+import { buildAdversarialCollectionGuidance, collectReviewContext, ensureGitRepository, resolveReviewTarget } from "../lib/git.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "../lib/prompts.mjs";
 import { renderNativeReviewResult, renderReviewResult, validateReviewResultShape } from "../lib/render.mjs";
 import { createCompanionJob, ensureCodexAvailable, firstMeaningfulLine, runForegroundCommand } from "./shared.mjs";
 
-function buildAdversarialReviewPrompt(context, focusText) {
+// 75 % of Codex's 1,048,576-character input limit; the rest covers the template
+// and the output schema (#405). `length` counts UTF-16 units, never fewer than
+// code points, so the check errs on the safe side.
+export const MAX_REVIEW_PROMPT_CHARS = 786432;
+
+function truncationMarker(characters) {
+  return `[Repository context truncated at ${characters} characters: inspect the target yourself with read-only git commands before finalizing findings.]`;
+}
+
+export function buildAdversarialReviewPrompt(context, focusText, onLog = null) {
   const template = loadPromptTemplate(ROOT_DIR, "adversarial-review");
-  return interpolateTemplate(template, {
+  const variables = {
     REVIEW_KIND: "Adversarial Review",
     TARGET_LABEL: context.target.label,
     USER_FOCUS: focusText || "No extra focus provided.",
     REVIEW_COLLECTION_GUIDANCE: context.collectionGuidance,
     REVIEW_INPUT: context.content
-  });
+  };
+  const prompt = interpolateTemplate(template, variables);
+  if (prompt.length <= MAX_REVIEW_PROMPT_CHARS) {
+    return prompt;
+  }
+
+  // Over the ceiling: keep whole lines of the context, say where it stops, and
+  // have Codex collect the rest itself.
+  const content = context.content;
+  const selfCollect = { ...variables, REVIEW_COLLECTION_GUIDANCE: buildAdversarialCollectionGuidance({ includeDiff: false }) };
+  const frame = interpolateTemplate(template, { ...selfCollect, REVIEW_INPUT: "" }).length;
+  const budget = MAX_REVIEW_PROMPT_CHARS - frame - truncationMarker(content.length).length;
+  const cutAt = budget > 0 ? content.lastIndexOf("\n", budget - 1) : -1;
+  const kept = content.slice(0, cutAt + 1);
+  onLog?.(`Review context truncated to fit the prompt ceiling (${kept.length} of ${content.length} characters).`);
+  return interpolateTemplate(template, { ...selfCollect, REVIEW_INPUT: `${kept}${truncationMarker(kept.length)}` });
 }
 
 function buildNativeReviewTarget(target) {
@@ -112,7 +136,7 @@ async function executeReviewRun(request) {
   }
 
   const context = collectReviewContext(request.cwd, target);
-  const prompt = buildAdversarialReviewPrompt(context, focusText);
+  const prompt = buildAdversarialReviewPrompt(context, focusText, request.onProgress);
   const result = await runAppServerTurn(context.repoRoot, {
     prompt,
     model: request.model,
