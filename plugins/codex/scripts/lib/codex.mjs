@@ -49,6 +49,7 @@ import { BROKER_BUSY_RPC_CODE, BROKER_ENDPOINT_ENV, CodexAppServerClient } from 
 import { loadBrokerSession } from "./broker-lifecycle.mjs";
 import { binaryAvailable } from "./process.mjs";
 import { listJobs } from "./state.mjs";
+import { isActiveJobStatus } from "./job-status.mjs";
 import { reapDeadJobs } from "./tracked-jobs.mjs";
 
 const SERVICE_NAME = "claude_code_codex_plugin";
@@ -1352,7 +1353,7 @@ function assertThreadIsFree(cwd, threadId, excludeJobId = null) {
     (job) =>
       job.id !== excludeJobId &&
       job.threadId === threadId &&
-      (job.status === "queued" || job.status === "running")
+      isActiveJobStatus(job.status)
   );
   if (busy) {
     throw new Error(`Thread ${threadId} is busy in job ${busy.id}; wait for it or run cancel ${busy.id} first.`);

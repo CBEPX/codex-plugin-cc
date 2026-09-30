@@ -4,6 +4,7 @@ import { BROKER_ENDPOINT_ENV } from "./app-server.mjs";
 import { loadBrokerSession, resolveBrokerStateFile } from "./broker-lifecycle.mjs";
 import { getSessionRuntimeStatus } from "./codex.mjs";
 import { getConfig, listJobs, readStoredJob, removeJobPidFile, removeJobRequestFile, upsertJob, withStateLock, writeJobFile } from "./state.mjs";
+import { isActiveJobStatus, isTerminalRecord, JOB_STATUS } from "./job-status.mjs";
 import { DEAD_WORKER_MESSAGE, reapDeadJobs, SESSION_ID_ENV } from "./tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
@@ -166,7 +167,7 @@ export function enrichJob(job, options = {}) {
     ...job,
     kindLabel: getJobTypeLabel(job),
     progressPreview:
-      job.status === "queued" || job.status === "running" || job.status === "failed"
+      isActiveJobStatus(job.status) || job.status === JOB_STATUS.FAILED
         ? readJobProgressPreview(job.logFile, maxProgressLines)
         : [],
     elapsed: formatElapsedDuration(job.startedAt ?? job.createdAt, job.completedAt ?? null),
@@ -216,14 +217,14 @@ export function buildStatusSnapshot(cwd, options = {}) {
   const maxProgressLines = options.maxProgressLines ?? DEFAULT_MAX_PROGRESS_LINES;
 
   const running = jobs
-    .filter((job) => job.status === "queued" || job.status === "running")
+    .filter((job) => isActiveJobStatus(job.status))
     .map((job) => enrichJob(job, { maxProgressLines }));
 
-  const latestFinishedRaw = jobs.find((job) => job.status !== "queued" && job.status !== "running") ?? null;
+  const latestFinishedRaw = jobs.find((job) => !isActiveJobStatus(job.status)) ?? null;
   const latestFinished = latestFinishedRaw ? enrichJob(latestFinishedRaw, { maxProgressLines }) : null;
 
   const recent = (options.all ? jobs : jobs.slice(0, maxJobs))
-    .filter((job) => job.status !== "queued" && job.status !== "running" && job.id !== latestFinished?.id)
+    .filter((job) => !isActiveJobStatus(job.status) && job.id !== latestFinished?.id)
     .map((job) => enrichJob(job, { maxProgressLines }));
 
   return {
@@ -272,7 +273,7 @@ export function resolveResultJob(cwd, reference) {
   const active = matchJobReference(
     jobs,
     reference,
-    (job) => job.status === "queued" || job.status === "running",
+    (job) => isActiveJobStatus(job.status),
     { optional: true }
   );
   if (active) {
@@ -289,7 +290,7 @@ export function resolveResultJob(cwd, reference) {
 export function resolveCancelableJob(cwd, reference, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const jobs = sortJobsNewestFirst(reapDeadJobs(workspaceRoot, listJobs(workspaceRoot)));
-  const activeJobs = jobs.filter((job) => job.status === "queued" || job.status === "running");
+  const activeJobs = jobs.filter((job) => isActiveJobStatus(job.status));
 
   if (reference) {
     const selected = matchJobReference(activeJobs, reference);
@@ -313,10 +314,6 @@ export function resolveCancelableJob(cwd, reference, options = {}) {
   }
 
   throw new Error("No active Codex jobs to cancel.");
-}
-
-function isTerminalRecord(stored) {
-  return Boolean(stored) && stored.status !== "queued" && stored.status !== "running";
 }
 
 // A terminal record carrying the worker's own `workerClosed` marker, set only by

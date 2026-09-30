@@ -20,6 +20,7 @@ import { reapDeadJobs } from "./lib/tracked-jobs.mjs";
 import { TRANSCRIPT_PATH_ENV } from "./lib/claude-session-transfer.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 import { readHookInput } from "./lib/hook-input.mjs";
+import { isActiveJobStatus } from "./lib/job-status.mjs";
 
 export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
 // How long a `busy` broker is given to shed a client this hook has just reaped,
@@ -141,7 +142,7 @@ export function cleanupSessionJobs(cwd, sessionId, lockWaitMs, remainingMs, deps
       if (job.background) {
         continue;
       }
-      const stillRunning = job.status === "queued" || job.status === "running";
+      const stillRunning = isActiveJobStatus(job.status);
       if (!stillRunning) {
         continue;
       }
@@ -232,7 +233,7 @@ function activeWorkspaceJobs(cwd, lockWaitMs, remainingMs) {
   // and trusting that record would keep this broker — and every later session's —
   // alive forever, with the dead job's private payload still on disk.
   return reapDeadJobs(workspaceRoot, state.jobs, { lockWaitMs, remainingMs })
-    .filter((job) => job.status === "queued" || job.status === "running")
+    .filter((job) => isActiveJobStatus(job.status))
     .map((job) => `${job.id}:${job.status}`);
 }
 

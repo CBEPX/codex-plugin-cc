@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import process from "node:process";
 
+import { isActiveJobStatus, isTerminalRecord, JOB_STATUS } from "./job-status.mjs";
 import { getProcessIdentities, getProcessIdentity, isPidAlive, processCommandLine } from "./process.mjs";
 
 import {
@@ -160,10 +161,6 @@ export function createProgressReporter({ stderr = false, logFile = null, onEvent
   };
 }
 
-function isActiveStatus(status) {
-  return status === "queued" || status === "running";
-}
-
 // A cancel that was acknowledged already wrote the terminal record and released
 // the artifacts; a worker that outlives it must not replace `cancelled` with its
 // own outcome. Read and write share the lock so a cancel cannot land in between.
@@ -194,7 +191,7 @@ export async function runTrackedJob(job, runner, options = {}) {
   // job that is no longer queued or running is never run.
   const refused = withStateLock(job.workspaceRoot, () => {
     const stored = readStoredJob(job.workspaceRoot, job.id);
-    if (stored && !isActiveStatus(stored.status)) {
+    if (stored && !isActiveJobStatus(stored.status)) {
       appendLogLine(runningRecord.logFile, `Worker started after the job was ${stored.status}; the turn was not run.`);
       removeJobPidFile(job.workspaceRoot, job.id);
       removeJobRequestFile(job.workspaceRoot, job.id);
@@ -314,7 +311,7 @@ function markJobDeadLocked(workspaceRoot, jobSummary, errorMessage) {
   const jobFile = resolveJobFile(workspaceRoot, jobSummary.id);
   const stored = fs.existsSync(jobFile) ? readJobFile(jobFile) : null;
   const base = stored ?? jobSummary;
-  if (base.status !== "running" && base.status !== "queued") {
+  if (!isActiveJobStatus(base.status)) {
     // The job finished between the caller's read and now — keep the real result,
     // and put it in the index too: a worker that died between its terminal
     // `writeJobFile` and its `upsertJob` leaves an active index entry that
@@ -384,7 +381,7 @@ const QUEUED_WITHOUT_PID_GRACE_MS = 30000;
 // cannot tell that apart from a record that was written microseconds ago, so age
 // decides it.
 function isQueuedWithoutWorker(job, pid) {
-  if (job.status !== "queued" || pid != null) {
+  if (job.status !== JOB_STATUS.QUEUED || pid != null) {
     return false;
   }
   const createdAt = Date.parse(job.createdAt ?? "");
@@ -449,11 +446,11 @@ export function reapDeadJobs(workspaceRoot, jobs, options = {}) {
   // disk, with a live pid that carries an identity — the same tests the loop
   // below applies, so the batch never probes a pid the loop would not.
   const liveIdentityCandidate = (job) => {
-    if (job.status !== "running" && job.status !== "queued") {
+    if (!isActiveJobStatus(job.status)) {
       return null;
     }
     const stored = readStoredJob(workspaceRoot, job.id);
-    if (stored && stored.status !== "running" && stored.status !== "queued") {
+    if (isTerminalRecord(stored)) {
       return null;
     }
     const { pid, identity } = resolveJobPid(workspaceRoot, job);
@@ -506,11 +503,11 @@ export function reapDeadJobs(workspaceRoot, jobs, options = {}) {
       deferred.push(job.id);
       return job;
     }
-    if (job.status !== "running" && job.status !== "queued") {
+    if (!isActiveJobStatus(job.status)) {
       return job;
     }
     const stored = readStoredJob(workspaceRoot, job.id);
-    if (stored && stored.status !== "running" && stored.status !== "queued") {
+    if (isTerminalRecord(stored)) {
       // Terminal on disk: markJobDead keeps the real result and reconciles it
       // into the index rather than failing the job.
       return markJobDead(workspaceRoot, job, DEAD_WORKER_MESSAGE, waitFor());

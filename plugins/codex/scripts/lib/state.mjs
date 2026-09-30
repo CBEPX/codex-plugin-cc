@@ -5,6 +5,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { readJsonOrNull } from "./fs.mjs";
+import { isActiveJobStatus, JOB_STATUS } from "./job-status.mjs";
 import { getProcessIdentity, isPidAlive } from "./process.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
@@ -716,11 +717,11 @@ export function updateJobPid(cwd, jobId, pid, identity = null) {
   // wrote its own pid there, the newer one.
   withStateLock(cwd, () => {
     const indexed = listJobs(cwd).find((job) => job.id === jobId);
-    if (indexed?.status !== "queued" && indexed?.status !== "running") {
+    if (!isActiveJobStatus(indexed?.status)) {
       return;
     }
     writeJobPidFile(cwd, jobId, pid, identity);
-    if (indexed.status === "queued") {
+    if (indexed.status === JOB_STATUS.QUEUED) {
       upsertJob(cwd, { id: jobId, pid, pidIdentity: identity });
     }
   });
@@ -783,7 +784,7 @@ export function readJobFile(jobFile) {
       // `runTrackedJob` flips the status to `running`, so staging one for a
       // running job would write plaintext `--config` values that nothing reads
       // and nothing deletes.
-      const active = current.status === "queued";
+      const active = current.status === JOB_STATUS.QUEUED;
       const migrated = withRedactedRequest(current);
       if (active && !fs.existsSync(requestFile)) {
         // Same shape and mode as `writeJobRequestFile`: the temp file carries the
@@ -861,7 +862,7 @@ export function resolveJobPid(cwd, job) {
   if (job?.pid != null) {
     return { pid: job.pid, identity: typeof job.pidIdentity === "string" ? job.pidIdentity : null };
   }
-  if (job?.status !== "queued" && job?.status !== "running") {
+  if (!isActiveJobStatus(job?.status)) {
     return { pid: null, identity: null };
   }
   return readJobPidSidecar(cwd, job.id) ?? { pid: null, identity: null };

@@ -25,6 +25,7 @@ import {
 import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
 import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
+import { isActiveJobStatus, isTerminalRecord } from "./lib/job-status.mjs";
 import { loadModelCatalog, resolveModelAlias, supportedEfforts } from "./lib/model-catalog.mjs";
 import { binaryAvailable, isPidAlive, terminateRecordedProcess, workerCommandLine } from "./lib/process.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
@@ -426,10 +427,6 @@ function renderStatusPayload(report, asJson) {
   return asJson ? report : renderStatusReport(report);
 }
 
-function isActiveJobStatus(status) {
-  return status === "queued" || status === "running";
-}
-
 function getCurrentClaudeSessionId() {
   return process.env[SESSION_ID_ENV] ?? null;
 }
@@ -448,8 +445,7 @@ function findLatestResumableTaskJob(jobs) {
       (job) =>
         job.jobClass === "task" &&
         job.threadId &&
-        job.status !== "queued" &&
-        job.status !== "running"
+        !isActiveJobStatus(job.status)
     ) ?? null
   );
 }
@@ -531,7 +527,7 @@ async function resolveLatestTrackedTaskThread(cwd, options = {}) {
   const sessionId = getCurrentClaudeSessionId();
   const jobs = sortJobsNewestFirst(reapDeadJobs(workspaceRoot, listJobs(workspaceRoot))).filter((job) => job.id !== options.excludeJobId);
   const visibleJobs = filterJobsForCurrentClaudeSession(jobs);
-  const activeTask = visibleJobs.find((job) => job.jobClass === "task" && (job.status === "queued" || job.status === "running"));
+  const activeTask = visibleJobs.find((job) => job.jobClass === "task" && isActiveJobStatus(job.status));
   if (activeTask) {
     throw new Error(`Task ${activeTask.id} is still running. Use /codex:status before continuing it.`);
   }
@@ -1399,7 +1395,7 @@ async function waitForTerminalRecord(workspaceRoot, jobId, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     const stored = readStoredJob(workspaceRoot, jobId);
-    if (stored && stored.status !== "queued" && stored.status !== "running") {
+    if (isTerminalRecord(stored)) {
       return stored;
     }
     if (Date.now() >= deadline) {
