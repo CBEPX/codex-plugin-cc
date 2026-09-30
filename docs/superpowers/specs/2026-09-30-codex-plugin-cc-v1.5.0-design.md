@@ -1,6 +1,6 @@
 # codex-plugin-cc v1.5.0 — companion split, bounded read views, review surface
 
-Date: 2026-09-30 (rev. 1, 2026-09-30)
+Date: 2026-09-30 (rev. 2, 2026-09-30)
 
 ## Goal
 
@@ -131,7 +131,7 @@ The `result` nextStep carries the resolved id: ``Full output: `result <id> --wai
 | 7 | rows 1–4 with `--output <new-path>` | file = the full pre-1.5.0 `--json` payload; stdout = receipt JSON | – | – |
 | 8 | `result --wait --output` | refused: `--output cannot be combined with --wait; result --wait already prints the full record.` (exit 1) | – | – |
 
-**`/codex:result` command file.** When the output ends with a `Truncated:` block, Claude runs the `result <id> --wait` shown in the `Full output:` line (a `node` call, allowed by `Bash(node:*)`; no `Read` tool is added) and presents that output instead.
+**`/codex:result` command file.** The command presents the stdout as it is. When the output ends with a `Truncated:` block, that is the preview plus the `Full output:` line; Claude does not re-run the command on its own. The user asks for the full text, and only then Claude runs the `result <id> --wait` from that line (a `node` call, allowed by `Bash(node:*)`; no `Read` tool is added).
 
 **Usage text.** `status … [--output <new-path>]` and `result … [--output <new-path>]`.
 
@@ -273,7 +273,7 @@ Transport is decided per run by the existing `withAppServer`: broker when reacha
   - `:1024-1038` (`exposures`) and `:1081-1084` no longer require `[redacted]` or the key name in `status --json` (the absence of the secret is still asserted; the presence checks move to `result --json`);
   - `task --await --json` of a 20 KB result has no `truncated` key.
 - `commands.test.mjs`:
-  - `result.md` pins the `--wait` instruction;
+  - `result.md` pins the preview rule: present the `Truncated:` block and the `Full output:` line as printed, and run `result <id> --wait` only when the user asks for the full text;
   - `:422-440` is kept (the sentence stays true).
 
 **S3**
@@ -310,7 +310,7 @@ Transport is decided per run by the existing `withAppServer`: broker when reacha
 
 ## Limits
 
-- **`result` without `--wait` shows a preview when the output is over 8 KB.** `/codex:result` then re-runs `result <id> --wait`, which puts the full text in Claude's context: the bound protects automated callers, not this command. `status` never shows `request` (the prompt); read it with `result --json` or `--output`.
+- **`result` without `--wait` shows a preview when the output is over 8 KB.** `/codex:result` shows that preview and the `Full output:` line; the full text needs a second, explicit request (`result <id> --wait`, or `--output` for the JSON). `status`, including `status <id> --wait`, never shows `request` (the prompt); read it with `result --json` or `--output`.
 - **Only the bounded commands carry the new fields.** Every bounded view has `truncated` and `omissions`. `task --await --json` and `result --wait --json` keep the 1.4.3 shape without them. A caller that read fields past 8 KB from `--json` now gets `…`-shortened strings and must use `--output`.
 - **Any positional text on `/codex:review` selects the adversarial reviewer.** That includes #522's model/effort words in kana: they become focus text, not a model choice. Non-English alias parsing is not implemented.
 - **Verbatim focus applies only to review commands fed through `--args-stdin`.** Quotes the user types reach the prompt literally. Flags after the focus are focus text (#547). `task --args-stdin` and the single-string form keep shell-like splitting and its backslash rule.
@@ -368,3 +368,4 @@ Transport is decided per run by the existing `withAppServer`: broker when reacha
 | rev | date | trigger | change |
 |---|---|---|---|
 | 1 | 2026-09-30 | controller rulings S0–S3 for v1.5.0 | initial |
+| 2 | 2026-09-30 | user review of rev. 1; CI 36700963516 | `/codex:result` shows the preview and does not re-run with `--wait` on its own; `status <id> --wait` confirmed bounded; S0(a) is committed; S0(c) broker idle-timeout test added |
