@@ -26,9 +26,9 @@ test("SessionEnd keeps a job whose tree left survivors and drops one whose kill 
     ["win32", { attempted: false, delivered: false, method: "handle", reason: "identity-mismatch" }, false, null],
     ["win32", { attempted: false, delivered: false, method: "handle", reason: "process-missing" }, false, null]
   ];
-  // A pid that is provably dead: a child that has already exited and that the
-  // plugin's liveness probe reports gone (helpers' deadPid waits for that on
-  // Windows), so no table row depends on which pids the host happens to use.
+  // Every row judges a dead root. The pid comes from an exited child, and the
+  // liveness answer is injected: the host may hand that pid to a new process
+  // between rows, which flipped a row on a Windows runner.
   const deadPid = deadPidOf();
   for (const [platform, outcome, keptExpected, stderrPattern] of cases) {
     const repo = makeTempDir();
@@ -38,7 +38,7 @@ test("SessionEnd keeps a job whose tree left survivors and drops one whose kill 
     const original = process.stderr.write;
     process.stderr.write = (chunk) => { written.push(String(chunk)); return true; };
     try {
-      cleanupSessionJobs(repo, sessionId, 1000, () => 8000, { platform, terminateRecordedProcessImpl: typeof outcome === "function" ? outcome : () => outcome, broker: { pid: 555, pidIdentity: "win32:1" } });
+      cleanupSessionJobs(repo, sessionId, 1000, () => 8000, { platform, isPidAliveImpl: () => false, terminateRecordedProcessImpl: typeof outcome === "function" ? outcome : () => outcome, broker: { pid: 555, pidIdentity: "win32:1" } });
     } finally {
       process.stderr.write = original;
     }

@@ -101,7 +101,15 @@ test("broker stays alive while a client is connected and exits after it disconne
   installFakeCodex(binDir);
   const sessionDir = makeTempDir("cxc-");
   const endpoint = createBrokerEndpoint(sessionDir);
-  const child = spawnBroker({ cwd: sessionDir, endpoint, env: buildEnv(binDir), idleTimeoutMs: 300 });
+  // The readiness probe's close re-arms the idle timer, so the broker must see
+  // this test's client within one idle timeout of it: 300 ms lost that race on a
+  // slow hosted runner.
+  const idleTimeoutMs = 2000;
+  const child = spawnBroker({ cwd: sessionDir, endpoint, env: buildEnv(binDir), idleTimeoutMs });
+  let brokerLog = "";
+  child.stderr.on("data", (chunk) => {
+    brokerLog += chunk;
+  });
 
   let socket = null;
   try {
@@ -112,8 +120,8 @@ test("broker stays alive while a client is connected and exits after it disconne
 
     // Hold the connection open well past the idle timeout; the broker must not
     // self-terminate while a client is still connected.
-    await delay(900);
-    assert.equal(child.exitCode, null, "broker must stay alive while a client is connected");
+    await delay(idleTimeoutMs * 1.5);
+    assert.equal(child.exitCode, null, `broker must stay alive while a client is connected\n${brokerLog}`);
 
     socket.end();
     socket = null;
