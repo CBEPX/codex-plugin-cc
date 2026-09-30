@@ -4,7 +4,9 @@ import process from "node:process";
 import { getProcessIdentities, getProcessIdentity, isPidAlive, processCommandLine } from "./process.mjs";
 
 import {
+  nowIso,
   readJobFile,
+  readStoredJob,
   removeJobPidFile,
   removeJobRequestFile,
   resolveJobFile,
@@ -16,10 +18,6 @@ import {
 } from "./state.mjs";
 
 export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
-
-export function nowIso() {
-  return new Date().toISOString();
-}
 
 function normalizeProgressEvent(value) {
   if (value && typeof value === "object" && !Array.isArray(value)) {
@@ -166,20 +164,12 @@ function isActiveStatus(status) {
   return status === "queued" || status === "running";
 }
 
-function readStoredJobOrNull(workspaceRoot, jobId) {
-  const jobFile = resolveJobFile(workspaceRoot, jobId);
-  if (!fs.existsSync(jobFile)) {
-    return null;
-  }
-  return readJobFile(jobFile);
-}
-
 // A cancel that was acknowledged already wrote the terminal record and released
 // the artifacts; a worker that outlives it must not replace `cancelled` with its
 // own outcome. Read and write share the lock so a cancel cannot land in between.
 function writeTerminalUnlessCancelled(workspaceRoot, jobId, logFile, write) {
   return withStateLock(workspaceRoot, () => {
-    if (readStoredJobOrNull(workspaceRoot, jobId)?.status === "cancelled") {
+    if (readStoredJob(workspaceRoot, jobId)?.status === "cancelled") {
       appendLogLine(logFile, "Worker finished after the job was cancelled; the cancelled record is kept.");
       return;
     }
@@ -203,7 +193,7 @@ export async function runTrackedJob(job, runner, options = {}) {
   // check and the takeover share the lock so none can land in between, and a
   // job that is no longer queued or running is never run.
   const refused = withStateLock(job.workspaceRoot, () => {
-    const stored = readStoredJobOrNull(job.workspaceRoot, job.id);
+    const stored = readStoredJob(job.workspaceRoot, job.id);
     if (stored && !isActiveStatus(stored.status)) {
       appendLogLine(runningRecord.logFile, `Worker started after the job was ${stored.status}; the turn was not run.`);
       removeJobPidFile(job.workspaceRoot, job.id);
@@ -229,7 +219,7 @@ export async function runTrackedJob(job, runner, options = {}) {
     writeTerminalUnlessCancelled(job.workspaceRoot, job.id, logFile, () => {
       // `runningRecord` predates `turn/started`, which is where the progress
       // updater stored the transport; read it back so the final record keeps it.
-      const stored = readStoredJobOrNull(job.workspaceRoot, job.id);
+      const stored = readStoredJob(job.workspaceRoot, job.id);
       writeJobFile(job.workspaceRoot, job.id, {
         ...runningRecord,
         transport: stored?.transport ?? runningRecord.transport ?? null,
@@ -279,7 +269,7 @@ export async function runTrackedJob(job, runner, options = {}) {
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
     writeTerminalUnlessCancelled(job.workspaceRoot, job.id, options.logFile ?? job.logFile ?? null, () => {
-      const existing = readStoredJobOrNull(job.workspaceRoot, job.id) ?? runningRecord;
+      const existing = readStoredJob(job.workspaceRoot, job.id) ?? runningRecord;
       const completedAt = nowIso();
       writeJobFile(job.workspaceRoot, job.id, {
         ...existing,
@@ -462,7 +452,7 @@ export function reapDeadJobs(workspaceRoot, jobs, options = {}) {
     if (job.status !== "running" && job.status !== "queued") {
       return null;
     }
-    const stored = readStoredJobOrNull(workspaceRoot, job.id);
+    const stored = readStoredJob(workspaceRoot, job.id);
     if (stored && stored.status !== "running" && stored.status !== "queued") {
       return null;
     }
@@ -519,7 +509,7 @@ export function reapDeadJobs(workspaceRoot, jobs, options = {}) {
     if (job.status !== "running" && job.status !== "queued") {
       return job;
     }
-    const stored = readStoredJobOrNull(workspaceRoot, job.id);
+    const stored = readStoredJob(workspaceRoot, job.id);
     if (stored && stored.status !== "running" && stored.status !== "queued") {
       // Terminal on disk: markJobDead keeps the real result and reconciles it
       // into the index rather than failing the job.

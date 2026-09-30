@@ -3,7 +3,7 @@ import fs from "node:fs";
 import { BROKER_ENDPOINT_ENV } from "./app-server.mjs";
 import { loadBrokerSession, resolveBrokerStateFile } from "./broker-lifecycle.mjs";
 import { getSessionRuntimeStatus } from "./codex.mjs";
-import { getConfig, listJobs, readJobFile, removeJobPidFile, removeJobRequestFile, resolveJobFile, upsertJob, withStateLock, writeJobFile } from "./state.mjs";
+import { getConfig, listJobs, readStoredJob, removeJobPidFile, removeJobRequestFile, upsertJob, withStateLock, writeJobFile } from "./state.mjs";
 import { DEAD_WORKER_MESSAGE, reapDeadJobs, SESSION_ID_ENV } from "./tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
@@ -180,14 +180,6 @@ export function enrichJob(job, options = {}) {
     ...enriched,
     phase: enriched.phase ?? inferLegacyJobPhase(enriched, enriched.progressPreview)
   };
-}
-
-export function readStoredJob(workspaceRoot, jobId) {
-  const jobFile = resolveJobFile(workspaceRoot, jobId);
-  if (!fs.existsSync(jobFile)) {
-    return null;
-  }
-  return readJobFile(jobFile);
 }
 
 function matchJobReference(jobs, reference, predicate = () => true, options = {}) {

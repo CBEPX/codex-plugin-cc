@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { readJsonOrNull } from "./fs.mjs";
 import { getProcessIdentity, isPidAlive } from "./process.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
@@ -14,7 +15,7 @@ const STATE_FILE_NAME = "state.json";
 const JOBS_DIR_NAME = "jobs";
 const MAX_JOBS = 50;
 
-function nowIso() {
+export function nowIso() {
   return new Date().toISOString();
 }
 
@@ -135,14 +136,6 @@ function withRedactedRequest(record) {
   return hasStoredConfigValues(record)
     ? { ...record, request: { ...record.request, config: redactConfigValues(record.request.config) } }
     : record;
-}
-
-function readJsonOrNull(filePath) {
-  try {
-    return JSON.parse(fs.readFileSync(filePath, "utf8"));
-  } catch {
-    return null;
-  }
 }
 
 // Records written before values were redacted (1.1.1 and earlier) carry the raw
@@ -821,6 +814,15 @@ export function resolveJobLogFile(cwd, jobId) {
 export function resolveJobFile(cwd, jobId) {
   ensureStateDir(cwd);
   return path.join(resolveJobsDir(cwd), `${jobId}.json`);
+}
+
+// The job file, or null when the job has none yet (queued, never started).
+export function readStoredJob(cwd, jobId) {
+  const jobFile = resolveJobFile(cwd, jobId);
+  if (!fs.existsSync(jobFile)) {
+    return null;
+  }
+  return readJobFile(jobFile);
 }
 
 export function resolveJobPidFile(cwd, jobId) {

@@ -2,6 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
+import { readJsonOrNull } from "./fs.mjs";
 import { runCommand } from "./process.mjs";
 
 export const CATALOG_ENV = "CODEX_COMPANION_MODEL_CATALOG";
@@ -29,18 +30,14 @@ function normalizeEntries(raw) {
     }));
 }
 
-function readJson(file) {
-  try { return JSON.parse(fs.readFileSync(file, "utf8")); } catch { return null; }
-}
-
 // Cached per process for the default environment only; an explicit env (tests)
 // always reads fresh.
 export function loadModelCatalog({ env = process.env, runCommandImpl = runCommand, cache = env === process.env } = {}) {
   if (cache && cached) return cached;
   const sources = [];
-  if (env[CATALOG_ENV]) sources.push(() => readJson(env[CATALOG_ENV]));
+  if (env[CATALOG_ENV]) sources.push(() => readJsonOrNull(env[CATALOG_ENV]));
   const codexHome = path.resolve(env.CODEX_HOME || path.join(os.homedir(), ".codex"));
-  sources.push(() => readJson(path.join(codexHome, "models_cache.json")));
+  sources.push(() => readJsonOrNull(path.join(codexHome, "models_cache.json")));
   // Last resort: the bundled catalogue, never the network-refreshing form — its
   // output is ~500 KB and this runs on every companion invocation.
   sources.push(() => {
