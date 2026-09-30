@@ -6,7 +6,7 @@ import path from "node:path";
 import process from "node:process";
 
 import { parseArgs } from "./lib/args.mjs";
-import { BROKER_BUSY_RPC_CODE, CodexAppServerClient } from "./lib/app-server.mjs";
+import { BROKER_BUSY_RPC_CODE, buildJsonRpcError, CodexAppServerClient } from "./lib/app-server.mjs";
 import { parseBrokerEndpoint } from "./lib/broker-endpoint.mjs";
 import { clearBrokerSessionIfEndpoint, registerBrokerProcess } from "./lib/broker-lifecycle.mjs";
 
@@ -59,10 +59,6 @@ function buildStreamThreadIds(method, params, result) {
     threadIds.add(result.reviewThreadId);
   }
   return threadIds;
-}
-
-function buildJsonRpcError(code, message, data) {
-  return data === undefined ? { code, message } : { code, message, data };
 }
 
 function send(socket, message) {

@@ -5,7 +5,8 @@ import { loadBrokerSession, resolveBrokerStateFile } from "./broker-lifecycle.mj
 import { getSessionRuntimeStatus } from "./codex.mjs";
 import { getConfig, listJobs, readStoredJob, removeJobPidFile, removeJobRequestFile, upsertJob, withStateLock, writeJobFile } from "./state.mjs";
 import { isActiveJobStatus, isTerminalRecord, JOB_STATUS } from "./job-status.mjs";
-import { DEAD_WORKER_MESSAGE, reapDeadJobs, SESSION_ID_ENV } from "./tracked-jobs.mjs";
+import { looksLikeVerificationCommand } from "./render.mjs";
+import { DEAD_WORKER_MESSAGE, filterJobsForSession, getCurrentSessionId, reapDeadJobs } from "./tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
 export const DEFAULT_MAX_STATUS_JOBS = 8;
@@ -13,18 +14,6 @@ export const DEFAULT_MAX_PROGRESS_LINES = 4;
 
 export function sortJobsNewestFirst(jobs) {
   return [...jobs].sort((left, right) => String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? "")));
-}
-
-function getCurrentSessionId(options = {}) {
-  return options.env?.[SESSION_ID_ENV] ?? process.env[SESSION_ID_ENV] ?? null;
-}
-
-function filterJobsForCurrentSession(jobs, options = {}) {
-  const sessionId = getCurrentSessionId(options);
-  if (!sessionId) {
-    return jobs;
-  }
-  return jobs.filter((job) => job.sessionId === sessionId);
 }
 
 function getJobTypeLabel(job) {
@@ -101,12 +90,6 @@ function formatElapsedDuration(startValue, endValue = null) {
     return `${minutes}m ${seconds}s`;
   }
   return `${seconds}s`;
-}
-
-function looksLikeVerificationCommand(line) {
-  return /\b(test|tests|lint|build|typecheck|type-check|check|verify|validate|pytest|jest|vitest|cargo test|npm test|pnpm test|yarn test|go test|mvn test|gradle test|tsc|eslint|ruff)\b/i.test(
-    line
-  );
 }
 
 function inferLegacyJobPhase(job, progressPreview = []) {
@@ -212,7 +195,7 @@ function matchJobReference(jobs, reference, predicate = () => true, options = {}
 export function buildStatusSnapshot(cwd, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const config = getConfig(workspaceRoot);
-  const jobs = sortJobsNewestFirst(filterJobsForCurrentSession(reapDeadJobs(workspaceRoot, listJobs(workspaceRoot)), options));
+  const jobs = sortJobsNewestFirst(filterJobsForSession(reapDeadJobs(workspaceRoot, listJobs(workspaceRoot)), options.env));
   const maxJobs = options.maxJobs ?? DEFAULT_MAX_STATUS_JOBS;
   const maxProgressLines = options.maxProgressLines ?? DEFAULT_MAX_PROGRESS_LINES;
 
@@ -258,7 +241,7 @@ export function buildSingleJobSnapshot(cwd, reference, options = {}) {
 // "No job found" (#498/#524); the caller decides how to report an active job.
 export function resolveResultJob(cwd, reference) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const jobs = sortJobsNewestFirst(reference ? reapDeadJobs(workspaceRoot, listJobs(workspaceRoot)) : filterJobsForCurrentSession(reapDeadJobs(workspaceRoot, listJobs(workspaceRoot))));
+  const jobs = sortJobsNewestFirst(reference ? reapDeadJobs(workspaceRoot, listJobs(workspaceRoot)) : filterJobsForSession(reapDeadJobs(workspaceRoot, listJobs(workspaceRoot))));
   const selected = matchJobReference(
     jobs,
     reference,
@@ -300,7 +283,7 @@ export function resolveCancelableJob(cwd, reference, options = {}) {
     return { workspaceRoot, job: selected };
   }
 
-  const sessionScopedActiveJobs = filterJobsForCurrentSession(activeJobs, options);
+  const sessionScopedActiveJobs = filterJobsForSession(activeJobs, options.env);
 
   if (sessionScopedActiveJobs.length === 1) {
     return { workspaceRoot, job: sessionScopedActiveJobs[0] };
@@ -309,7 +292,7 @@ export function resolveCancelableJob(cwd, reference, options = {}) {
     throw new Error("Multiple Codex jobs are active. Pass a job id to /codex:cancel.");
   }
 
-  if (getCurrentSessionId(options)) {
+  if (getCurrentSessionId(options.env)) {
     throw new Error("No active Codex jobs to cancel for this session.");
   }
 
@@ -427,44 +410,4 @@ export function brokerExclusion(broker) {
   }
   const identity = typeof broker.pidIdentity === "string" && /^win32:\d+$/.test(broker.pidIdentity) ? broker.pidIdentity : null;
   return Number.isInteger(broker.pid) && broker.pid >= 1 && identity ? [{ pid: broker.pid, identity }] : null;
-}
-
-// Pending cancel, rendered once for the three sinks. On posix `survivors` is
-// always [] and `reason` is v1.4.0's, so json/text/logLine are byte-identical
-// to v1.4.0 there; only win32 adds a survivors suffix and a stderr diagnostic.
-export function renderCancelPending(decision, pid, jobId) {
-  const survivors = decision.survivors ?? [];
-  // A brokered job may have no pid to name (its worker was never signalled).
-  const pending = `cancellation not confirmed: worker ${pid == null ? "" : `pid ${pid} `}left running (${decision.reason})`;
-  const survivorText = survivors.map((s) => `${s.pid}:${s.identity ?? "unknown"}`).join(" ");
-  const suffix = survivors.length > 0
-    ? ` worker tree survivors: ${survivorText}`
-    : decision.reason === "kill-failed" ? " (unverified)" : "";
-  // The root exited but part of its tree did not: nothing "waits for the worker".
-  const rootGone = survivors.length > 0 && decision.rootAlive === false;
-  const tail = rootGone
-    ? `worker pid ${pid} exited but part of its tree is still running (survivors: ${survivorText}); the job stays running until the reaper judges it.`
-    : decision.reason === "turn-not-interrupted"
-    ? "the shared runtime has not ended the turn, so the worker was not stopped; the job stays running."
-    : (decision.reason === "identity-unavailable" || decision.reason === "identity-mismatch" || decision.reason === "process-missing") && decision.rootAlive === false
-    ? `worker pid ${pid} exited before it could be verified; the job stays running until the reaper judges it.`
-    : "the job stays running until the worker exits.";
-  return {
-    json: { jobId, status: "running", cancellationPending: true, reason: decision.reason, ...(survivors.length > 0 ? { survivors } : {}) },
-    text: `${pending}\nThe turn interrupt was sent; ${tail} Re-run cancel or wait for result.\n`,
-    logLine: `${pending}${suffix}`,
-    diagnostic: survivors.length > 0 ? `[codex] worker tree survivors: ${survivorText}\n` : null,
-  };
-}
-
-// The caller's side of a pending cancel: one JSON document or the text on
-// stdout, the diagnostic (if any) on stderr, one line in the job log.
-export function emitCancelPending(decision, pid, jobId, { json, appendLog, stdout = process.stdout, stderr = process.stderr }) {
-  const rendered = renderCancelPending(decision, pid, jobId);
-  appendLog(rendered.logLine);
-  if (rendered.diagnostic) {
-    stderr.write(rendered.diagnostic);
-  }
-  stdout.write(json ? `${JSON.stringify(rendered.json, null, 2)}\n` : rendered.text);
-  return rendered;
 }

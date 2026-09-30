@@ -470,3 +470,60 @@ export function renderCancelReport(job) {
 
   return `${lines.join("\n").trimEnd()}\n`;
 }
+
+export function shorten(text, limit) {
+  const normalized = String(text ?? "").trim().replace(/\s+/g, " ");
+  if (!normalized) {
+    return "";
+  }
+  if (normalized.length <= limit) {
+    return normalized;
+  }
+  return `${normalized.slice(0, limit - 3)}...`;
+}
+
+export function looksLikeVerificationCommand(command) {
+  return /\b(test|tests|lint|build|typecheck|type-check|check|verify|validate|pytest|jest|vitest|cargo test|npm test|pnpm test|yarn test|go test|mvn test|gradle test|tsc|eslint|ruff)\b/i.test(
+    command
+  );
+}
+
+// Pending cancel, rendered once for the three sinks. On posix `survivors` is
+// always [] and `reason` is v1.4.0's, so json/text/logLine are byte-identical
+// to v1.4.0 there; only win32 adds a survivors suffix and a stderr diagnostic.
+export function renderCancelPending(decision, pid, jobId) {
+  const survivors = decision.survivors ?? [];
+  // A brokered job may have no pid to name (its worker was never signalled).
+  const pending = `cancellation not confirmed: worker ${pid == null ? "" : `pid ${pid} `}left running (${decision.reason})`;
+  const survivorText = survivors.map((s) => `${s.pid}:${s.identity ?? "unknown"}`).join(" ");
+  const suffix = survivors.length > 0
+    ? ` worker tree survivors: ${survivorText}`
+    : decision.reason === "kill-failed" ? " (unverified)" : "";
+  // The root exited but part of its tree did not: nothing "waits for the worker".
+  const rootGone = survivors.length > 0 && decision.rootAlive === false;
+  const tail = rootGone
+    ? `worker pid ${pid} exited but part of its tree is still running (survivors: ${survivorText}); the job stays running until the reaper judges it.`
+    : decision.reason === "turn-not-interrupted"
+    ? "the shared runtime has not ended the turn, so the worker was not stopped; the job stays running."
+    : (decision.reason === "identity-unavailable" || decision.reason === "identity-mismatch" || decision.reason === "process-missing") && decision.rootAlive === false
+    ? `worker pid ${pid} exited before it could be verified; the job stays running until the reaper judges it.`
+    : "the job stays running until the worker exits.";
+  return {
+    json: { jobId, status: "running", cancellationPending: true, reason: decision.reason, ...(survivors.length > 0 ? { survivors } : {}) },
+    text: `${pending}\nThe turn interrupt was sent; ${tail} Re-run cancel or wait for result.\n`,
+    logLine: `${pending}${suffix}`,
+    diagnostic: survivors.length > 0 ? `[codex] worker tree survivors: ${survivorText}\n` : null,
+  };
+}
+
+// The caller's side of a pending cancel: one JSON document or the text on
+// stdout, the diagnostic (if any) on stderr, one line in the job log.
+export function emitCancelPending(decision, pid, jobId, { json, appendLog, stdout = process.stdout, stderr = process.stderr }) {
+  const rendered = renderCancelPending(decision, pid, jobId);
+  appendLog(rendered.logLine);
+  if (rendered.diagnostic) {
+    stderr.write(rendered.diagnostic);
+  }
+  stdout.write(json ? `${JSON.stringify(rendered.json, null, 2)}\n` : rendered.text);
+  return rendered;
+}

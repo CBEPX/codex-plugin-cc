@@ -48,6 +48,7 @@ import { readJsonFile } from "./fs.mjs";
 import { BROKER_BUSY_RPC_CODE, BROKER_ENDPOINT_ENV, CodexAppServerClient } from "./app-server.mjs";
 import { loadBrokerSession } from "./broker-lifecycle.mjs";
 import { binaryAvailable } from "./process.mjs";
+import { looksLikeVerificationCommand, shorten } from "./render.mjs";
 import { listJobs } from "./state.mjs";
 import { isActiveJobStatus } from "./job-status.mjs";
 import { reapDeadJobs } from "./tracked-jobs.mjs";
@@ -142,23 +143,6 @@ function buildResumeParams(threadId, cwd, options = {}) {
 /** @returns {UserInput[]} */
 function buildTurnInput(prompt) {
   return [{ type: "text", text: prompt, text_elements: [] }];
-}
-
-function shorten(text, limit = 72) {
-  const normalized = String(text ?? "").trim().replace(/\s+/g, " ");
-  if (!normalized) {
-    return "";
-  }
-  if (normalized.length <= limit) {
-    return normalized;
-  }
-  return `${normalized.slice(0, limit - 3)}...`;
-}
-
-function looksLikeVerificationCommand(command) {
-  return /\b(test|tests|lint|build|typecheck|type-check|check|verify|validate|pytest|jest|vitest|cargo test|npm test|pnpm test|yarn test|go test|mvn test|gradle test|tsc|eslint|ruff)\b/i.test(
-    command
-  );
 }
 
 function buildTaskThreadName(prompt) {

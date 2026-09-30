@@ -8,7 +8,8 @@ import { saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle
 import { DEAD_WORKER_MESSAGE } from "../plugins/codex/scripts/lib/tracked-jobs.mjs";
 import assert from "node:assert/strict";
 
-import { brokerExclusion, brokerPresence, cancelDecision, commitCancel, emitCancelPending, isWorkerProvedRecord, isWorkerTerminalRecord, renderCancelPending } from "../plugins/codex/scripts/lib/job-control.mjs";
+import { brokerExclusion, brokerPresence, cancelDecision, commitCancel, isWorkerProvedRecord, isWorkerTerminalRecord } from "../plugins/codex/scripts/lib/job-control.mjs";
+import { emitCancelPending, renderCancelPending } from "../plugins/codex/scripts/lib/render.mjs";
 
 const SURVIVORS = [{ pid: 4301, identity: "win32:7" }];
 

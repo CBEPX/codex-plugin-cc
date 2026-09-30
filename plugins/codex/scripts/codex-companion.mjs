@@ -54,7 +54,6 @@ import {
   buildStatusSnapshot,
   cancelDecision,
   commitCancel,
-  emitCancelPending,
   isWorkerProvedRecord,
   isWorkerTerminalRecord,
   resolveCancelableJob,
@@ -67,13 +66,15 @@ import {
   createJobProgressUpdater,
   createJobRecord,
   createProgressReporter,
+  filterJobsForSession,
+  getCurrentSessionId,
   reapDeadJobs,
   registerWorkerCrashGuard,
-  runTrackedJob,
-  SESSION_ID_ENV
+  runTrackedJob
 } from "./lib/tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 import {
+  emitCancelPending,
   renderNativeReviewResult,
   renderReviewResult,
   renderStoredJobResult,
@@ -81,7 +82,8 @@ import {
   renderJobStatusReport,
   renderSetupReport,
   renderStatusReport,
-  renderTaskResult
+  renderTaskResult,
+  shorten
 } from "./lib/render.mjs";
 
 const ROOT_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
@@ -267,17 +269,6 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function shorten(text, limit = 96) {
-  const normalized = String(text ?? "").trim().replace(/\s+/g, " ");
-  if (!normalized) {
-    return "";
-  }
-  if (normalized.length <= limit) {
-    return normalized;
-  }
-  return `${normalized.slice(0, limit - 3)}...`;
-}
-
 function firstMeaningfulLine(text, fallback) {
   const line = String(text ?? "")
     .split(/\r?\n/)
@@ -427,18 +418,6 @@ function renderStatusPayload(report, asJson) {
   return asJson ? report : renderStatusReport(report);
 }
 
-function getCurrentClaudeSessionId() {
-  return process.env[SESSION_ID_ENV] ?? null;
-}
-
-function filterJobsForCurrentClaudeSession(jobs) {
-  const sessionId = getCurrentClaudeSessionId();
-  if (!sessionId) {
-    return jobs;
-  }
-  return jobs.filter((job) => job.sessionId === sessionId);
-}
-
 function findLatestResumableTaskJob(jobs) {
   return (
     jobs.find(
@@ -524,9 +503,9 @@ function outputJobResult(cwd, reference, asJson) {
 
 async function resolveLatestTrackedTaskThread(cwd, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const sessionId = getCurrentClaudeSessionId();
+  const sessionId = getCurrentSessionId();
   const jobs = sortJobsNewestFirst(reapDeadJobs(workspaceRoot, listJobs(workspaceRoot))).filter((job) => job.id !== options.excludeJobId);
-  const visibleJobs = filterJobsForCurrentClaudeSession(jobs);
+  const visibleJobs = filterJobsForSession(jobs);
   const activeTask = visibleJobs.find((job) => job.jobClass === "task" && isActiveJobStatus(job.status));
   if (activeTask) {
     throw new Error(`Task ${activeTask.id} is still running. Use /codex:status before continuing it.`);
@@ -764,7 +743,7 @@ function buildTaskRunMetadata({ prompt, resumeLast = false }) {
   const fallbackSummary = resumeLast ? DEFAULT_CONTINUE_PROMPT : "Task";
   return {
     title,
-    summary: shorten(prompt || fallbackSummary)
+    summary: shorten(prompt || fallbackSummary, 96)
   };
 }
 
@@ -1292,8 +1271,8 @@ function handleTaskResumeCandidate(argv) {
 
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
-  const sessionId = getCurrentClaudeSessionId();
-  const jobs = filterJobsForCurrentClaudeSession(sortJobsNewestFirst(reapDeadJobs(workspaceRoot, listJobs(workspaceRoot))));
+  const sessionId = getCurrentSessionId();
+  const jobs = filterJobsForSession(sortJobsNewestFirst(reapDeadJobs(workspaceRoot, listJobs(workspaceRoot))));
   const candidate = findLatestResumableTaskJob(jobs);
 
   const payload = {

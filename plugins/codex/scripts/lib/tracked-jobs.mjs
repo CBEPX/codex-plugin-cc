@@ -20,6 +20,18 @@ import {
 
 export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
 
+export function getCurrentSessionId(env) {
+  return env?.[SESSION_ID_ENV] ?? process.env[SESSION_ID_ENV] ?? null;
+}
+
+export function filterJobsForSession(jobs, env) {
+  const sessionId = getCurrentSessionId(env);
+  if (!sessionId) {
+    return jobs;
+  }
+  return jobs.filter((job) => job.sessionId === sessionId);
+}
+
 function normalizeProgressEvent(value) {
   if (value && typeof value === "object" && !Array.isArray(value)) {
     return {
