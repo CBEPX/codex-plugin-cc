@@ -23,3 +23,5 @@ If the user did pass a job ID:
 - Do not summarize or condense it.
 
 If the output ends with a `Truncated:` line, keep that line and the next-step line after it as printed, below the table or the output. Do not re-run the command on your own.
+
+If the arguments include `--output`, the command prints a JSON receipt (`outputFile`, `bytes`, `sha256`) instead of the report: show it as printed.

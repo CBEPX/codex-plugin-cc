@@ -53,7 +53,6 @@ function seedLiveTask(workspace, prompt) {
   );
 }
 
-
 test("status shows phases, hints, and the latest finished job", () => {
   const workspace = makeTempDir();
   const stateDir = resolveStateDir(workspace);
@@ -790,4 +789,149 @@ test("an oversized status list shrinks its arrays and counts every omitted recor
     assert.match(text.stdout, /\n\nTruncated: \{.*\}\n/);
     assert.ok(text.stdout.endsWith(`\n${omittedJobs > 0 ? "Use --all to include omitted records, with --output <new-path> for the complete JSON payload." : STATUS_NEXT}\n`));
   }
+});
+
+// Port of the cc-plugin-codex "large historical Unicode reads" regression.
+test("a large historical record with CJK and astral text reads bounded through status and result, untouched on disk", () => {
+  const workspace = makeTempDir();
+  const stateDir = resolveStateDir(workspace);
+  const jobsDir = path.join(stateDir, "jobs");
+  fs.mkdirSync(jobsDir, { recursive: true });
+  // Astral characters straddle every cut point (512, 4096 and the halvings).
+  const body = `漢字${"😀漢".repeat(20_000)}`;
+  const job = {
+    id: "task-unicode",
+    kind: "task",
+    jobClass: "task",
+    status: "completed",
+    phase: "done",
+    title: "Codex Task",
+    summary: `概要😀${"長".repeat(3000)}`,
+    threadId: "thr_unicode",
+    request: { prompt: body, config: {} },
+    createdAt: "2026-03-18T15:00:00.000Z",
+    completedAt: "2026-03-18T15:01:00.000Z",
+    updatedAt: "2026-03-18T15:01:00.000Z"
+  };
+  const jobFile = path.join(jobsDir, "task-unicode.json");
+  const statePath = path.join(stateDir, "state.json");
+  fs.writeFileSync(jobFile, `${JSON.stringify({ ...job, result: { rawOutput: body }, rendered: `${body}\n` }, null, 2)}\n`, "utf8");
+  fs.writeFileSync(statePath, `${JSON.stringify({ version: 1, config: { stopReviewGate: false }, jobs: [job] }, null, 2)}\n`, "utf8");
+  const before = [fs.readFileSync(jobFile), fs.readFileSync(statePath)];
+
+  for (const args of [["status", "task-unicode"], ["result", "task-unicode"]]) {
+    for (const format of [[], ["--json"]]) {
+      const read = run(process.execPath, [SCRIPT, ...args, ...format], { cwd: workspace });
+      const label = [...args, ...format].join(" ");
+      assert.equal(read.status, 0, `${label}: ${read.stderr}`);
+      assert.ok(bytes(read.stdout) <= READ_LIMIT, `${label}: ${bytes(read.stdout)} bytes`);
+      assert.equal(read.stdout.includes("�"), false, `${label} printed a broken surrogate`);
+      assert.match(read.stdout, /Truncated|"truncated": true/, label);
+      if (format.length) {
+        assert.equal(JSON.parse(read.stdout).truncated, true, label);
+      }
+    }
+  }
+  assert.ok(fs.readFileSync(jobFile).equals(before[0]), "the job file is never rewritten by a read");
+  assert.ok(fs.readFileSync(statePath).equals(before[1]), "the state index is never rewritten by a read");
+});
+
+test("result on an active job with a 3000-character id stays bounded with exit 3", () => {
+  const workspace = makeTempDir();
+  const stateDir = resolveStateDir(workspace);
+  fs.mkdirSync(path.join(stateDir, "jobs"), { recursive: true });
+  const id = `task-${"x".repeat(3000)}`;
+  // Index only: a job file name that long is over NAME_MAX, and nothing reads one for an active job without a pid.
+  const job = { id, kind: "task", jobClass: "task", status: "running", phase: "running", title: "Codex Task", summary: "long id", createdAt: "2026-03-18T15:30:00.000Z", updatedAt: "2026-03-18T15:30:02.000Z" };
+  fs.writeFileSync(path.join(stateDir, "state.json"), `${JSON.stringify({ version: 1, config: { stopReviewGate: false }, jobs: [job] }, null, 2)}\n`, "utf8");
+  for (const format of [[], ["--json"]]) {
+    const read = run(process.execPath, [SCRIPT, "result", id, ...format], { cwd: workspace });
+    assert.equal(read.status, 3, read.stderr);
+    assert.ok(bytes(read.stdout) <= READ_LIMIT, `${format.join(" ") || "text"}: ${bytes(read.stdout)} bytes`);
+    if (format.length) {
+      assert.ok("resumeCommand" in JSON.parse(read.stdout));
+    } else {
+      assert.ok(read.stdout.startsWith(`Job ${id.slice(0, 100)}`), read.stdout.slice(0, 200));
+    }
+  }
+});
+
+test("result of a 20 KB answer prints a bounded preview; --wait prints it in full; --wait --output is refused", { timeout: 60_000 }, () => {
+  const repo = seededRepo();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const answer = "0123456789".repeat(2000);
+  const env = buildEnv(binDir, { FAKE_CODEX_ANSWER_TEXT: answer });
+  const task = run(process.execPath, [SCRIPT, "task", "--json", "a long answer please"], { cwd: repo, env });
+  assert.equal(task.status, 0, task.stderr);
+  const stored = readJobRecord(repo);
+  const jobId = stored.id;
+  const nextStep = `Full output: \`result ${jobId} --wait\` (text) or \`result ${jobId} --output <new-path>\` (JSON).`;
+
+  const preview = run(process.execPath, [SCRIPT, "result", jobId], { cwd: repo, env });
+  assert.equal(preview.status, 0, preview.stderr);
+  assert.ok(bytes(preview.stdout) <= READ_LIMIT, `${bytes(preview.stdout)} bytes`);
+  assert.ok(preview.stdout.startsWith(`${answer.slice(0, 4096)}…\n`), preview.stdout.slice(0, 4200));
+  assert.match(preview.stdout, new RegExp(`\\nCodex session ID: ${stored.threadId}\\n`));
+  assert.match(preview.stdout, /\n\nTruncated: \{"fields":0,"fieldNames":\[\],"records":0,"strings":\d+\}\n/);
+  assert.ok(preview.stdout.endsWith(`\n${nextStep}\n`), preview.stdout.slice(-300));
+
+  const json = run(process.execPath, [SCRIPT, "result", jobId, "--json"], { cwd: repo, env });
+  assert.equal(json.status, 0, json.stderr);
+  assert.ok(bytes(json.stdout) <= READ_LIMIT, `${bytes(json.stdout)} bytes`);
+  const view = JSON.parse(json.stdout);
+  assert.deepEqual([view.job.id, view.job.status, view.truncated, view.nextStep], [jobId, "completed", true, nextStep]);
+  assert.ok(view.omissions.strings >= 1);
+  assert.equal(view.omissions.fields, 0, "result is not a summary: nothing is dropped");
+  assert.ok(view.storedJob.result.rawOutput.endsWith("…"));
+
+  const full = run(process.execPath, [SCRIPT, "result", jobId, "--wait"], { cwd: repo, env });
+  assert.equal(full.status, 0, full.stderr);
+  assert.equal(full.stdout, `${stored.rendered}\nCodex session ID: ${stored.threadId}\nResume in Codex: codex resume ${stored.threadId}\n`);
+
+  const outputFile = path.join(makeTempDir(), "result.json");
+  const refused = run(process.execPath, [SCRIPT, "result", jobId, "--wait", "--output", outputFile], { cwd: repo, env });
+  assert.equal(refused.status, 1);
+  assert.match(refused.stderr, /--output cannot be combined with --wait; result --wait already prints the full record\./);
+  assert.equal(fs.existsSync(outputFile), false);
+
+  const exported = run(process.execPath, [SCRIPT, "result", jobId, "--output", outputFile], { cwd: repo, env });
+  assert.equal(exported.status, 0, exported.stderr);
+  assert.equal(JSON.parse(exported.stdout).outputFile, outputFile);
+  assert.equal(JSON.parse(fs.readFileSync(outputFile, "utf8")).storedJob.result.rawOutput, answer);
+});
+
+test("result on an active job with a 60 KB prompt: bounded hint with exit 3; --wait's timeout hint stays full", () => {
+  const workspace = makeTempDir();
+  const prompt = "q".repeat(60_000);
+  seedLiveTask(workspace, prompt);
+  const nextStep = "Full output: `result task-live --wait` (text) or `result task-live --output <new-path>` (JSON).";
+
+  const json = run(process.execPath, [SCRIPT, "result", "task-live", "--json"], { cwd: workspace });
+  assert.equal(json.status, 3, json.stderr);
+  assert.ok(bytes(json.stdout) <= READ_LIMIT, `${bytes(json.stdout)} bytes`);
+  const view = JSON.parse(json.stdout);
+  assert.match(view.resumeCommand, /^node ".*codex-companion\.mjs" result task-live --wait --timeout-ms 540000$/);
+  assert.deepEqual([view.job.status, view.truncated, view.nextStep], ["running", true, nextStep]);
+  assert.equal("request" in view.job, false);
+
+  const text = run(process.execPath, [SCRIPT, "result", "task-live"], { cwd: workspace });
+  assert.equal(text.status, 3, text.stderr);
+  // Only the summary drop happened: the text hint is the 1.4.3 line, nothing appended.
+  assert.match(text.stdout, /^Job task-live is still running\. Re-run: node .*result task-live --wait --timeout-ms 540000\n$/);
+
+  const outputFile = path.join(makeTempDir(), "active.json");
+  const exported = run(process.execPath, [SCRIPT, "result", "task-live", "--output", outputFile], { cwd: workspace });
+  assert.equal(exported.status, 3, exported.stderr);
+  assert.equal(JSON.parse(exported.stdout).outputFile, outputFile);
+  const full = JSON.parse(fs.readFileSync(outputFile, "utf8"));
+  assert.equal(full.job.request.prompt, prompt);
+  assert.equal(full.resumeCommand, view.resumeCommand);
+
+  // Row 5: the `--wait` timeout hint is the rescue path's, printed in full as in 1.4.3.
+  const waited = run(process.execPath, [SCRIPT, "result", "task-live", "--wait", "--timeout-ms", "100", "--json"], { cwd: workspace });
+  assert.equal(waited.status, 3, waited.stderr);
+  const hint = JSON.parse(waited.stdout);
+  assert.equal(hint.job.request.prompt, prompt);
+  assert.equal("truncated" in hint, false);
 });

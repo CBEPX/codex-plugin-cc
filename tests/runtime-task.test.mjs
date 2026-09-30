@@ -9,6 +9,7 @@ import {
   FAKE_RESOLVED_SETTINGS,
   initGitRepo,
   IS_WIN,
+  jobDiagnostics,
   makeTempDir,
   readJobRecord,
   readStateIndex,
@@ -1713,4 +1714,26 @@ test("a timed-out turn whose turn/start carried no id is still interrupted (#781
   const fakeState = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
   assert.ok(fakeState.lastInterrupt?.turnId, "the turn named by turn/started must be interrupted");
   assert.equal(readJobRecord(repo).turnId, fakeState.lastInterrupt.turnId);
+});
+
+// Row 6 of the read-view table: the rescue path's awaited result is never bounded.
+test("task --await --json of a 20 KB answer prints the full record without read-view fields", { timeout: 60_000 }, (t) => {
+  const repo = seededRepo();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const answer = "0123456789".repeat(2000);
+  const env = buildEnv(binDir, { FAKE_CODEX_ANSWER_TEXT: answer });
+  t.after(() => {
+    try {
+      const { pid } = readJobRecord(repo);
+      if (pid) process.kill(pid, "SIGKILL");
+    } catch {}
+  });
+  const awaited = run(process.execPath, [SCRIPT, "task", "--await", "--json", "--prompt-stdin"], { cwd: repo, env, input: "a long answer please\n" });
+  assert.equal(awaited.status, 0, `${awaited.stderr}\n${jobDiagnostics(repo, readJobRecord(repo).id)}`);
+  assert.ok(Buffer.byteLength(awaited.stdout) > 8192);
+  const out = JSON.parse(awaited.stdout);
+  assert.equal("truncated" in out, false);
+  assert.equal("omissions" in out, false);
+  assert.equal(out.storedJob.result.rawOutput, answer);
 });

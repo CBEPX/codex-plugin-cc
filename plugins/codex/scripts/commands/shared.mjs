@@ -4,6 +4,7 @@ import process from "node:process";
 import {
   COMPANION_SCRIPT,
   outputCommandResult,
+  outputReadView,
   outputResult,
   parseCommandInput,
   resolveCommandWorkspace
@@ -31,6 +32,7 @@ import {
   registerWorkerCrashGuard,
   runTrackedJob
 } from "../lib/tracked-jobs.mjs";
+import { resultNextStep } from "../lib/read-views.mjs";
 import { renderStoredJobResult } from "../lib/render.mjs";
 
 const DEFAULT_STATUS_WAIT_TIMEOUT_MS = 240000;
@@ -82,10 +84,25 @@ function buildResumeWaitCommand(jobId) {
 }
 
 // Every "the job outlived this command" exit looks the same: the lead-in, the
-// exact command that resumes the wait, and exit code 3.
-function outputActiveJobHint(snapshot, leadIn, asJson) {
+// exact command that resumes the wait, and exit code 3. `readView`
+// (`{ outputPath, cwd }`) is passed only by `result` without `--wait` (row 4):
+// a bounded summary, or the full payload exported. Without it (`result --wait`,
+// `task --await`) the hint prints in full, as in 1.4.3.
+function outputActiveJobHint(snapshot, leadIn, asJson, readView = null) {
   const resumeCommand = buildResumeWaitCommand(snapshot.job.id);
-  outputCommandResult({ ...snapshot, resumeCommand }, `${leadIn} Re-run: ${resumeCommand}\n`, asJson);
+  const payload = { ...snapshot, resumeCommand };
+  if (readView) {
+    // Rendered from the projection, never the captured strings, so a huge id or
+    // companion path shrinks with the view. Only `result` without --wait passes
+    // a read view, and its lead-in is exactly this line.
+    outputReadView(
+      payload,
+      (view) => `Job ${view.job.id} is still ${view.job.status}. Re-run: ${view.resumeCommand}\n`,
+      { ...readView, asJson, summary: true, nextStep: resultNextStep(snapshot.job.id) }
+    );
+  } else {
+    outputCommandResult(payload, `${leadIn} Re-run: ${resumeCommand}\n`, asJson);
+  }
   process.exitCode = 3;
 }
 
@@ -108,15 +125,26 @@ export async function waitForTerminalJobOrHint(cwd, reference, options = {}) {
 
 // Prints exactly what `result <reference>` prints — the awaited task path reuses
 // it so both commands stay on one rendering — and returns the resolved job.
-export function outputJobResult(cwd, reference, asJson) {
+// `readView` (only `result` without `--wait` passes one) bounds the output to
+// PUBLIC_READ_BYTES or exports it (rows 3, 4, 7); `result --wait` and
+// `task --await` pass none and print the full record (rows 5, 6).
+export function outputJobResult(cwd, reference, asJson, readView = null) {
   const { workspaceRoot, job } = resolveResultJob(cwd, reference);
   if (isActiveJobStatus(job.status)) {
-    outputActiveJobHint(buildSingleJobSnapshot(cwd, job.id), `Job ${job.id} is still ${job.status}.`, asJson);
+    outputActiveJobHint(buildSingleJobSnapshot(cwd, job.id), `Job ${job.id} is still ${job.status}.`, asJson, readView);
     return job;
   }
 
   const storedJob = readStoredJob(workspaceRoot, job.id);
-  outputCommandResult({ job, storedJob }, renderStoredJobResult(job, storedJob), asJson);
+  if (readView) {
+    outputReadView(
+      { job, storedJob },
+      (view) => renderStoredJobResult(view.job, view.storedJob),
+      { ...readView, asJson, summary: false, nextStep: resultNextStep(job.id) }
+    );
+  } else {
+    outputCommandResult({ job, storedJob }, renderStoredJobResult(job, storedJob), asJson);
+  }
   return job;
 }
 

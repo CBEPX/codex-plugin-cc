@@ -210,12 +210,30 @@ test("transfer, result, and cancel commands are exposed as deterministic runtime
   assert.match(transfer, /codex-companion\.mjs" transfer --args-stdin <<'CODEX_ARGS'/);
   assert.match(transfer, /codex resume <session-id>/);
   assert.match(result, /disable-model-invocation:\s*true/);
-  assert.match(result, /argument-hint:\s*'\[job-id\] \[--wait\] \[--timeout-ms <ms>\]'/);
+  assert.match(result, /argument-hint:\s*'\[job-id\] \[--wait\] \[--timeout-ms <ms>\] \[--output <new-path>\]'/);
   assert.match(result, /codex-companion\.mjs" result --args-stdin <<'CODEX_ARGS'/);
   assert.match(cancel, /disable-model-invocation:\s*true/);
   assert.match(cancel, /codex-companion\.mjs" cancel --args-stdin <<'CODEX_ARGS'/);
   assert.match(resultHandling, /do not turn a failed or incomplete Codex run into a Claude-side implementation attempt/i);
   assert.match(resultHandling, /if Codex was never successfully invoked, do not generate a substitute answer at all/i);
+});
+
+// Spec rev. 2: a truncated `result` is shown as the preview it is; the full text
+// is a second, explicit request, never an automatic `--wait` re-run.
+test("result.md presents a truncated preview as printed and fetches the full text only on request", () => {
+  const result = read("commands/result.md");
+  assert.match(result, /ends with a `Truncated:` block and a `Full output:` line/);
+  assert.match(result, /Present that preview and the `Full output:` line as printed/);
+  assert.match(result, /Do not re-run the command on your own/);
+  assert.match(
+    result,
+    /Only when the user asks for the full text, run `node "\$\{CLAUDE_PLUGIN_ROOT\}\/scripts\/codex-companion\.mjs" result <id> --wait`/
+  );
+  assert.doesNotMatch(result, /present the full (command )?output/i);
+  assert.match(read("commands/status.md"), /ends with a `Truncated:` line/);
+  const receipt = /If the arguments include `--output`, the command prints a JSON receipt \(`outputFile`, `bytes`, `sha256`\) instead of the report: show it as printed\./;
+  assert.match(read("commands/status.md"), receipt);
+  assert.match(result, receipt);
 });
 
 test("internal docs use task terminology for rescue runs", () => {

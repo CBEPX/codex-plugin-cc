@@ -33,7 +33,7 @@ export function printUsage() {
       "  node scripts/codex-companion.mjs task [--background|--await [--await-timeout-ms <ms>]] [--prompt-stdin] [--write] [--resume-last|--resume|--fresh] [--model <model|spark|astra|sol|luna|terra|mini>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [--turn-timeout-ms <ms>] [--config key=value]... [prompt]",
       "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json] [--output <new-path>]",
-      "  node scripts/codex-companion.mjs result [job-id] [--wait [--timeout-ms <ms>]] [--json]",
+      "  node scripts/codex-companion.mjs result [job-id] [--wait [--timeout-ms <ms>]] [--json] [--output <new-path>]",
       "  node scripts/codex-companion.mjs cancel [job-id] [--json]",
       "",
       "Any subcommand also accepts --args-stdin: the whole argument string is read",

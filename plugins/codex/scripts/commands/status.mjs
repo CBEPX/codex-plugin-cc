@@ -61,7 +61,7 @@ export async function handleStatus(argv) {
 
 export async function handleResult(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["cwd", "timeout-ms"],
+    valueOptions: ["cwd", "timeout-ms", "output"],
     booleanOptions: ["json", "wait"]
   });
   if (maybePrintCommandHelp(options)) {
@@ -72,7 +72,10 @@ export async function handleResult(argv) {
   if (options["timeout-ms"] != null && !options.wait) {
     throw new Error("--timeout-ms requires --wait.");
   }
-  let reference = positionals[0] ?? "";
+  if (options.output != null && options.wait) {
+    throw new Error("--output cannot be combined with --wait; result --wait already prints the full record.");
+  }
+  const reference = positionals[0] ?? "";
   if (options.wait) {
     if (!reference) {
       throw new Error("`result --wait` requires a job id.");
@@ -81,11 +84,13 @@ export async function handleResult(argv) {
       timeoutMs: parseTimeoutOption(options["timeout-ms"], "--timeout-ms"),
       json: options.json
     });
-    if (!jobId) {
-      return;
+    if (jobId) {
+      // Row 5: the full record, exactly as 1.4.3 printed it.
+      outputJobResult(cwd, jobId, options.json);
     }
-    reference = jobId;
+    return;
   }
 
-  outputJobResult(cwd, reference, options.json);
+  // Rows 3, 4 and 7: the only caller that passes a read view.
+  outputJobResult(cwd, reference, options.json, { outputPath: options.output ?? null, cwd });
 }
