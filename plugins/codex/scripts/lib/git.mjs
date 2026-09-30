@@ -136,7 +136,9 @@ export function getWorkingTreeState(cwd) {
 // to widen the review silently (#653), and a `-`-leading one reached
 // `git merge-base` as an option. The `-` check comes first, so git never sees it.
 function assertBaseRefResolves(cwd, baseRef) {
-  if (baseRef.startsWith("-") || git(cwd, ["rev-parse", "--verify", "--quiet", `${baseRef}^{commit}`]).status !== 0) {
+  // rev-parse reads a leading `^` as negation and exits 0 with `^<sha>`, so demand one bare object id.
+  const resolved = baseRef === "" || baseRef.startsWith("-") ? null : git(cwd, ["rev-parse", "--verify", "--quiet", `${baseRef}^{commit}`]);
+  if (!resolved || resolved.status !== 0 || !/^[0-9a-f]{40,64}$/.test(resolved.stdout.trim())) {
     throw new Error(
       `Base ref "${baseRef}" not found in this repository; pass a branch, tag or commit that resolves locally (git fetch it first for a remote ref).`
     );
@@ -151,7 +153,7 @@ export function resolveReviewTarget(cwd, options = {}) {
   const state = getWorkingTreeState(cwd);
   const supportedScopes = new Set(["auto", "working-tree", "branch"]);
 
-  if (baseRef) {
+  if (baseRef !== null) {
     assertBaseRefResolves(cwd, baseRef);
     return {
       mode: "branch",

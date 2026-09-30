@@ -431,7 +431,7 @@ test("review --args-stdin with flags only still runs the built-in reviewer", () 
 
 test("review and adversarial-review refuse an unresolvable --base before any job or Codex start (#653)", () => {
   for (const command of ["review", "adversarial-review"]) {
-    for (const ref of ["nope", "-x"]) {
+    for (const ref of ["nope", "-x", "^main"]) {
       const repo = seededRepo();
       const binDir = makeTempDir();
       installFakeCodex(binDir);

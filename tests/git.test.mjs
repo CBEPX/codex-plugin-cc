@@ -218,6 +218,7 @@ function baseRefRepo() {
   run("git", ["add", "app.js"], { cwd });
   run("git", ["commit", "-m", "init"], { cwd });
   run("git", ["tag", "v1"], { cwd });
+  run("git", ["tag", "-a", "-m", "a", "va"], { cwd });
   run("git", ["update-ref", "refs/remotes/origin/main", "main"], { cwd });
   run("git", ["checkout", "-b", "feature/test"], { cwd });
   return cwd;
@@ -229,7 +230,7 @@ const baseNotFound = (ref) =>
 test("resolveReviewTarget refuses an explicit base that is not a local commit (#653)", () => {
   const cwd = baseRefRepo();
   const tree = run("git", ["rev-parse", "HEAD^{tree}"], { cwd }).stdout.trim();
-  for (const ref of ["nope", tree, "-x", "--output=/tmp/owned"]) {
+  for (const ref of ["nope", tree, "-x", "--output=/tmp/owned", "^main", ""]) {
     assert.throws(() => resolveReviewTarget(cwd, { base: ref }), { message: baseNotFound(ref) }, ref);
   }
 });
@@ -237,7 +238,7 @@ test("resolveReviewTarget refuses an explicit base that is not a local commit (#
 test("resolveReviewTarget accepts a branch, tag, sha and remote-tracking base", () => {
   const cwd = baseRefRepo();
   const sha = run("git", ["rev-parse", "main"], { cwd }).stdout.trim();
-  for (const ref of ["main", "v1", sha, "origin/main"]) {
+  for (const ref of ["main", "v1", "va", sha, "origin/main"]) {
     assert.deepEqual(resolveReviewTarget(cwd, { base: ref }), { mode: "branch", label: `branch diff against ${ref}`, baseRef: ref, explicit: true }, ref);
   }
 });
