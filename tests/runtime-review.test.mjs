@@ -400,6 +400,23 @@ test("adversarial-review --args-stdin keeps a focus-only heredoc in one piece an
   assert.equal(turn.model, null, "--model after -- is focus text, not a flag");
 });
 
+test("adversarial-review --args-stdin accepts a bullet-led focus", () => {
+  const repo = featureBranchRepo();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+
+  const result = run(process.execPath, [SCRIPT, "adversarial-review", "--args-stdin"], {
+    cwd: repo,
+    env: buildEnv(binDir),
+    input: "- check auth\n- check races\n"
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const prompt = JSON.parse(fs.readFileSync(statePath, "utf8")).lastTurnStart.prompt;
+  assert.ok(prompt.includes("User focus: - check auth\n- check races\n</task>"), focusLine(prompt));
+});
+
 test("review --args-stdin with flags only still runs the built-in reviewer", () => {
   const repo = featureBranchRepo();
   const binDir = makeTempDir();

@@ -174,7 +174,8 @@ export function splitRawArgumentString(raw) {
 // positional (or `--`), then hand the rest of the raw string over as ONE token,
 // trimmed, with quotes, apostrophes, backslashes and newlines untouched. `spec`
 // is the parseArgs config; only valueOptions, repeatableOptions and aliasMap
-// matter here — they say which flag swallows the next token as its value.
+// matter here — they say which flag swallows the next token as its value. A tail
+// that starts with `-` (a bullet list) goes after `--`, so parseArgs reads it as text.
 export function splitArgsWithVerbatimTail(raw, spec = {}) {
   const takesValue = new Set([...(spec.valueOptions ?? []), ...(spec.repeatableOptions ?? [])]);
   const aliasMap = spec.aliasMap ?? {};
@@ -188,7 +189,8 @@ export function splitArgsWithVerbatimTail(raw, spec = {}) {
       return tail ? [...argv, "--", tail] : [...argv, "--"];
     }
     if (!value.startsWith("-") || value === "-") {
-      return [...argv, raw.slice(start).trim()];
+      const tail = raw.slice(start).trim();
+      return tail.startsWith("-") && tail !== "-" ? [...argv, "--", tail] : [...argv, tail];
     }
     argv.push(value);
     const isLong = value.startsWith("--");

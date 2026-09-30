@@ -164,6 +164,12 @@ test("splitArgsWithVerbatimTail keeps everything from the first positional as on
     ["--bogus focus", ["--bogus", "focus"]],
     ["--base", ["--base"]],
     ["--base -x focus", ["--base", "-x", "focus"]],
+    ["- check auth\n- check races\n", ["--", "- check auth\n- check races"]],
+    ["--base main - check auth", ["--base", "main", "--", "- check auth"]],
+    ["\"quoted focus\" more", ["\"quoted focus\" more"]],
+    ["check\n--\nmore", ["check\n--\nmore"]],
+    ["--config --json focus", ["--config", "--json", "focus"]],
+    ["--base main\r\nfix the\r\nthing\r\n", ["--base", "main", "fix the\r\nthing"]],
     ["", []],
     ["  \n\t", []]
   ];
@@ -181,6 +187,10 @@ test("splitArgsWithVerbatimTail output parses to the same options and one focus 
   assert.deepEqual(options.config, ["a=1"]);
   assert.deepEqual(positionals, ["check --model x, don't \"stop\""]);
   assert.deepEqual(parse("-- --model is wrong").positionals, ["--model is wrong"]);
+  assert.deepEqual(parse("- check auth\n- check races\n").positionals, ["- check auth\n- check races"]);
+  const dashValue = parse("--config --json focus");
+  assert.deepEqual(dashValue.options.config, ["--json"]);
+  assert.deepEqual(dashValue.positionals, ["focus"]);
   assert.throws(() => parse("--base"), /Missing value for --base/);
   assert.throws(() => parse("--bogus focus"), /Unknown option: --bogus/);
 });
