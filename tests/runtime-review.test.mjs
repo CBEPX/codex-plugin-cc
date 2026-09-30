@@ -14,6 +14,7 @@ import {
   SCRIPT,
   seededRepo
 } from "./helpers.mjs";
+import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
 
 
 test("review renders a no-findings result from app-server review/start", () => {
@@ -426,4 +427,31 @@ test("review --args-stdin with flags only still runs the built-in reviewer", () 
 
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /Reviewed changes against main/);
+});
+
+test("review and adversarial-review refuse an unresolvable --base before any job or Codex start (#653)", () => {
+  for (const command of ["review", "adversarial-review"]) {
+    for (const ref of ["nope", "-x"]) {
+      const repo = seededRepo();
+      const binDir = makeTempDir();
+      installFakeCodex(binDir);
+      fs.writeFileSync(path.join(repo, "README.md"), "hello again\n");
+      const label = `${command} --base ${ref}`;
+
+      const result = run(process.execPath, [SCRIPT, command, "--base", ref], { cwd: repo, env: buildEnv(binDir) });
+
+      assert.equal(result.status, 1, `${label}: ${result.stdout}${result.stderr}`);
+      assert.ok(
+        result.stderr.includes(`Base ref "${ref}" not found in this repository; pass a branch, tag or commit that resolves locally (git fetch it first for a remote ref).`),
+        `${label}: ${result.stderr}`
+      );
+      // Failing before the job means no state was written at all.
+      const indexPath = path.join(resolveStateDir(repo), "state.json");
+      assert.deepEqual(fs.existsSync(indexPath) ? readStateIndex(repo).jobs : [], [], `${label}: no job record`);
+      // The fake bumps appServerStarts on every `codex app-server` launch (fake-codex-fixture.mjs:288).
+      const fakeStatePath = path.join(binDir, "fake-codex-state.json");
+      const starts = fs.existsSync(fakeStatePath) ? JSON.parse(fs.readFileSync(fakeStatePath, "utf8")).appServerStarts : 0;
+      assert.equal(starts, 0, `${label}: no app-server start`);
+    }
+  }
 });

@@ -210,3 +210,34 @@ test("collectReviewContext keeps untracked file content in lightweight working t
   assert.match(context.content, /## Untracked Files/);
   assert.match(context.content, /UNTRACKED_RISK_MARKER/);
 });
+
+function baseRefRepo() {
+  const cwd = makeTempDir();
+  initGitRepo(cwd);
+  fs.writeFileSync(path.join(cwd, "app.js"), "console.log('v1');\n");
+  run("git", ["add", "app.js"], { cwd });
+  run("git", ["commit", "-m", "init"], { cwd });
+  run("git", ["tag", "v1"], { cwd });
+  run("git", ["update-ref", "refs/remotes/origin/main", "main"], { cwd });
+  run("git", ["checkout", "-b", "feature/test"], { cwd });
+  return cwd;
+}
+
+const baseNotFound = (ref) =>
+  `Base ref "${ref}" not found in this repository; pass a branch, tag or commit that resolves locally (git fetch it first for a remote ref).`;
+
+test("resolveReviewTarget refuses an explicit base that is not a local commit (#653)", () => {
+  const cwd = baseRefRepo();
+  const tree = run("git", ["rev-parse", "HEAD^{tree}"], { cwd }).stdout.trim();
+  for (const ref of ["nope", tree, "-x", "--output=/tmp/owned"]) {
+    assert.throws(() => resolveReviewTarget(cwd, { base: ref }), { message: baseNotFound(ref) }, ref);
+  }
+});
+
+test("resolveReviewTarget accepts a branch, tag, sha and remote-tracking base", () => {
+  const cwd = baseRefRepo();
+  const sha = run("git", ["rev-parse", "main"], { cwd }).stdout.trim();
+  for (const ref of ["main", "v1", sha, "origin/main"]) {
+    assert.deepEqual(resolveReviewTarget(cwd, { base: ref }), { mode: "branch", label: `branch diff against ${ref}`, baseRef: ref, explicit: true }, ref);
+  }
+});

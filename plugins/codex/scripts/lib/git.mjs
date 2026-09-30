@@ -132,6 +132,17 @@ export function getWorkingTreeState(cwd) {
   };
 }
 
+// An explicit --base must name a commit in this repository: an unknown ref used
+// to widen the review silently (#653), and a `-`-leading one reached
+// `git merge-base` as an option. The `-` check comes first, so git never sees it.
+function assertBaseRefResolves(cwd, baseRef) {
+  if (baseRef.startsWith("-") || git(cwd, ["rev-parse", "--verify", "--quiet", `${baseRef}^{commit}`]).status !== 0) {
+    throw new Error(
+      `Base ref "${baseRef}" not found in this repository; pass a branch, tag or commit that resolves locally (git fetch it first for a remote ref).`
+    );
+  }
+}
+
 export function resolveReviewTarget(cwd, options = {}) {
   ensureGitRepository(cwd);
 
@@ -141,6 +152,7 @@ export function resolveReviewTarget(cwd, options = {}) {
   const supportedScopes = new Set(["auto", "working-tree", "branch"]);
 
   if (baseRef) {
+    assertBaseRefResolves(cwd, baseRef);
     return {
       mode: "branch",
       label: `branch diff against ${baseRef}`,
