@@ -1,6 +1,6 @@
 # codex-plugin-cc v1.5.0 — companion split, bounded read views, review surface
 
-Date: 2026-09-30 (rev. 3, 2026-09-30)
+Date: 2026-09-30 (rev. 4, 2026-09-30)
 
 ## Goal
 
@@ -27,9 +27,11 @@ Success means all of the following:
   - The file holds exactly what the command's `--json` printed before 1.5.0. That is no new exposure: the same user already reads it on stdout. It includes `request` with its config values redacted.
   - Win32: the mode is ignored (the file inherits the directory ACL); `wx` stays exclusive.
 - **Review request file.** A background review uses the existing 0600 `jobs/<id>.request.json`, written by `writeJobRequestFile` and deleted by `consumeJobRequestFile` (both defined at `state.mjs:879-900`), and removed on cancel (`job-control.mjs:342`) and by the reaper and the terminal write (`tracked-jobs.mjs:274/306/351`). `--config` values live only there. The record carries `request` with `redactConfigValues` applied, exactly as task does (`codex-companion.mjs:909`).
-- **No new spawn path.** The review worker is the existing `spawnDetachedTaskWorker` (`codex-companion.mjs:878-888`): `process.execPath` with the absolute companion path, `task-worker --cwd <cwd> --job-id <id>`, `detached`, `windowsHide`. The `--base` check uses the existing `git()` helper (`lib/git.mjs:12`, `shell: false`). `docs/agent/windows-threat-model.md` does not apply.
+- **No new spawn path.** The review worker is the existing `spawnDetachedTaskWorker` (`codex-companion.mjs:878-888`): `process.execPath` with the absolute companion path, `task-worker --cwd <cwd> --job-id <id>`, `detached`, `windowsHide`. The `--base` check uses the existing `git()` helper (`lib/git.mjs:12`, `shell: false`). One spawn option changes: the detached worker's stdout and stderr are appended to the job's existing log file instead of being discarded (see Worker diagnostics); the executable, argv, `shell`, `detached`, `windowsHide` and the log's path and mode are unchanged. `docs/agent/windows-threat-model.md` is walked point by point in that task.
 - **Refs starting with `-` are refused.** `parseArgs` accepts `--base -x` as a value (`lib/args.mjs:44-58`), and today that reaches `git merge-base HEAD -x` (pre-existing option injection). #653 refuses it with the same "not found" error.
 - **Focus text** is user prompt text as before. It arrives through the quoted heredoc on stdin (never a shell) and is now passed on verbatim.
+- **Heredoc delimiter.** Every command file passes `$ARGUMENTS` through a quoted heredoc whose delimiter is `CODEX_ARGS_` + 8 fresh random hex characters that do not appear as an exact line in the arguments (rescue already uses `CODEX_PROMPT_<random>`). An argument line equal to a fixed delimiter would end the heredoc early and run the rest on the host shell; the fixed `CODEX_ARGS` has been there since `--args-stdin` was added, and verbatim multi-line focus makes it reachable. The rule covers all seven command files, not only the review ones.
+- **Untracked symlinks are never followed.** The review context names an untracked symlink as `(skipped: symlink)` and reads nothing through it, so a link to a file outside the repository cannot put that file into the prompt (the sister's rule).
 
 ## Design
 
@@ -89,16 +91,18 @@ AGENTS.md stays at 29 lines (`docs-contracts.test.mjs` caps it at 50).
 `PUBLIC_READ_BYTES = 8192`.
 
 `boundedReadView(payload, { summary, render, asJson, nextStep })` returns `{ view, text, complete }`. The loop:
-1. Start with limits `{string: ∞, items: ∞}`. Each later round tries `{4096, 8}`, then halves both, until both reach 0. (The reference starts at 512; a 512-byte preview of a large result would waste most of the budget now that `/codex:result` shows the preview as it is.)
+1. Start with limits `{string: ∞, items: ∞}`. The first shrinking round depends on the view: `{512, 8}` for a summary view (`status`, the active-job hint), as in the reference, and `{4096, 8}` for the `result` preview. Later rounds halve both until both reach 0. (A 512-byte preview of a large result would waste most of the budget now that `/codex:result` shows the preview as it is; for lists, 4096 would drop records the reference keeps — eight records with 5000-byte strings stay eight at 512 and become two at 4096.)
 2. `project` works as follows:
    - strings over the limit (in bytes) are cut at a surrogate-safe boundary and end with `…`;
    - arrays are sliced to the item limit;
    - depth over 12 becomes `null`;
-   - in summary mode the keys `request`, `result` and `rendered` are dropped at any depth when their value is not null.
+   - in summary mode the keys `request`, `result` and `rendered` are dropped at any depth when their value is not null; a dropped array also adds its length to `omissions.records`, as in the reference;
+   - every key of the payload stays an own property of the projection (`__proto__` included).
 3. `view = { ...projected, truncated, omissions: { fields, fieldNames, records, strings }, nextStep? }`. `records` starts at `payload.omittedJobs`; `nextStep` is present only when truncated.
-4. The printed form is `JSON.stringify(view, null, 2) + "\n"` in JSON mode. In text mode it is `render(projected)`, plus, when the text itself was shortened, a line `Truncated: <omissions as JSON>` and then `<nextStep>`. A summary drop alone does not count in text mode: the text renderers of `status` never print `request`, `result` or `rendered`, so nothing the text showed is missing. In JSON mode a summary drop does set `truncated: true`, `omissions.fields`/`fieldNames` and `nextStep`.
+4. The printed form is `JSON.stringify(view, null, 2) + "\n"` in JSON mode. In text mode it is `render(projected)`, plus, when the text itself was shortened, a line `Truncated: <omissions as JSON>` and then `<nextStep>`. Shortened means a cut string, a sliced array, a depth-limit `null` or omitted job records. A deliberate summary drop alone does not count in text mode: the text renderers of `status` never print `request`, `result` or `rendered`, so nothing the text showed is missing. In JSON mode a summary drop does set `truncated: true`, `omissions.fields`/`fieldNames` and `nextStep`.
 5. If the printed bytes are ≤ 8192, stop. Otherwise try the next limits.
-6. If the limits bottom out, print `{ truncated: true, omissions, nextStep }` (JSON mode) or `Truncated: output exceeds 8192 bytes.` followed by `<nextStep>` (text mode).
+6. If the limits bottom out, print `{ truncated: true, omissions, nextStep }` (JSON mode) or `Truncated: output exceeds 8192 bytes.` followed by `<nextStep>` (text mode). This form is measured as well: when it does not fit with the caller's `nextStep` (a very long job id or path), the fixed `Use --output <new-path> for the complete JSON payload.` replaces it. No path prints more than 8192 bytes.
+7. A text renderer of a bounded view reads the projection, never the original payload (the active-job hint is built from the projected job id and resume command).
 
 Deviation from the reference: the size check is on the bytes printed. The reference checks the JSON view and falls back to JSON for text. That is wrong here because a `result` JSON view repeats the output three times (`rendered`, `result.rawOutput`, `codex.stdout`), so small results would be shrunk for no reason.
 
@@ -107,6 +111,7 @@ JSON is never cut mid-token. Keys, numbers and booleans (`waitTimedOut`, `resume
 **`exportReadPayload(payload, outputPath, cwd)`**
 - Behaves as described in the Trust boundary.
 - Returns the receipt `{ outputFile, bytes, sha256 }`, always printed as JSON on stdout, even without `--json`.
+- The receipt is computed before the file is created. A receipt that would itself exceed 8192 bytes is refused: `--output path is too long: its receipt would exceed 8192 bytes; pass a shorter path.` (exit 1, nothing created). The path and checksum are never shortened.
 - `EEXIST` gives the error `--output <path> already exists; pass a new path.` (the resolved absolute path) with exit 1. Other errors are raw, exit 1.
 - Before a `status <id> --wait` starts waiting, an `lstat` of the resolved path fails the command early with the same error. That check is a courtesy; the `wx` open is the guard.
 
@@ -174,6 +179,11 @@ Transport is decided per run by the existing `withAppServer`: broker when reacha
 - The subcommand name `task-worker` and its argv stay, so `workerCommandLine` (`task-worker.*--job-id <id>`) and the reaper's `codex-companion.mjs` match are unchanged.
 - The worker re-resolves `{ base, scope }` (see Limits).
 
+**Worker diagnostics** (every detached worker, task and review; the sister's rule).
+- The worker's stdout and stderr are appended to the job log (`logFile` in `status --json`); before, they were discarded, so an error printed before the worker could write its own log was lost and the reaper recorded only a generic dead-worker message.
+- The worker registers its crash guard before it reads the request. A worker that cannot read its request file ends the job `failed` with `errorMessage` `worker could not start: <reason>`; for a JSON error the reason is `its request file is not valid JSON` (the parser's own text quotes the file, which may hold a `--config` value, and is never recorded). The log gets `Marked failed: <errorMessage>`.
+- A failed spawn (`error` event) leaves `Could not spawn the background Codex worker: <message>` in the log.
+
 **Cancel, SessionEnd and reaper for a detached review** follow the task rules exactly:
 - **SessionEnd** leaves a `background: true` job alone. The broker stays while any job is active.
 - **Reaper:** unchanged.
@@ -203,6 +213,8 @@ Transport is decided per run by the existing `withAppServer`: broker when reacha
 - The fake already stores `ephemeral` in `lastThreadStart` (`fake-codex-fixture.mjs:379`) and names through `thread/name/set` (`:386-391`).
 
 **#405 prompt caps**, in `lib/git.mjs` and the prompt builder:
+- An untracked symlink is reported as `### <path>` + `(skipped: symlink)` and costs only that line; a broken link keeps `(skipped: broken symlink or unreadable file)`.
+- The inline diff is read with the inline cap as its bound (the size probe and the read are two git calls, and the diff can grow between them; today an overflow past 1 MiB throws a raw `ENOBUFS`). An overflow at the read falls back to the self-collect sections, and `inputMode`/`collectionGuidance` report what was actually inlined.
 - `MAX_UNTRACKED_TOTAL_BYTES = 262144`: the total of the formatted untracked entries in both inline and self-collect modes. Today the untracked bodies are inlined even in self-collect mode (`git.mjs:234` inline, `:244` self-collect). Past the cap each file is left out and one line is added: `(<N> untracked file(s) omitted: aggregate untracked content exceeds the 262144 byte limit; see Git Status for the full list and inspect them directly.)`
 - `MAX_REVIEW_PROMPT_CHARS = 786432` (75 % of Codex's 1,048,576-character input limit). If the interpolated prompt is longer:
   - `REVIEW_INPUT` is cut at the last newline that fits;
@@ -225,6 +237,8 @@ Transport is decided per run by the existing `withAppServer`: broker when reacha
 - `commands/review.md` and `commands/adversarial-review.md` drop the ` ```typescript ` `Bash(..., run_in_background: true)` block. Background flow: run `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" <cmd> --background --args-stdin <<'CODEX_ARGS'` (`--background` before `--args-stdin` survives the splice), and return its stdout verbatim.
 - The text becomes "the companion detaches a `--background` review itself".
 - `review.md` says focus text runs the adversarial reviewer.
+- `--wait`/`--background` count as mode flags only among the leading flags — before the first word that is neither a flag nor a flag's value, and before `--`; the same words inside the focus text are focus.
+- The heredoc delimiter is `CODEX_ARGS_<random>` in every command file (Trust boundary).
 - `printUsage` shows `review … [focus text]`.
 
 ## Testing
@@ -254,13 +268,16 @@ Transport is decided per run by the existing `withAppServer`: broker when reacha
   - a payload with several long strings, which does not fit at 4096, still lands under the limit;
   - `omittedJobs` counts in `records`;
   - text-mode output fits the limit;
-  - a wide object bottoms out to the minimal view.
+  - a wide object bottoms out to the minimal view; an oversized `nextStep` or job id still prints ≤ 8192 bytes in both formats;
+  - `__proto__` survives as an own key; a dropped summary array counts its records in JSON and prints no `Truncated:` line in text; a depth-limit `null` does print it;
+  - eight records with 5000-byte strings all survive in summary mode.
 - `exportReadPayload`:
   - receipt `sha256` = the file's hash;
   - mode 0600 (posix);
   - `EEXIST` on an existing path;
   - a symlink is refused (`{ skip: win32 }`);
-  - an injected write failure (`t.mock.method(fs, "writeFileSync")`) removes the file.
+  - an injected write failure (`t.mock.method(fs, "writeFileSync")`) removes the file;
+  - a path whose receipt would exceed 8192 bytes is refused and nothing is created.
 - `runtime-status.test.mjs`:
   - a background task with a 60 KB prompt:
     - `status --json` is ≤ 8192 bytes, has no `request` and has `truncated: true`;
@@ -269,6 +286,7 @@ Transport is decided per run by the existing `withAppServer`: broker when reacha
     - `--output` writes a file containing the prompt and prints the receipt;
     - a second `--output` to the same path exits 1 with `already exists`;
   - 12 finished jobs give `omittedJobs > 0`, and `nextStep` mentions `--all`;
+  - two regressions ported from the reference: an oversized list (4 active and 30 finished records with 6 KB CJK summaries: exact `totalJobs`, `omittedJobs` and `omissions.records`, ≤ 8192 bytes in both formats), and a finished record with CJK and astral-plane text read through `status <id>` and `result <id>` in both formats (no broken surrogate, the stored record untouched);
   - a 20 KB result:
     - `result <id>` shows the preview plus the `Full output: \`result <id> --wait\`` line;
     - `result <id> --wait` is byte-identical to the stored `rendered` plus the session lines;
@@ -295,7 +313,9 @@ Transport is decided per run by the existing `withAppServer`: broker when reacha
 - `args.test.mjs` (`splitArgsWithVerbatimTail`): apostrophes; quotes; newlines; `--model sol` then focus containing `--model x`; `-m sol`; `--config k=v`; `-- -x`; flags only (no tail); empty input.
 - `git.test.mjs`:
   - missing base, a tree sha and `-x` are rejected; a branch, tag, sha and `origin/…` are accepted;
-  - 300 × 20 KB untracked files give a section ≤ 256 KiB plus the notice with the count.
+  - 300 × 20 KB untracked files give a section ≤ 256 KiB plus the notice with the count;
+  - an untracked symlink to a file outside the repository is skipped and none of the target's content is in the context (both modes);
+  - a diff larger than the bound at the read gives self-collect context, not an exception (working tree and branch).
 - Prompt ceiling: unit test of `buildAdversarialReviewPrompt` with a 1 MB context → ≤ 786432 characters, the marker line and the self-collect text.
 - New `codex-structured-output.test.mjs` (port of #583's table): bare, `json`-fenced, untagged fence, CRLF, backticks inside a string, malformed, prose, empty.
 - `render.test.mjs`: the `Focus:` line; a stored built-in review with `parseError` renders `rendered`.
@@ -305,7 +325,12 @@ Transport is decided per run by the existing `withAppServer`: broker when reacha
   - a queued-window review cancel removes the request file.
 - `commands.test.mjs:17-76`:
   - remove the checks for ` ```typescript `, `run_in_background: true`, the `command:` template, `description: "Codex …"`, `Do not call \`BashOutput\``, the "Claude Code's `Bash(..., run_in_background: true)` … detaches" line, and "or extra focus text";
-  - add `<cmd> --background --args-stdin <<'CODEX_ARGS'`, `doesNotMatch(/run_in_background/)` and the focus → adversarial sentence.
+  - add `<cmd> --background --args-stdin <<'CODEX_ARGS_<random>'`, `doesNotMatch(/run_in_background/)`, the focus → adversarial sentence and the leading-flags rule for `--wait`/`--background`;
+  - a scan of `commands/*.md`, `agents/*.md` and `skills/*/SKILL.md`: every heredoc is quoted and uses the `_<random>` delimiter with its selection rule.
+- `runtime-task.test.mjs`, worker diagnostics: a worker that throws before it tracks its job leaves the error in the job log; a corrupted request file fails the job with `worker could not start: its request file is not valid JSON`, and the file's content reaches neither the log nor the state index.
+- `runtime-hooks.test.mjs`: the SessionEnd test holds the review's turn, sees `running` before and after the hook with the worker and broker alive, then cancels.
+- `runtime-cancel.test.mjs`: two background reviews at once — the second falls back to `transport: "direct"`; cancelling it kills its worker and leaves the brokered one to complete (posix).
+- `runtime-review.test.mjs`: stdin `investigate --background handling` runs in the foreground with that exact focus.
 - New fake knob `FAKE_CODEX_REVIEW_DELAY_MS=N`: `review/start` answers and sends `turn/started` and `enteredReviewMode`, then completes after N ms. It is registered in `interruptibleTurns`, so `turn/interrupt` completes it as `interrupted`, and the `FAKE_CODEX_IGNORE_*` knobs apply.
 - Timing (`docs/agent/testing-and-ci.md`):
   - no absolute bound under 10 s;
@@ -327,6 +352,9 @@ Transport is decided per run by the existing `withAppServer`: broker when reacha
 - **No wall-clock limit per job** (#615 defect 3). Use `--turn-timeout-ms`.
 - **The built-in reviewer never returns a schema-shaped `result`** (#679). `parseError` says so.
 - **Persisted review threads write rollouts** to `~/.codex/sessions`. `codex resume <id>` now works for them; they are never `--resume-last` candidates.
+- **Structured output: only a fence around the whole message is unwrapped.** The sister also recovers a JSON object embedded in prose; that is not ported, because a prose reply that quotes an object would be taken for the review result.
+- **The sister's throwaway review worktree is not ported.** It contains a reviewer that can write; here the reviewer runs in Codex's read-only sandbox.
+- **`--output` must name a path that is free when the command starts.** `status <id> --wait --output` refuses an occupied path before waiting, even if it would be free by the end of the wait. A path so long that its receipt would exceed 8192 bytes is refused.
 - **`--output` has limits of its own.** Windows ignores the 0600 mode; the symlink-refusal test is posix-only; every export needs a new path. A crash between create and write can leave a partial file.
 - **Cancelling a foreground review is unchanged** (pre-existing): its pid is the companion itself, not a `task-worker`.
 
@@ -350,7 +378,10 @@ Transport is decided per run by the existing `withAppServer`: broker when reacha
   - #714 focus mangling;
   - #653 unresolved `--base` (and a `-`-leading ref);
   - #405 unbounded adversarial prompt;
-  - #583 fenced JSON.
+  - #583 fenced JSON;
+  - the fixed heredoc delimiter in every command file (an argument line equal to it ran the rest on the host shell);
+  - untracked symlinks followed into the review context; the unbounded inline diff read;
+  - a detached worker's startup failure lost its reason.
 - **Internal**
   - the S1 split;
   - the AGENTS.md install rule;
@@ -376,3 +407,4 @@ Transport is decided per run by the existing `withAppServer`: broker when reacha
 | 1 | 2026-09-30 | controller rulings S0–S3 for v1.5.0 | initial |
 | 2 | 2026-09-30 | user review of rev. 1; CI 36700963516 | `/codex:result` shows the preview and does not re-run with `--wait` on its own; `status <id> --wait` confirmed bounded; S0(a) is committed; S0(c) broker idle-timeout test added |
 | 3 | 2026-09-30 | plan writers' code reading; controller rulings on S2 | first shrink step 4096 instead of 512; a summary drop alone prints no `Truncated:` block in text mode; `--output` is checked before a `status --wait` starts waiting; S1 residue, entry allow-list and exports corrected; test sites `runtime-task:955-966`, `:1081-1084` (via `--output`), `commands.test:213` added; line references corrected; limit "focus text is never cut" added |
+| 4 | 2026-09-30 | user: compare with the sister plugin; Codex (gpt-6.1-sol) read the plan against cc-plugin-codex 66846d9 | random heredoc delimiter in every command file; untracked symlinks skipped; inline diff read bounded; worker stdout/stderr to the job log and `worker could not start: …` (one spawn option changes, threat model walked); bottom-out view measured, receipt preflight, own-property projection; first shrink step 512 for summary views and 4096 only for the `result` preview; summary-dropped arrays counted; depth nulls count as shortened in text; mode flags only before the focus; sister regressions and the concurrent-review cancel test added; limits: prose-embedded JSON and the review worktree not ported, `--output` path free at start |
