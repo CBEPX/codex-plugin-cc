@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-import { IS_WIN, makeTempDir, run } from "./helpers.mjs";
+import { deadPid, IS_WIN, makeTempDir, run } from "./helpers.mjs";
 import { getProcessIdentity } from "../plugins/codex/scripts/lib/process.mjs";
 import {
   consumeJobRequestFile,
@@ -313,12 +313,6 @@ function seedLockEntry(lockDir, name, pid, startedAt = new Date().toISOString(),
   const entry = path.join(lockDir, name);
   fs.writeFileSync(entry, `${JSON.stringify({ pid, startedAt, identity })}\n`, "utf8");
   return entry;
-}
-
-function deadPid() {
-  const finished = run(process.execPath, ["-e", "process.exit(0)"], { env: process.env });
-  assert.equal(finished.status, 0);
-  return finished.pid;
 }
 
 // The property the whole lock exists for, checked the only way that means

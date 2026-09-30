@@ -3,8 +3,10 @@ import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
-import { parseProtocolLines, resetWindowsIdentityCircuit, runPowerShell } from "../plugins/codex/scripts/lib/process.mjs";
+import { isPidAlive, parseProtocolLines, resetWindowsIdentityCircuit, runPowerShell } from "../plugins/codex/scripts/lib/process.mjs";
+import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
 
 export const IS_WIN = process.platform === "win32";
 
@@ -77,4 +79,94 @@ export async function waitFor(predicate, { timeoutMs = 30000, intervalMs = 50 } 
     await new Promise((resolve) => setTimeout(resolve, intervalMs));
   }
   throw new Error("Timed out waiting for condition.");
+}
+
+export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+export const PLUGIN_ROOT = path.join(ROOT, "plugins", "codex");
+export const SCRIPT = path.join(PLUGIN_ROOT, "scripts", "codex-companion.mjs");
+export const STOP_HOOK = path.join(PLUGIN_ROOT, "scripts", "stop-review-gate-hook.mjs");
+export const SESSION_HOOK = path.join(PLUGIN_ROOT, "scripts", "session-lifecycle-hook.mjs");
+export const FAKE_RESOLVED_SETTINGS = {
+  model: "gpt-5.4",
+  modelProvider: "openai",
+  reasoningEffort: null,
+  sandbox: {
+    type: "readOnly",
+    access: { type: "fullAccess" },
+    networkAccess: false
+  }
+};
+
+export const isAlive = (pid) => isPidAlive(pid) === true;
+
+export function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// A pid that has certainly exited (a finished child), for stale-record fixtures.
+export function deadPid() {
+  const finished = run(process.execPath, ["-e", ""]);
+  if (finished.status !== 0) throw new Error(`deadPid: helper child exited ${finished.status}`);
+  return finished.pid;
+}
+
+export function waitForExit(child, { timeoutMs = 10000 } = {}) {
+  return new Promise((resolve, reject) => {
+    if (child.exitCode !== null || child.signalCode !== null) {
+      resolve({ code: child.exitCode, signal: child.signalCode });
+      return;
+    }
+    const timer = setTimeout(() => {
+      child.removeListener("exit", onExit);
+      reject(new Error("Timed out waiting for broker process to exit."));
+    }, timeoutMs);
+    function onExit(code, signal) {
+      clearTimeout(timer);
+      resolve({ code, signal });
+    }
+    child.once("exit", onExit);
+  });
+}
+
+// Like waitFor but resolves null on timeout, so the caller's own assertion (and its
+// on-failure diagnostic, e.g. the broker-log tail) still runs.
+export async function waitUntil(predicate, { timeoutMs = 8000, intervalMs = 100 } = {}) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const value = await predicate();
+    if (value) {
+      return value;
+    }
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+  return null;
+}
+
+export function readStateIndex(workspaceRoot) {
+  return JSON.parse(fs.readFileSync(path.join(resolveStateDir(workspaceRoot), "state.json"), "utf8"));
+}
+
+export function readJobRecord(workspaceRoot, jobId = null) {
+  const resolvedJobId = jobId ?? readStateIndex(workspaceRoot).jobs[0].id;
+  return JSON.parse(fs.readFileSync(path.join(resolveStateDir(workspaceRoot), "jobs", `${resolvedJobId}.json`), "utf8"));
+}
+
+// Read only on failure: which record a cancel found, who wrote it, and the job-log tail.
+export function jobDiagnostics(repo, jobId) {
+  try {
+    const record = readJobRecord(repo, jobId);
+    const log = fs.readFileSync(record.logFile, "utf8").split("\n").slice(-20).join("\n");
+    return `record: ${JSON.stringify({ status: record.status, phase: record.phase, transport: record.transport, workerClosed: record.workerClosed, appServerExited: record.appServerExited, errorMessage: record.errorMessage })}\njob log tail:\n${log}`;
+  } catch (error) {
+    return `(job record unreadable: ${error.message})`;
+  }
+}
+
+export function seededRepo() {
+  const repo = makeTempDir();
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  return repo;
 }
