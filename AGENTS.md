@@ -18,7 +18,7 @@ common boundary (usually `plugins/codex/scripts/lib/`); never add caller-specifi
 - Pushing a work branch under an active claim is fine; merging, tagging, publishing a release and posting upstream comments each need the user's explicit go.
 - Maintainers claim the work item with the `agent-work` tool before writing and release the claim at the end of the stage (see `docs/agent/process.md`); contributors without it open a draft PR first.
 - README describes behaviour by observable outputs (flags, `status --json` / `result --json` fields, exit codes, decision lines, error text). Function names and `plugins/codex/scripts/...` paths belong in the internals docs under `docs/` (rules: `docs/agent/docs.md`).
-- The `codex@cbepx` plugin is installed from the marketplace cache per Claude config dir; the working tree is not what `/codex:*` runs. After a release: `claude plugin marketplace update cbepx && claude plugin update codex@cbepx` in each config dir, then restart the session.
+- For the maintainer the `cbepx` marketplace is a directory source on this repository: `/codex:*` runs the main checkout's `plugins/codex/` directly, so never edit plugin code on `main` — only in a worktree. After a release still run `claude plugin marketplace update cbepx && claude plugin update codex@cbepx` in each Claude config dir (it refreshes the recorded cache copy), then restart the session.
 
 ## Read on demand
 
